@@ -1,0 +1,8 @@
+rwarp
+Copyright 2026 Danil Sharov
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product bundles third-party Rust crates, each under its own license,
+including alacritty_terminal, eframe/egui, dirs, rfd, serde, serde_json,
+libc (Unix), and windows-sys (Windows). See each crate for details.

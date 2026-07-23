@@ -1,0 +1,70 @@
+# rwarp
+
+A small terminal built for running [Claude Code](https://www.anthropic.com/claude-code) sessions. It keeps every session in a sidebar, shows how full each session's context window is, and lets you suspend a session to free memory and resume it later without losing the conversation.
+
+It is a native desktop app written in Rust (egui + alacritty_terminal). One binary, no runtime dependencies.
+
+## Why
+
+If you run several Claude Code agents at once, a normal terminal gives you a wall of tabs with no idea which session is which or how close any of them is to filling its context. rwarp puts each session in a labeled row with a live context-percent badge, so you can tell at a glance which agent is about to run out of room and which one is idle waiting for you.
+
+## Features
+
+- **Session sidebar.** Each Claude Code session is a row with its name (pulled from Claude), working directory, and a status dot: green while the agent works, orange when it waits for input, red when it exits with an error.
+- **Context-percent badge.** A pill on each row shows how full that session's context window is: green under 50%, yellow 50-70%, red and pulsing over 70%. It appears the instant you resume a session by id, before Claude even finishes booting.
+- **Suspend and resume.** Put a session to sleep to free its memory; a text snapshot of the screen is kept. Resume it later with `claude --resume` wired up automatically.
+- **Knows which session is running.** Whether you launch Claude by typing `claude --resume <id>`, pick one from a session browser, or use a wrapper tool, rwarp identifies the session and binds its context to the right row.
+- **Idle suspend.** Sessions with no output for N minutes are suspended automatically. An interactive Claude prompt counts as idle; a silent `make` or `rsync` does not get killed.
+- **Warp-style command bar.** A command editor under the terminal with filtered history; drag-and-drop or paste a file to insert its path.
+- **Directory switcher, git status, per-session resource monitor.**
+
+## Context percent, exactly
+
+Claude Code does not store the context percentage anywhere on disk; it computes it at runtime. rwarp gets the number two ways:
+
+1. **Estimate (works everywhere, no setup).** rwarp reads the session transcript that Claude Code writes under `~/.claude/projects`, takes the last recorded token usage, and divides by the model's context window (with self-calibration, so a 1M-token window is never mistaken for 200k). This is what drives the badge out of the box.
+
+2. **Exact (macOS and Linux, opt-in).** Turn on "Точный % контекста" in settings and rwarp installs a tiny statusline hook into Claude Code. Claude then feeds rwarp the same percentage it shows itself, about once a second. If you already have a statusline configured, rwarp wraps it instead of replacing it, and removes itself cleanly when you turn the option off. The Windows exact-hook is not in this release; Windows uses the estimate.
+
+## Install
+
+### Download a release
+
+Grab the latest build from the [Releases](https://github.com/densharik/rwarp/releases) page.
+
+- **Windows:** download `rwarp.exe` and run it. It is a single portable binary; put it anywhere.
+- **macOS:** download `rwarp-macos.zip`, unzip, and move `rwarp.app` to Applications. The app is not notarized, so on first launch right-click it and choose Open (or run `xattr -cr /Applications/rwarp.app`).
+
+### Build from source
+
+You need a Rust toolchain (stable, edition 2024).
+
+```
+git clone https://github.com/densharik/rwarp
+cd rwarp
+cargo build --release
+```
+
+The binary lands at `target/release/rwarp` (`rwarp.exe` on Windows).
+
+## Platform support
+
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| Terminal, sessions, resume | yes | yes | yes |
+| Context badge (estimate) | yes | yes | yes |
+| Exact context hook | yes | yes | not yet |
+| `cd` follows in the path chip | yes | yes | not yet |
+| File/image clipboard paste | yes | yes | text only |
+| Notifications | full | full | sound only |
+
+Windows runs on ConPTY with PowerShell as the shell. The items marked "not yet" fall back gracefully and are on the roadmap.
+
+## Requirements
+
+- [Claude Code](https://www.anthropic.com/claude-code) installed and on your `PATH`.
+- macOS 11+, a recent Linux, or Windows 10/11.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
