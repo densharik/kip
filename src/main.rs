@@ -128,6 +128,8 @@ struct App {
     upd_rx: Receiver<update::UpdateMsg>,
     settings_open: bool,
     last_tick: Instant,
+    /// When the last background update check ran.
+    last_update_check: Instant,
     /// Command editor pinned under the terminal.
     cmd_input: String,
     /// The typed text used as the history filter (nav-fill does not change it).
@@ -208,6 +210,7 @@ impl App {
             active_shared: Arc::new(AtomicU64::new(0)),
             settings_open: false,
             last_tick: Instant::now(),
+            last_update_check: Instant::now(),
             cmd_input: String::new(),
             hist_query: String::new(),
             hist_sel: None,
@@ -731,6 +734,19 @@ impl App {
 
         if now.duration_since(self.last_tick) >= TICK {
             self.last_tick = now;
+            // Background update check a couple of times a day, on top of the
+            // one at launch. Skip while a check/update is already in flight or
+            // an update is already offered.
+            if self.last_update_check.elapsed() >= Duration::from_secs(12 * 3600)
+                && matches!(
+                    self.update_state,
+                    UpdateState::Idle | UpdateState::UpToDate | UpdateState::Failed(_)
+                )
+            {
+                self.last_update_check = now;
+                self.update_state = UpdateState::Checking;
+                update::check(self.upd_tx.clone(), ctx.clone());
+            }
             let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
             let active = self.active;
             let idle_limit = self.settings.idle_suspend_min as u64 * 60;
@@ -1267,7 +1283,7 @@ impl App {
                     ui.add_space(10.0);
                     let upd = matches!(self.update_state, UpdateState::Available(_));
                     let label = if upd {
-                        RichText::new("● Настройки").size(11.5).color(GIT_ADD)
+                        RichText::new("Настройки").size(11.5).color(GIT_ADD).strong()
                     } else {
                         RichText::new("Настройки").size(11.5)
                     };

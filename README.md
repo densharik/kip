@@ -1,44 +1,49 @@
-# kip
+<div align="center">
+  <img src="resources/icon_1024.png" width="104" alt="kip">
+  <h1>kip</h1>
+  <p>A terminal for running Claude Code sessions side by side.</p>
+</div>
 
-A small terminal built for running [Claude Code](https://www.anthropic.com/claude-code) sessions. It keeps every session in a sidebar, shows how full each session's context window is, and lets you suspend a session to free memory and resume it later without losing the conversation.
+---
 
-It is a native desktop app written in Rust (egui + alacritty_terminal). One binary, no runtime dependencies.
+kip keeps every Claude Code session in a sidebar, shows how full each one's
+context window is, and lets you put a session to sleep to free memory and pick
+it up later. It is a single native binary written in Rust (egui +
+alacritty_terminal), with no runtime dependencies.
 
 ## Why
 
-If you run several Claude Code agents at once, a normal terminal gives you a wall of tabs with no idea which session is which or how close any of them is to filling its context. kip puts each session in a labeled row with a live context-percent badge, so you can tell at a glance which agent is about to run out of room and which one is idle waiting for you.
+Run a few agents at once in a normal terminal and you get a wall of tabs: no
+idea which session is which, or how close any of them is to filling its
+context. kip gives each session a labeled row with a live context-percent
+badge, so you can see at a glance which agent is about to run out of room and
+which one is idle waiting for you.
 
 ## Features
 
-- **Session sidebar.** Each Claude Code session is a row with its name (pulled from Claude), working directory, and a status dot: green while the agent works, orange when it waits for input, red when it exits with an error.
-- **Context-percent badge.** A pill on each row shows how full that session's context window is: green under 50%, yellow 50-70%, red and pulsing over 70%. It appears the instant you resume a session by id, before Claude even finishes booting.
-- **Suspend and resume.** Put a session to sleep to free its memory; a text snapshot of the screen is kept. Resume it later with `claude --resume` wired up automatically.
-- **Knows which session is running.** Whether you launch Claude by typing `claude --resume <id>`, pick one from a session browser, or use a wrapper tool, kip identifies the session and binds its context to the right row.
-- **Idle suspend.** Sessions with no output for N minutes are suspended automatically. An interactive Claude prompt counts as idle; a silent `make` or `rsync` does not get killed.
-- **Warp-style command bar.** A command editor under the terminal with filtered history; drag-and-drop or paste a file to insert its path.
-- **Directory switcher, git status, per-session resource monitor.**
-- **In-app updates.** kip checks GitHub for a newer release on launch; a button in settings downloads and installs it, then restarts. macOS and Windows.
-
-## Context percent, exactly
-
-Claude Code does not store the context percentage anywhere on disk; it computes it at runtime. kip gets the number two ways:
-
-1. **Estimate (works everywhere, no setup).** kip reads the session transcript that Claude Code writes under `~/.claude/projects`, takes the last recorded token usage, and divides by the model's context window (with self-calibration, so a 1M-token window is never mistaken for 200k). This is what drives the badge out of the box.
-
-2. **Exact (macOS and Linux, opt-in).** Turn on "Точный % контекста" in settings and kip installs a tiny statusline hook into Claude Code. Claude then feeds kip the same percentage it shows itself, about once a second. If you already have a statusline configured, kip wraps it instead of replacing it, and removes itself cleanly when you turn the option off. The Windows exact-hook is not in this release; Windows uses the estimate.
+- Every session is a row with its name, working directory, and a status dot.
+- A per-session badge shows context use: green under 50%, yellow 50-70%, red
+  and pulsing above 70%. It shows up the moment you resume, before Claude boots.
+- Suspend a session to free its memory; resume later with `--resume` wired up.
+- Idle sessions suspend on their own after N minutes; a live Claude prompt
+  counts as idle, a running `make` or `rsync` does not.
+- Six color themes with an accent picker.
+- Command bar with history, drag-and-drop file paths, and `cd` that follows.
+- Updates itself from a button in settings.
 
 ## Install
 
-### Download a release
+Grab the latest build from [Releases](https://github.com/densharik/kip/releases).
+After that kip updates itself, so this is a one-time step.
 
-Grab the latest build from the [Releases](https://github.com/densharik/kip/releases) page. After that, kip updates itself from a button in settings, so this is a one-time step.
+**macOS** - open `kip-installer.pkg`. It is not notarized, so right-click the
+`.pkg` and choose Open the first time, then follow the installer. Installed this
+way it launches with no Gatekeeper warning.
 
-- **macOS:** download `kip-installer.pkg` and open it. Because it is not notarized, right-click the .pkg and choose Open the first time, then follow the installer (it asks for your password to install into Applications). Installed this way, kip launches normally with no Gatekeeper warning. If you prefer, `kip-macos.zip` still works: unzip, move `kip.app` to Applications, and run `xattr -cr /Applications/kip.app` once.
-- **Windows:** download `kip.exe` and run it. It is a single portable binary; put it anywhere.
+**Windows** - download `kip.exe` and run it. Single portable binary, put it
+anywhere.
 
-### Build from source
-
-You need a Rust toolchain (stable, edition 2024).
+**From source** - needs a stable Rust toolchain (edition 2024):
 
 ```
 git clone https://github.com/densharik/kip
@@ -46,25 +51,24 @@ cd kip
 cargo build --release
 ```
 
-The binary lands at `target/release/kip` (`kip.exe` on Windows).
+## Context percent
+
+Claude Code computes the percentage at runtime and never writes it to disk, so
+kip gets it two ways. By default it reads the session transcript under
+`~/.claude/projects` and estimates from the last token count - works everywhere,
+no setup. Turn on the statusline hook in settings (macOS/Linux) and Claude feeds
+kip the exact number it shows itself, about once a second.
 
 ## Platform support
 
-| | macOS | Linux | Windows |
-|---|---|---|---|
-| Terminal, sessions, resume | yes | yes | yes |
-| Context badge (estimate) | yes | yes | yes |
-| Exact context hook | yes | yes | not yet |
-| `cd` follows in the path chip | yes | yes | not yet |
-| File/image clipboard paste | yes | yes | text only |
-| Desktop notifications | full | full | not yet |
+|                          | macOS | Linux | Windows |
+|--------------------------|:-----:|:-----:|:-------:|
+| Terminal, sessions, themes |  yes  |  yes  |   yes   |
+| Context badge (estimate)   |  yes  |  yes  |   yes   |
+| Exact context hook         |  yes  |  yes  |    -    |
+| File/image paste           |  yes  |  yes  |  text   |
 
-Windows runs on ConPTY with PowerShell as the shell. The items marked "not yet" fall back gracefully and are on the roadmap.
-
-## Requirements
-
-- [Claude Code](https://www.anthropic.com/claude-code) installed and on your `PATH`.
-- macOS 11+ (Apple Silicon native; Intel Macs run it under Rosetta 2), a recent Linux, or Windows 10/11.
+Windows runs on ConPTY with PowerShell. Items marked `-` fall back gracefully.
 
 ## License
 
