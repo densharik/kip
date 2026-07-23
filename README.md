@@ -17,6 +17,7 @@ If you run several Claude Code agents at once, a normal terminal gives you a wal
 - **Idle suspend.** Sessions with no output for N minutes are suspended automatically. An interactive Claude prompt counts as idle; a silent `make` or `rsync` does not get killed.
 - **Warp-style command bar.** A command editor under the terminal with filtered history; drag-and-drop or paste a file to insert its path.
 - **Directory switcher, git status, per-session resource monitor.**
+- **In-app updates.** kip checks GitHub for a newer release on launch; a button in settings downloads and installs it, then restarts. macOS and Windows.
 
 ## Context percent, exactly
 

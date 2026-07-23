@@ -8,6 +8,7 @@ mod plat;
 mod palette;
 mod session;
 mod term_view;
+mod update;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,6 +80,15 @@ fn main() -> eframe::Result {
     eframe::run_native("kip", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
+enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(update::Release),
+    Working,
+    Failed(String),
+}
+
 enum Act {
     Select(u64),
     NewSame,
@@ -115,6 +125,9 @@ struct App {
     /// Own 500ms cadence of the context poller, independent of TICK.
     last_ctx_stat: Option<Instant>,
     hook_error: Option<String>,
+    update_state: UpdateState,
+    upd_tx: Sender<update::UpdateMsg>,
+    upd_rx: Receiver<update::UpdateMsg>,
     settings_open: bool,
     last_tick: Instant,
     /// Command editor pinned under the terminal.
@@ -164,6 +177,7 @@ impl App {
         let (ctx_tx, ctx_rx) = mpsc::channel();
         let (ctxi_tx, ctxi_rx) = mpsc::channel();
         let (stats_tx, stats_rx) = mpsc::channel();
+        let (upd_tx, upd_rx) = mpsc::channel();
         let jsonl_map: ctx_index::SharedMap = Default::default();
         ctx_index::spawn_initial_scan(jsonl_map.clone());
         ctx_index::sweep();
@@ -189,6 +203,9 @@ impl App {
             jsonl_map,
             last_ctx_stat: None,
             hook_error: None,
+            update_state: UpdateState::Idle,
+            upd_tx,
+            upd_rx,
             active_shared: Arc::new(AtomicU64::new(0)),
             settings_open: false,
             last_tick: Instant::now(),
@@ -230,7 +247,26 @@ impl App {
         for s in &app.sessions {
             app.poll_ctx_now(s, &cc.egui_ctx);
         }
+        // Clean up any leftover from a prior update, then check for a new one.
+        update::cleanup();
+        app.update_state = UpdateState::Checking;
+        update::check(app.upd_tx.clone(), cc.egui_ctx.clone());
         app
+    }
+
+    fn drain_update(&mut self) {
+        while let Ok(msg) = self.upd_rx.try_recv() {
+            match msg {
+                update::UpdateMsg::Checked(Ok(Some(r))) => {
+                    self.update_state = UpdateState::Available(r)
+                },
+                update::UpdateMsg::Checked(Ok(None)) => self.update_state = UpdateState::UpToDate,
+                update::UpdateMsg::Checked(Err(e)) | update::UpdateMsg::Applied(Err(e)) => {
+                    self.update_state = UpdateState::Failed(e)
+                },
+                update::UpdateMsg::Applied(Ok(())) => {},
+            }
+        }
     }
 
     /// Immediate context poll by the saved session id (no live claude needed).
@@ -1225,7 +1261,13 @@ impl App {
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_space(10.0);
-                    if ui.button(RichText::new("Настройки").size(11.5)).clicked() {
+                    let upd = matches!(self.update_state, UpdateState::Available(_));
+                    let label = if upd {
+                        RichText::new("● Настройки").size(11.5).color(GIT_ADD)
+                    } else {
+                        RichText::new("Настройки").size(11.5)
+                    };
+                    if ui.button(label).on_hover_text(if upd { "Доступно обновление" } else { "" }).clicked() {
                         acts.push(Act::Settings);
                     }
                     ui.add_space(4.0);
@@ -2053,6 +2095,84 @@ impl App {
                         ui.label(RichText::new(e).size(10.5).color(GIT_DEL));
                     }
                 }
+
+                // Updates. Flags are collected during the immutable borrow of
+                // update_state and acted on afterwards to avoid a borrow clash.
+                ui.separator();
+                let busy = matches!(
+                    self.update_state,
+                    UpdateState::Checking | UpdateState::Working
+                );
+                let mut do_check = false;
+                let mut do_update: Option<update::Release> = None;
+                let mut do_open = false;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("Версия {}", update::current_version()))
+                            .size(11.5)
+                            .color(TXT_DIM),
+                    );
+                    if ui
+                        .add_enabled(
+                            !busy,
+                            egui::Button::new(RichText::new("Проверить обновления").size(11.5)),
+                        )
+                        .clicked()
+                    {
+                        do_check = true;
+                    }
+                });
+                match &self.update_state {
+                    UpdateState::Checking => {
+                        ui.label(RichText::new("проверяю...").size(10.5).color(TXT_FAINT));
+                    },
+                    UpdateState::UpToDate => {
+                        ui.label(
+                            RichText::new("установлена последняя версия").size(10.5).color(TXT_FAINT),
+                        );
+                    },
+                    UpdateState::Working => {
+                        ui.label(
+                            RichText::new("загружаю и устанавливаю, сейчас перезапущусь...")
+                                .size(10.5)
+                                .color(ORANGE),
+                        );
+                    },
+                    UpdateState::Failed(e) => {
+                        ui.label(RichText::new(e).size(10.5).color(GIT_DEL));
+                        if ui.button(RichText::new("Открыть страницу загрузки").size(11.0)).clicked() {
+                            do_open = true;
+                        }
+                    },
+                    UpdateState::Available(r) => {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("Доступна {}", r.version))
+                                    .size(11.5)
+                                    .color(GIT_ADD),
+                            );
+                            if ui
+                                .button(RichText::new("Обновить").size(11.5).color(GIT_ADD))
+                                .clicked()
+                            {
+                                do_update = Some(r.clone());
+                            }
+                        });
+                    },
+                    UpdateState::Idle => {},
+                }
+                if do_check {
+                    self.update_state = UpdateState::Checking;
+                    update::check(self.upd_tx.clone(), ctx.clone());
+                }
+                if let Some(rel) = do_update {
+                    self.persist();
+                    self.update_state = UpdateState::Working;
+                    update::apply(rel, self.upd_tx.clone(), ctx.clone());
+                }
+                if do_open {
+                    update::open_releases();
+                }
             });
         // Settings apply live from memory; the file is written once, on close
         // (and again by on_exit), not on every slider-drag frame.
@@ -2071,6 +2191,7 @@ impl eframe::App for App {
         self.drain_git();
         self.drain_ctx(&ctx);
         self.drain_ctx_index();
+        self.drain_update();
         while let Ok(mut st) = self.stats_rx.try_recv() {
             // The kip tree includes every session's shell as a descendant -
             // subtract them so the first row is kip itself, not the whole app.

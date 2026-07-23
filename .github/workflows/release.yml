@@ -58,8 +58,8 @@ jobs:
             <key>CFBundleName</key><string>kip</string>
             <key>CFBundleDisplayName</key><string>kip</string>
             <key>CFBundleIdentifier</key><string>com.densharik.kip</string>
-            <key>CFBundleVersion</key><string>0.1.0</string>
-            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>CFBundleVersion</key><string>0.1.2</string>
+            <key>CFBundleShortVersionString</key><string>0.1.2</string>
             <key>CFBundleExecutable</key><string>kip</string>
             <key>CFBundleIconFile</key><string>kip</string>
             <key>CFBundlePackageType</key><string>APPL</string>
