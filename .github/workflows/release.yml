@@ -78,11 +78,23 @@ jobs:
         run: ditto -c -k --keepParent dist/kip.app dist/kip-macos.zip
       - name: Build .pkg installer
         run: |
-          mkdir -p pkgroot
+          mkdir -p pkgroot pkgscripts
           cp -R dist/kip.app pkgroot/
+          # Hand the installed app to the logged-in user so in-app updates can
+          # replace it in place, without a password on every update.
+          cat > pkgscripts/postinstall <<'SH'
+          #!/bin/sh
+          u="${INSTALL_PKG_SESSION_OWNER:-$(/usr/bin/stat -f%Su /dev/console)}"
+          if [ -n "$u" ] && [ "$u" != "root" ] && [ "$u" != "loginwindow" ]; then
+            /usr/sbin/chown -R "$u:staff" "/Applications/kip.app"
+          fi
+          exit 0
+          SH
+          chmod +x pkgscripts/postinstall
           pkgbuild --root pkgroot \
             --identifier com.densharik.kip \
             --version "$(echo ${GITHUB_SHA} | cut -c1-7)" \
+            --scripts pkgscripts \
             --install-location /Applications \
             dist/kip-installer.pkg
       - uses: actions/upload-artifact@v4

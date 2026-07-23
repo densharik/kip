@@ -1,8 +1,9 @@
 //! In-app self-update from GitHub Releases. Network via curl (present on macOS
 //! and Windows 10+); no extra crates. Check runs in the background and reports
-//! over an mpsc channel. Applying: Windows swaps the exe in place, macOS runs
-//! the release .pkg via the system installer (handles the root-owned
-//! /Applications case). Both relaunch on success.
+//! over an mpsc channel. Applying: Windows swaps the exe in place; macOS
+//! replaces the .app bundle in place (no password) and falls back to the
+//! release .pkg via the system installer (one password) when the app is
+//! root-owned. Both relaunch on success.
 
 use std::path::Path;
 use std::process::Command;
@@ -14,7 +15,7 @@ const RELEASES_URL: &str = "https://github.com/densharik/kip/releases/latest";
 #[cfg(windows)]
 const ASSET_NAME: &str = "kip.exe";
 #[cfg(target_os = "macos")]
-const ASSET_NAME: &str = "kip-installer.pkg";
+const ASSET_NAME: &str = "kip-macos.zip";
 #[cfg(all(not(windows), not(target_os = "macos")))]
 const ASSET_NAME: &str = "";
 
@@ -38,6 +39,10 @@ pub fn current_label() -> String {
 pub struct Release {
     pub display: String,
     pub asset_url: String,
+    /// macOS .pkg installer URL, the admin fallback when the app is root-owned.
+    /// None on other platforms.
+    #[allow(dead_code)]
+    pub pkg_url: Option<String>,
 }
 
 pub enum UpdateMsg {
@@ -74,12 +79,17 @@ fn do_check() -> Result<Option<Release>, String> {
     if tag == current_build() {
         return Ok(None);
     }
-    let asset_url = v["assets"]
-        .as_array()
-        .and_then(|a| a.iter().find(|x| x["name"].as_str() == Some(ASSET_NAME)))
-        .and_then(|x| x["browser_download_url"].as_str())
-        .ok_or_else(|| format!("в релизе {tag} нет {ASSET_NAME}"))?;
-    Ok(Some(Release { display: short(tag), asset_url: asset_url.to_string() }))
+    let find = |name: &str| -> Option<String> {
+        v["assets"]
+            .as_array()?
+            .iter()
+            .find(|x| x["name"].as_str() == Some(name))
+            .and_then(|x| x["browser_download_url"].as_str())
+            .map(str::to_string)
+    };
+    let asset_url = find(ASSET_NAME).ok_or_else(|| format!("в релизе {tag} нет {ASSET_NAME}"))?;
+    let pkg_url = if cfg!(target_os = "macos") { find("kip-installer.pkg") } else { None };
+    Ok(Some(Release { display: short(tag), asset_url, pkg_url }))
 }
 
 pub fn check(tx: Sender<UpdateMsg>, egui: egui::Context) {
@@ -126,18 +136,97 @@ fn do_apply(rel: &Release) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn do_apply(rel: &Release) -> Result<(), String> {
-    let cur = std::env::current_exe().map_err(|e| format!("нет пути к бинарнику: {e}"))?;
-    let tmp = std::env::temp_dir().join(format!("kip-update-{}", std::process::id()));
+fn bundle_of(cur: &Path) -> Result<std::path::PathBuf, String> {
+    // .../kip.app/Contents/MacOS/kip -> kip.app
+    let b = cur
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or("не найден .app бандл")?;
+    if b.extension().and_then(|e| e.to_str()) != Some("app") {
+        return Err("запущен не из .app - обнови вручную".into());
+    }
+    Ok(b.to_path_buf())
+}
+
+/// Try to replace the bundle in place, no password. Ok(true) = done,
+/// Ok(false) = permission denied (caller should use the admin .pkg), Err = a
+/// hard failure (download/unpack).
+#[cfg(target_os = "macos")]
+fn swap_install(bundle: &Path, rel: &Release) -> Result<bool, String> {
+    let parent = bundle.parent().ok_or("нет каталога бандла")?;
+    let probe = parent.join(".kip-write-test");
+    if std::fs::write(&probe, b"x").is_err() {
+        return Ok(false);
+    }
+    let _ = std::fs::remove_file(&probe);
+
+    let tmp = std::env::temp_dir().join(format!("kip-swap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("temp: {e}"))?;
+    let zip = tmp.join("kip.zip");
+    download(&rel.asset_url, &zip)?;
+    let ok = Command::new("ditto")
+        .args(["-x", "-k"])
+        .arg(&zip)
+        .arg(&tmp)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        return Err("не удалось распаковать архив".into());
+    }
+    let newapp = tmp.join("kip.app");
+    if !newapp.exists() {
+        return Err("в архиве нет kip.app".into());
+    }
+    let _ = Command::new("xattr").args(["-cr"]).arg(&newapp).status();
+
+    // Copy next to the target (same filesystem) so the final swap is atomic.
+    let staged = parent.join("kip.app.new");
+    let _ = std::fs::remove_dir_all(&staged);
+    let staged_ok = Command::new("ditto")
+        .arg(&newapp)
+        .arg(&staged)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !staged_ok {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Ok(false);
+    }
+    let backup = parent.join("kip.app.old");
+    let _ = std::fs::remove_dir_all(&backup);
+    if let Err(e) = std::fs::rename(bundle, &backup) {
+        let _ = std::fs::remove_dir_all(&staged);
+        let _ = std::fs::remove_dir_all(&tmp);
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            return Ok(false);
+        }
+        return Err(format!("не сдвинуть старую версию: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&staged, bundle) {
+        let _ = std::fs::rename(&backup, bundle);
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!("замена бандла: {e}"));
+    }
+    let _ = std::fs::remove_dir_all(&backup);
+    let _ = std::fs::remove_dir_all(&tmp);
+    Ok(true)
+}
+
+/// Admin fallback: run the release .pkg through the system installer. One
+/// password prompt; the .pkg hands the app to the user so the next update can
+/// use the passwordless swap path.
+#[cfg(target_os = "macos")]
+fn pkg_install(rel: &Release) -> Result<(), String> {
+    let pkg_url = rel.pkg_url.as_deref().ok_or("в релизе нет .pkg")?;
+    let tmp = std::env::temp_dir().join(format!("kip-pkg-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| format!("temp: {e}"))?;
     let pkg = tmp.join("kip.pkg");
-    download(&rel.asset_url, &pkg)?;
-
-    // A .pkg-installed app lives in /Applications owned by root, so it cannot be
-    // replaced in-process (that is the Permission denied path). Hand the .pkg to
-    // the system installer with admin rights: macOS shows one password prompt
-    // and swaps the bundle cleanly. `quoted form of` handles shell quoting.
+    download(pkg_url, &pkg)?;
+    // `quoted form of` handles shell quoting inside the AppleScript command.
     let script = format!(
         "do shell script \"installer -pkg \" & quoted form of \"{}\" & \" -target /\" \
          with administrator privileges",
@@ -147,6 +236,7 @@ fn do_apply(rel: &Release) -> Result<(), String> {
         .args(["-e", &script])
         .output()
         .map_err(|e| format!("osascript: {e}"))?;
+    let _ = std::fs::remove_dir_all(&tmp);
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         if err.contains("-128") {
@@ -154,18 +244,14 @@ fn do_apply(rel: &Release) -> Result<(), String> {
         }
         return Err(format!("установка не удалась: {}", err.trim()));
     }
-    let _ = std::fs::remove_dir_all(&tmp);
+    Ok(())
+}
 
-    // Relaunch the freshly installed bundle. `open` must run AFTER we quit:
-    // while this old instance is still alive macOS just reactivates it instead
-    // of launching the new one. Detach a helper that waits for us to exit.
-    let bundle = cur
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .filter(|b| b.extension().and_then(|e| e.to_str()) == Some("app"))
-        .map(|b| b.to_path_buf())
-        .unwrap_or_else(|| "/Applications/kip.app".into());
+/// Relaunch the installed bundle. `open` must run AFTER we quit: while this
+/// instance is alive macOS just reactivates the old app instead of launching
+/// the new one. Detach a helper that waits for us to exit.
+#[cfg(target_os = "macos")]
+fn relaunch(bundle: &Path) -> Result<(), String> {
     let quoted = format!("'{}'", bundle.to_string_lossy().replace('\'', "'\\''"));
     Command::new("sh")
         .arg("-c")
@@ -173,6 +259,16 @@ fn do_apply(rel: &Release) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("перезапуск: {e}"))?;
     std::process::exit(0);
+}
+
+#[cfg(target_os = "macos")]
+fn do_apply(rel: &Release) -> Result<(), String> {
+    let cur = std::env::current_exe().map_err(|e| format!("нет пути к бинарнику: {e}"))?;
+    let bundle = bundle_of(&cur)?;
+    if !swap_install(&bundle, rel)? {
+        pkg_install(rel)?;
+    }
+    relaunch(&bundle)
 }
 
 #[cfg(all(not(windows), not(target_os = "macos")))]
