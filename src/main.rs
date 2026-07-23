@@ -1222,7 +1222,7 @@ impl App {
         {
             let git = self.sessions[idx].git.clone();
             let s = &mut self.sessions[idx];
-            ui.horizontal(|ui| {
+            ui.horizontal_centered(|ui| {
                 ui.add_space(6.0);
                 // Warp-style path chip: click opens the directory switcher.
                 let path_full = tilde(&s.cwd);
@@ -1272,7 +1272,9 @@ impl App {
                     } else {
                         RichText::new("Настройки").size(11.5)
                     };
-                    if ui.button(label).on_hover_text(if upd { "Доступно обновление" } else { "" }).clicked() {
+                    let btn = ui.button(label);
+                    let btn = if upd { btn.on_hover_text("Доступно обновление") } else { btn };
+                    if btn.clicked() {
                         acts.push(Act::Settings);
                     }
                     ui.add_space(4.0);
@@ -1289,14 +1291,8 @@ impl App {
                             }
                         },
                         Phase::Suspended | Phase::Exited(_) => {
-                            if s.claude_session_id.is_some()
-                                && ui.button(RichText::new("Продолжить Claude").size(11.5).color(GIT_ADD)).clicked()
-                            {
-                                acts.push(Act::Resume(s.id, true));
-                            }
-                            if ui.button(RichText::new("Терминал").size(11.5)).clicked() {
-                                acts.push(Act::Resume(s.id, false));
-                            }
+                            // Resume/terminal actions live on the card in the
+                            // terminal area; the status bar just shows state.
                             if let Phase::Exited(code) = &s.phase {
                                 let txt = match code {
                                     Some(c) => format!("завершено, код {c}"),
@@ -1500,16 +1496,18 @@ impl App {
                     top,
                     Stroke::new(1.0, Color32::from_rgb(0x2a, 0x2a, 0x2a)),
                 );
-                ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.add_space(10.0);
                     ui.label(RichText::new(">").font(font.clone()).color(TXT_DIM));
-                    // Multiline so Shift+Enter inserts a newline; plain Enter is
-                    // consumed above and submits, so the editor never sees it.
+                    // Multiline, but egui only inserts a newline on its return_key -
+                    // point that at Shift+Enter. Plain Enter is consumed above and
+                    // submits, so the editor never sees it.
                     let resp = ui.add(
                         egui::TextEdit::multiline(&mut self.cmd_input)
                             .frame(Frame::new())
                             .font(font.clone())
                             .desired_rows(1)
+                            .return_key(egui::KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter))
                             .hint_text(RichText::new("команда...").font(font).color(TXT_FAINT))
                             .desired_width(ui.available_width() - 8.0),
                     );
