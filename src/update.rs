@@ -156,7 +156,9 @@ fn do_apply(rel: &Release) -> Result<(), String> {
     }
     let _ = std::fs::remove_dir_all(&tmp);
 
-    // Relaunch the freshly installed bundle.
+    // Relaunch the freshly installed bundle. `open` must run AFTER we quit:
+    // while this old instance is still alive macOS just reactivates it instead
+    // of launching the new one. Detach a helper that waits for us to exit.
     let bundle = cur
         .parent()
         .and_then(|p| p.parent())
@@ -164,7 +166,12 @@ fn do_apply(rel: &Release) -> Result<(), String> {
         .filter(|b| b.extension().and_then(|e| e.to_str()) == Some("app"))
         .map(|b| b.to_path_buf())
         .unwrap_or_else(|| "/Applications/kip.app".into());
-    Command::new("open").arg(&bundle).spawn().map_err(|e| format!("перезапуск: {e}"))?;
+    let quoted = format!("'{}'", bundle.to_string_lossy().replace('\'', "'\\''"));
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("sleep 1; open -n {quoted}"))
+        .spawn()
+        .map_err(|e| format!("перезапуск: {e}"))?;
     std::process::exit(0);
 }
 
