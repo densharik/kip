@@ -13,7 +13,6 @@ use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_ME
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{MB_OK, MessageBeep};
 
 use super::SysStats;
 
@@ -140,13 +139,9 @@ pub fn clipboard_paths() -> Option<String> {
     None
 }
 
-/// Minimal notification: the default system sound. A visual toast needs our
-/// window handle (owned by eframe) - deferred to a later version.
-pub fn notify(_title: &str, _body: &str, sound: bool) {
-    if sound {
-        unsafe { MessageBeep(MB_OK) };
-    }
-}
+/// Desktop notifications need a toast/window handle (owned by eframe) and are
+/// deferred to a later version; the sidebar unread markers still work.
+pub fn notify(_title: &str, _body: &str, _sound: bool) {}
 
 fn working_set_kb(pid: i32) -> u64 {
     let h = open_query(pid);

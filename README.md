@@ -56,7 +56,7 @@ The binary lands at `target/release/rwarp` (`rwarp.exe` on Windows).
 | Exact context hook | yes | yes | not yet |
 | `cd` follows in the path chip | yes | yes | not yet |
 | File/image clipboard paste | yes | yes | text only |
-| Notifications | full | full | sound only |
+| Desktop notifications | full | full | not yet |
 
 Windows runs on ConPTY with PowerShell as the shell. The items marked "not yet" fall back gracefully and are on the roadmap.
 
