@@ -20,11 +20,11 @@ jobs:
         shell: bash
         run: |
           mkdir dist
-          cp target/release/rwarp.exe dist/rwarp.exe
+          cp target/release/kip.exe dist/kip.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: rwarp-windows-x64
-          path: dist/rwarp.exe
+          name: kip-windows-x64
+          path: dist/kip.exe
 
   macos:
     runs-on: macos-latest
@@ -39,27 +39,29 @@ jobs:
           cargo build --release --target x86_64-apple-darwin
           cargo build --release --target aarch64-apple-darwin
           mkdir -p dist
-          lipo -create -output dist/rwarp \
-            target/x86_64-apple-darwin/release/rwarp \
-            target/aarch64-apple-darwin/release/rwarp
-      - name: Bundle rwarp.app
+          lipo -create -output dist/kip \
+            target/x86_64-apple-darwin/release/kip \
+            target/aarch64-apple-darwin/release/kip
+      - name: Bundle kip.app
         run: |
-          APP=dist/rwarp.app
+          APP=dist/kip.app
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp dist/rwarp "$APP/Contents/MacOS/rwarp"
-          chmod +x "$APP/Contents/MacOS/rwarp"
-          cp resources/rwarp-ctx-hook.sh "$APP/Contents/Resources/"
+          cp dist/kip "$APP/Contents/MacOS/kip"
+          chmod +x "$APP/Contents/MacOS/kip"
+          cp resources/kip-ctx-hook.sh "$APP/Contents/Resources/"
+          cp resources/icon.icns "$APP/Contents/Resources/kip.icns"
           cat > "$APP/Contents/Info.plist" <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-            <key>CFBundleName</key><string>rwarp</string>
-            <key>CFBundleDisplayName</key><string>rwarp</string>
-            <key>CFBundleIdentifier</key><string>com.densharik.rwarp</string>
+            <key>CFBundleName</key><string>kip</string>
+            <key>CFBundleDisplayName</key><string>kip</string>
+            <key>CFBundleIdentifier</key><string>com.densharik.kip</string>
             <key>CFBundleVersion</key><string>0.1.0</string>
             <key>CFBundleShortVersionString</key><string>0.1.0</string>
-            <key>CFBundleExecutable</key><string>rwarp</string>
+            <key>CFBundleExecutable</key><string>kip</string>
+            <key>CFBundleIconFile</key><string>kip</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>LSMinimumSystemVersion</key><string>11.0</string>
             <key>NSHighResolutionCapable</key><true/>
@@ -67,11 +69,11 @@ jobs:
           </plist>
           PLIST
           codesign --force --deep -s - "$APP"
-          ditto -c -k --keepParent "$APP" dist/rwarp-macos.zip
+          ditto -c -k --keepParent "$APP" dist/kip-macos.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: rwarp-macos
-          path: dist/rwarp-macos.zip
+          name: kip-macos
+          path: dist/kip-macos.zip
 
   release:
     needs: [windows, macos]
@@ -85,6 +87,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/rwarp-windows-x64/rwarp.exe
-            artifacts/rwarp-macos/rwarp-macos.zip
+            artifacts/kip-windows-x64/kip.exe
+            artifacts/kip-macos/kip-macos.zip
           generate_release_notes: true

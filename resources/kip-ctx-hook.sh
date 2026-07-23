@@ -1,12 +1,12 @@
 #!/bin/sh
-# rwarp-ctx-hook: snapshots Claude Code statusline context for rwarp.
+# kip-ctx-hook: snapshots Claude Code statusline context for kip.
 # stdin: statusline JSON from claude (called ~1/s). $1 (optional): the user's
 # previous statusline command to chain; it receives the same stdin, its stdout
 # goes back to claude untouched. POSIX sh only - /bin/sh may be bash or zsh.
 # Any snapshot failure is silent: the user's statusline always runs.
 
 PREV="${1:-}"
-DIR="${HOME}/.rwarp/ctx"
+DIR="${HOME}/.kip/ctx"
 IN="${DIR}/in.$$"
 
 run_prev() {

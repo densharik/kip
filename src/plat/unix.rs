@@ -116,7 +116,7 @@ pub fn clipboard_paths() -> Option<String> {
     }
     super::sweep_paste_temp();
     let dest = std::env::temp_dir().join(format!(
-        "rwarp-paste-{}.png",
+        "kip-paste-{}.png",
         std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis())

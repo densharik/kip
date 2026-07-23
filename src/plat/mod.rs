@@ -18,7 +18,7 @@ pub struct SysStats {
     pub procs: Vec<(String, f32, u64)>,
 }
 
-/// Delete day-old rwarp-paste-*.png files from the temp dir (background).
+/// Delete day-old kip-paste-*.png files from the temp dir (background).
 /// Pure std, identical on every platform.
 pub fn sweep_paste_temp() {
     std::thread::spawn(|| {
@@ -29,7 +29,7 @@ pub fn sweep_paste_temp() {
                     .metadata()
                     .and_then(|m| m.modified())
                     .is_ok_and(|t| t.elapsed().is_ok_and(|d| d.as_secs() > 24 * 3600));
-                if name.to_string_lossy().starts_with("rwarp-paste-") && old {
+                if name.to_string_lossy().starts_with("kip-paste-") && old {
                     let _ = std::fs::remove_file(e.path());
                 }
             }

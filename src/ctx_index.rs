@@ -1,6 +1,6 @@
 //! Context-% pipeline: hook snapshots + jsonl estimates merged by source time.
 //!
-//! Data flow: background threads read `~/.rwarp/ctx` snapshots (written by the
+//! Data flow: background threads read `~/.kip/ctx` snapshots (written by the
 //! statusline hook) and estimate from `~/.claude/projects/**.jsonl` transcripts,
 //! then send `CtxMsg` over mpsc; the UI drains the channel into `CtxIndex` and
 //! renders badges with a synchronous lookup. The UI thread never reads files.
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::config::Settings;
 use crate::session::{claude_dir, project_dir, valid_sid};
 
-pub const HOOK_SCRIPT: &str = include_str!("../resources/rwarp-ctx-hook.sh");
+pub const HOOK_SCRIPT: &str = include_str!("../resources/kip-ctx-hook.sh");
 
 const SNAPSHOT_MAX: u64 = 64 * 1024;
 /// Progressive transcript tail: one jsonl line can exceed 64KB (huge tool
@@ -209,7 +209,7 @@ pub fn resolve_jsonl(map: &SharedMap, sid: &str, cwd_hint: Option<&Path>) -> Opt
 // ---- hook snapshots ----
 
 fn ctx_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".rwarp").join("ctx"))
+    dirs::home_dir().map(|h| h.join(".kip").join("ctx"))
 }
 
 pub fn by_sid_path(sid: &str) -> Option<PathBuf> {
@@ -468,10 +468,10 @@ fn claude_settings_path() -> Option<PathBuf> {
 
 /// $HOME stays literal in settings.json so the entry survives dotfiles sync
 /// to another machine/user.
-const HOOK_CMD: &str = "\"$HOME\"/.rwarp/bin/rwarp-ctx-hook.sh";
+const HOOK_CMD: &str = "\"$HOME\"/.kip/bin/kip-ctx-hook.sh";
 
 fn is_ours(cmd: &str) -> bool {
-    cmd.contains(".rwarp/bin/rwarp-ctx-hook.sh")
+    cmd.contains(".kip/bin/kip-ctx-hook.sh")
 }
 
 fn build_cmd(prev_cmd: Option<&str>) -> String {
@@ -530,19 +530,19 @@ fn write_settings_root(path: &Path, root: &serde_json::Value) -> Result<(), Stri
         let _ = std::fs::create_dir_all(dir);
     }
     let json = serde_json::to_vec_pretty(root).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.rwarp-tmp");
+    let tmp = path.with_extension("json.kip-tmp");
     std::fs::write(&tmp, json).map_err(|e| format!("запись settings.json: {e}"))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("замена settings.json: {e}"))
 }
 
-/// Copy the embedded script to ~/.rwarp/bin (the .app path is not stable -
+/// Copy the embedded script to ~/.kip/bin (the .app path is not stable -
 /// moves, updates, duplicates; this one is). Idempotent, run on every start
 /// while the hook is enabled so updates propagate.
 pub fn write_hook_script() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or("нет домашней директории")?;
-    let bin = home.join(".rwarp").join("bin");
+    let bin = home.join(".kip").join("bin");
     std::fs::create_dir_all(&bin).map_err(|e| format!("mkdir {}: {e}", bin.display()))?;
-    let p = bin.join("rwarp-ctx-hook.sh");
+    let p = bin.join("kip-ctx-hook.sh");
     std::fs::write(&p, HOOK_SCRIPT).map_err(|e| format!("запись хука: {e}"))?;
     #[cfg(unix)]
     {
@@ -553,7 +553,7 @@ pub fn write_hook_script() -> Result<PathBuf, String> {
 }
 
 /// The wrapped command carries the previous one as its quoted argument -
-/// recover it when rwarp's own state was lost (fresh machine, reset state.json)
+/// recover it when kip's own state was lost (fresh machine, reset state.json)
 /// so a later rollback still restores the user's statusline.
 fn recover_prev(cmd: &str) -> String {
     let Some(rest) = cmd.strip_prefix(HOOK_CMD).map(str::trim) else { return String::new() };
@@ -572,7 +572,7 @@ pub fn install_hook(settings: &mut Settings) -> Result<(), String> {
         settings.prev_statusline = Some(prev);
         write_settings_root(&path, &root)?;
     } else if settings.prev_statusline.is_none() {
-        // Already wrapped, but this rwarp never saw the original.
+        // Already wrapped, but this kip never saw the original.
         let cmd = root["statusLine"]["command"].as_str().unwrap_or_default();
         settings.prev_statusline = Some(recover_prev(cmd));
     }
@@ -604,7 +604,7 @@ mod tests {
     }
 
     fn tdir(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("rwarp-test-{name}-{}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("kip-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -865,7 +865,7 @@ mod tests {
 
     #[cfg(unix)]
     fn run_hook(home: &Path, stdin: &str, arg: Option<&str>) {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/rwarp-ctx-hook.sh");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/kip-ctx-hook.sh");
         let mut cmd = Command::new("/bin/sh");
         cmd.arg(&script);
         if let Some(a) = arg {
@@ -890,13 +890,13 @@ mod tests {
             "{{\"session_id\":\"{SID}\",\"model\":{{\"id\":\"claude-fable-5\"}},\"context_window\":{{\"used_percentage\":37.5}}}}"
         );
         run_hook(&home, &stdin, None);
-        let by_sid = home.join(".rwarp/ctx/by-sid").join(format!("{SID}.json"));
+        let by_sid = home.join(".kip/ctx/by-sid").join(format!("{SID}.json"));
         let text = std::fs::read_to_string(by_sid).expect("by-sid snapshot written");
         let u = parse_snapshot(&text).unwrap();
         assert_eq!(u.sid, SID);
         assert!((u.pct - 37.5).abs() < 0.01);
         // by-pid keyed by the hook's parent (this test process).
-        let by_pid = home.join(".rwarp/ctx/by-pid");
+        let by_pid = home.join(".kip/ctx/by-pid");
         assert!(std::fs::read_dir(by_pid).unwrap().flatten().count() >= 1);
     }
 
@@ -910,7 +910,7 @@ mod tests {
             &format!("{{\"session_id\":\"{SID}\",\"context_window\":{{\"used_percentage\":0}}}}"),
             None,
         );
-        let by_sid = home.join(".rwarp/ctx/by-sid");
+        let by_sid = home.join(".kip/ctx/by-sid");
         let n = std::fs::read_dir(by_sid).map(|r| r.flatten().count()).unwrap_or(0);
         assert_eq!(n, 0);
     }
@@ -926,7 +926,7 @@ mod tests {
         let echoed = std::fs::read_to_string(&out).expect("prev command ran");
         assert_eq!(echoed, stdin, "prev must receive the exact stdin");
         // No stdin-buffer litter left behind.
-        let leftovers = std::fs::read_dir(home.join(".rwarp/ctx"))
+        let leftovers = std::fs::read_dir(home.join(".kip/ctx"))
             .unwrap()
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with("in."))

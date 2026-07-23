@@ -75,7 +75,7 @@ pub struct AppState {
 }
 
 fn state_path() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| "/tmp".into()).join("rwarp").join("state.json")
+    dirs::config_dir().unwrap_or_else(|| "/tmp".into()).join("kip").join("state.json")
 }
 
 pub fn load_state() -> AppState {

@@ -285,7 +285,7 @@ pub fn spawn_live(
     let mut env = HashMap::new();
     env.insert("TERM".into(), "xterm-256color".into());
     env.insert("COLORTERM".into(), "truecolor".into());
-    env.insert("TERM_PROGRAM".into(), "rwarp".into());
+    env.insert("TERM_PROGRAM".into(), "kip".into());
 
     // Built via Default so the windows-only `escape_args` field is set too.
     let mut opts = PtyOptions::default();

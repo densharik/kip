@@ -46,7 +46,7 @@ const POPUP_BG: Color32 = Color32::from_rgb(0x1f, 0x1f, 0x1f);
 const POPUP_STROKE: Color32 = Color32::from_rgb(0x35, 0x35, 0x35);
 
 fn main() -> eframe::Result {
-    // If rwarp itself was launched from a Claude Code session, its CLAUDE* markers
+    // If kip itself was launched from a Claude Code session, its CLAUDE* markers
     // leak into our shells and a claude started there thinks it is a child session
     // and disables transcript saving (breaking resume and context tracking).
     let claude_vars: Vec<String> = std::env::vars()
@@ -58,17 +58,25 @@ fn main() -> eframe::Result {
         unsafe { std::env::remove_var(k) };
     }
 
-    // Clipboard-image pastes land in temp as rwarp-paste-*.png; sweep old ones.
+    // Clipboard-image pastes land in temp as kip-paste-*.png; sweep old ones.
     plat::sweep_paste_temp();
 
+    // 256x256 raw RGBA, matching resources/icon_1024.png. Sets the taskbar/dock
+    // icon at runtime (Windows has no embedded exe icon; macOS .app uses the icns).
+    let icon = egui::IconData {
+        rgba: include_bytes!("../resources/icon_256.rgba").to_vec(),
+        width: 256,
+        height: 256,
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("rwarp")
+            .with_title("kip")
+            .with_icon(std::sync::Arc::new(icon))
             .with_inner_size([1160.0, 740.0])
             .with_min_inner_size([680.0, 420.0]),
         ..Default::default()
     };
-    eframe::run_native("rwarp", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native("kip", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
 enum Act {
@@ -161,7 +169,7 @@ impl App {
         ctx_index::sweep();
         #[cfg(not(windows))]
         if state.settings.ctx_hook {
-            // Keep the installed hook script current across rwarp updates.
+            // Keep the installed hook script current across kip updates.
             let _ = ctx_index::write_hook_script();
         }
         let mut app = App {
@@ -561,7 +569,7 @@ impl App {
                         s.unread = true;
                         if self.settings.notify_bell {
                             let name = s.display_name();
-                            plat::notify("rwarp", &format!("{name}: сигнал терминала"), self.settings.notify_sound);
+                            plat::notify("kip", &format!("{name}: сигнал терминала"), self.settings.notify_sound);
                         }
                     }
                 },
@@ -742,7 +750,7 @@ impl App {
                         s.unread = true;
                         if self.settings.notify_job_done {
                             plat::notify(
-                                "rwarp",
+                                "kip",
                                 &format!("{}: агент завершил работу ({})", s.display_name(), fmt_dur(dur)),
                                 self.settings.notify_sound,
                             );
@@ -1575,7 +1583,7 @@ impl App {
         if stale && !self.stats_inflight {
             self.stats_inflight = true;
             let mut targets: Vec<(String, i32)> =
-                vec![("rwarp".into(), std::process::id() as i32)];
+                vec![("kip".into(), std::process::id() as i32)];
             for s in &self.sessions {
                 if let Some(live) = s.live() {
                     targets.push((s.display_name(), live.shell_pid));
@@ -1944,7 +1952,7 @@ impl App {
         ui.painter().rect_filled(rect, 0.0, palette::TERM_BG);
         ui.vertical_centered(|ui| {
             ui.add_space(rect.height() * 0.35);
-            ui.label(RichText::new("rwarp").size(22.0).color(TXT_DIM));
+            ui.label(RichText::new("kip").size(22.0).color(TXT_DIM));
             ui.label(RichText::new("Нет открытых сессий").size(12.5).color(TXT_FAINT));
             ui.add_space(14.0);
             ui.horizontal(|ui| {
@@ -2022,7 +2030,7 @@ impl App {
                     let resp = ui
                         .checkbox(&mut hook_on, "Точный % контекста Claude (statusline-хук)")
                         .on_hover_text(
-                            "Ставит крошечный скрипт в ~/.rwarp/bin и подключает его statusline-хуком \
+                            "Ставит крошечный скрипт в ~/.kip/bin и подключает его statusline-хуком \
                              Claude Code - % будет ровно тот, что видит сам Claude.\n\
                              Уже настроенный statusline не ломается: он оборачивается и продолжает \
                              работать. Снятие галочки возвращает всё как было.",
@@ -2064,8 +2072,8 @@ impl eframe::App for App {
         self.drain_ctx(&ctx);
         self.drain_ctx_index();
         while let Ok(mut st) = self.stats_rx.try_recv() {
-            // The rwarp tree includes every session's shell as a descendant -
-            // subtract them so the first row is rwarp itself, not the whole app.
+            // The kip tree includes every session's shell as a descendant -
+            // subtract them so the first row is kip itself, not the whole app.
             if let Some((first, rest)) = st.procs.split_first_mut() {
                 for (_, cpu, rss) in rest.iter() {
                     first.1 = (first.1 - cpu).max(0.0);
