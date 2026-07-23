@@ -1,12 +1,18 @@
 name: Release
 
+# Every push to main is a release: no version numbers, the build id is the
+# commit. The in-app updater compares its embedded commit against the latest
+# release and updates when they differ.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: write
+
+env:
+  KIP_BUILD: build-${{ github.sha }}
 
 jobs:
   windows:
@@ -15,6 +21,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release
       - run: cargo build --release
       - name: Stage artifact
         shell: bash
@@ -23,7 +30,7 @@ jobs:
           cp target/release/kip.exe dist/kip.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: kip-windows-x64
+          name: kip-windows
           path: dist/kip.exe
 
   macos:
@@ -34,6 +41,7 @@ jobs:
         with:
           targets: x86_64-apple-darwin,aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release
       - name: Build universal binary
         run: |
           cargo build --release --target x86_64-apple-darwin
@@ -69,24 +77,39 @@ jobs:
           </plist>
           PLIST
           codesign --force --deep -s - "$APP"
-          ditto -c -k --keepParent "$APP" dist/kip-macos.zip
+      - name: Zip (for the in-app updater and manual install)
+        run: ditto -c -k --keepParent dist/kip.app dist/kip-macos.zip
+      - name: Build .pkg installer
+        run: |
+          mkdir -p pkgroot
+          cp -R dist/kip.app pkgroot/
+          pkgbuild --root pkgroot \
+            --identifier com.densharik.kip \
+            --version "$(echo ${GITHUB_SHA} | cut -c1-7)" \
+            --install-location /Applications \
+            dist/kip-installer.pkg
       - uses: actions/upload-artifact@v4
         with:
           name: kip-macos
-          path: dist/kip-macos.zip
+          path: |
+            dist/kip-macos.zip
+            dist/kip-installer.pkg
 
   release:
     needs: [windows, macos]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Create release
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: build-${{ github.sha }}
+          name: build-${{ github.sha }}
+          target_commitish: ${{ github.sha }}
           files: |
-            artifacts/kip-windows-x64/kip.exe
+            artifacts/kip-windows/kip.exe
             artifacts/kip-macos/kip-macos.zip
+            artifacts/kip-macos/kip-installer.pkg
           generate_release_notes: true

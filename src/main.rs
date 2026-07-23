@@ -2124,7 +2124,7 @@ impl App {
                 let mut do_open = false;
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("Версия {}", update::current_version()))
+                        RichText::new(format!("Сборка {}", update::current_label()))
                             .size(11.5)
                             .color(TXT_DIM),
                     );
@@ -2163,7 +2163,7 @@ impl App {
                     UpdateState::Available(r) => {
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(format!("Доступна {}", r.version))
+                                RichText::new(format!("Доступна сборка {}", r.display))
                                     .size(11.5)
                                     .color(GIT_ADD),
                             );

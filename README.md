@@ -31,10 +31,10 @@ Claude Code does not store the context percentage anywhere on disk; it computes 
 
 ### Download a release
 
-Grab the latest build from the [Releases](https://github.com/densharik/kip/releases) page.
+Grab the latest build from the [Releases](https://github.com/densharik/kip/releases) page. After that, kip updates itself from a button in settings, so this is a one-time step.
 
+- **macOS:** download `kip-installer.pkg` and open it. Because it is not notarized, right-click the .pkg and choose Open the first time, then follow the installer (it asks for your password to install into Applications). Installed this way, kip launches normally with no Gatekeeper warning. If you prefer, `kip-macos.zip` still works: unzip, move `kip.app` to Applications, and run `xattr -cr /Applications/kip.app` once.
 - **Windows:** download `kip.exe` and run it. It is a single portable binary; put it anywhere.
-- **macOS:** download `kip-macos.zip`, unzip, and move `kip.app` to Applications. The app is not notarized, so on first launch right-click it and choose Open (or run `xattr -cr /Applications/kip.app`).
 
 ### Build from source
 
