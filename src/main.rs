@@ -1456,10 +1456,14 @@ impl App {
                 self.hist_sel = Some(sel);
                 self.cmd_input = display[sel].clone();
                 caret_end = true;
-            } else if self.cmd_input.is_empty() && !self.history.is_empty() {
+            } else if self.cmd_input.is_empty() && show_n > 0 {
+                // First Up on an empty line: open and land on the most recent
+                // command right away, not on a second press.
                 self.hist_forced = true;
                 self.hist_dismissed = false;
-                self.hist_sel = None;
+                self.hist_sel = Some(show_n - 1);
+                self.cmd_input = display[show_n - 1].clone();
+                caret_end = true;
                 hist_visible = true;
             }
         }
