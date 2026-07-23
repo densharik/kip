@@ -1439,7 +1439,14 @@ impl App {
             .collect();
         display.reverse();
         let show_n = display.len();
-        let mut hist_visible = !self.hist_dismissed
+        // While settings or the directory switcher is open the editor is not
+        // interactive; close the history popup so it does not sit there frozen.
+        if !interactive {
+            self.hist_forced = false;
+            self.hist_sel = None;
+        }
+        let mut hist_visible = interactive
+            && !self.hist_dismissed
             && (!self.cmd_input.is_empty() || self.hist_forced)
             && show_n > 0;
 
