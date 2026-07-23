@@ -64,7 +64,7 @@ Windows runs on ConPTY with PowerShell as the shell. The items marked "not yet" 
 ## Requirements
 
 - [Claude Code](https://www.anthropic.com/claude-code) installed and on your `PATH`.
-- macOS 11+, a recent Linux, or Windows 10/11.
+- macOS 11+ (Apple Silicon native; Intel Macs run it under Rosetta 2), a recent Linux, or Windows 10/11.
 
 ## License
 

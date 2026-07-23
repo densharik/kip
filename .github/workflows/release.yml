@@ -34,22 +34,19 @@ jobs:
           path: dist/kip.exe
 
   macos:
+    # macos-latest is Apple Silicon, so this builds arm64 natively in one pass.
+    # Intel Macs run it through Rosetta 2.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release
-      - name: Build universal binary
+      - name: Build (Apple Silicon)
         run: |
-          cargo build --release --target x86_64-apple-darwin
-          cargo build --release --target aarch64-apple-darwin
+          cargo build --release
           mkdir -p dist
-          lipo -create -output dist/kip \
-            target/x86_64-apple-darwin/release/kip \
-            target/aarch64-apple-darwin/release/kip
+          cp target/release/kip dist/kip
       - name: Bundle kip.app
         run: |
           APP=dist/kip.app
