@@ -260,7 +260,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         let (fg, bg) = palette::cell_colors(cell.fg, cell.bg, flags, colors, selected);
 
         if point == cursor.point {
-            cursor_cell = Some((cell.c, bg.unwrap_or(palette::TERM_BG)));
+            cursor_cell = Some((cell.c, bg.unwrap_or(palette::term_bg())));
         }
 
         let spacer = flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
@@ -288,7 +288,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
 
     // ---- Render (lock released) ----
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, palette::TERM_BG);
+    painter.rect_filled(rect, 0.0, palette::term_bg());
 
     let mut buf = String::with_capacity(4);
     for dc in &cells {
@@ -334,7 +334,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
             let shape = if focused { cursor.shape } else { CursorShape::HollowBlock };
             match shape {
                 CursorShape::Block => {
-                    painter.rect_filled(cell_rect, 0.0, palette::CURSOR);
+                    painter.rect_filled(cell_rect, 0.0, palette::cursor());
                     if let Some((c, _)) = cursor_cell {
                         if c != ' ' {
                             painter.text(
@@ -342,7 +342,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                                 Align2::LEFT_TOP,
                                 c,
                                 font_id.clone(),
-                                palette::TERM_BG,
+                                palette::term_bg(),
                             );
                         }
                     }
@@ -351,21 +351,21 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                     painter.rect_filled(
                         Rect::from_min_size(Pos2::new(x, y), Vec2::new(2.0, cell_h)),
                         0.0,
-                        palette::CURSOR,
+                        palette::cursor(),
                     );
                 },
                 CursorShape::Underline => {
                     painter.rect_filled(
                         Rect::from_min_size(Pos2::new(x, y + cell_h - 2.0), Vec2::new(cell_w, 2.0)),
                         0.0,
-                        palette::CURSOR,
+                        palette::cursor(),
                     );
                 },
                 CursorShape::HollowBlock => {
                     painter.rect_stroke(
                         cell_rect,
                         0.0,
-                        Stroke::new(1.0, palette::CURSOR),
+                        Stroke::new(1.0, palette::cursor()),
                         StrokeKind::Inside,
                     );
                 },

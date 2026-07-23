@@ -22,6 +22,10 @@ pub struct Settings {
     pub ctx_hook: bool,
     /// Serialized original statusLine value for rollback ("" = key was absent).
     pub prev_statusline: Option<String>,
+    /// Terminal color preset key (see palette::PRESETS).
+    pub theme: String,
+    /// Optional selection-highlight override; None uses the preset's color.
+    pub accent: Option<[u8; 3]>,
 }
 
 impl Default for Settings {
@@ -39,6 +43,8 @@ impl Default for Settings {
             copy_on_select: true,
             ctx_hook: false,
             prev_statusline: None,
+            theme: "tomorrow".into(),
+            accent: None,
         }
     }
 }

@@ -31,8 +31,6 @@ const TICK: Duration = Duration::from_secs(2);
 const GIT_INTERVAL: Duration = Duration::from_secs(7);
 const BUSY_NOTIFY_MIN: Duration = Duration::from_secs(5);
 
-const BG_SIDEBAR: Color32 = Color32::from_rgb(0x19, 0x19, 0x19);
-const BG_BAR: Color32 = Color32::from_rgb(0x1c, 0x1c, 0x1c);
 const TXT: Color32 = Color32::from_rgb(0xc4, 0xc4, 0xc4);
 const TXT_DIM: Color32 = Color32::from_rgb(0x7a, 0x7a, 0x7a);
 const TXT_FAINT: Color32 = Color32::from_rgb(0x5a, 0x5a, 0x5a);
@@ -169,8 +167,9 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
-        apply_style(&cc.egui_ctx);
         let state = load_state();
+        palette::apply(&state.settings.theme, state.settings.accent.map(rgb32));
+        apply_style(&cc.egui_ctx);
         cc.egui_ctx.set_zoom_factor(state.settings.ui_scale.clamp(0.5, 2.0));
         let (ev_tx, ev_rx) = mpsc::channel();
         let (git_tx, git_rx) = mpsc::channel();
@@ -1488,7 +1487,7 @@ impl App {
             .exact_size(panel_h)
             .resizable(false)
             .show_separator_line(false)
-            .frame(Frame::new().fill(BG_BAR))
+            .frame(Frame::new().fill(palette::chrome_bar()))
             .show(ui, |ui| {
                 let top = ui.max_rect().top();
                 ui.painter().hline(
@@ -1915,7 +1914,7 @@ impl App {
         let mut skip_changed = false;
         let s = &mut self.sessions[idx];
         let rect = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(rect, 0.0, palette::TERM_BG);
+        ui.painter().rect_filled(rect, 0.0, palette::term_bg());
 
         if let Some(snap) = &s.snapshot {
             ScrollArea::vertical()
@@ -2007,7 +2006,7 @@ impl App {
 
     fn empty_state(&self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         let rect = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(rect, 0.0, palette::TERM_BG);
+        ui.painter().rect_filled(rect, 0.0, palette::term_bg());
         ui.vertical_centered(|ui| {
             ui.add_space(rect.height() * 0.35);
             ui.label(RichText::new("kip").size(22.0).color(TXT_DIM));
@@ -2069,6 +2068,54 @@ impl App {
                     ui.label("Команда Claude");
                     ui.add(egui::TextEdit::singleline(&mut self.settings.claude_cmd).desired_width(160.0));
                     ui.end_row();
+
+                    ui.label("Тема");
+                    let cur = palette::PRESETS
+                        .iter()
+                        .find(|p| p.key == self.settings.theme)
+                        .map(|p| p.label)
+                        .unwrap_or(palette::PRESETS[0].label);
+                    let mut theme_changed = false;
+                    egui::ComboBox::from_id_salt("theme-preset")
+                        .selected_text(cur)
+                        .width(160.0)
+                        .show_ui(ui, |ui| {
+                            for p in palette::PRESETS.iter() {
+                                if ui.selectable_label(self.settings.theme == p.key, p.label).clicked()
+                                    && self.settings.theme != p.key
+                                {
+                                    self.settings.theme = p.key.to_string();
+                                    // A fresh preset drops the custom accent so
+                                    // its native selection color shows.
+                                    self.settings.accent = None;
+                                    theme_changed = true;
+                                }
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Акцент выделения");
+                    ui.horizontal(|ui| {
+                        let s = palette::selection();
+                        let mut acc = self.settings.accent.unwrap_or([s.r(), s.g(), s.b()]);
+                        if ui.color_edit_button_srgb(&mut acc).changed() {
+                            self.settings.accent = Some(acc);
+                            theme_changed = true;
+                        }
+                        if self.settings.accent.is_some()
+                            && ui.small_button("сброс").clicked()
+                        {
+                            self.settings.accent = None;
+                            theme_changed = true;
+                        }
+                    });
+                    ui.end_row();
+
+                    if theme_changed {
+                        palette::apply(&self.settings.theme, self.settings.accent.map(rgb32));
+                        apply_style(ctx);
+                        ctx.request_repaint();
+                    }
                 });
                 ui.separator();
                 ui.checkbox(&mut self.settings.notify_job_done, "Уведомлять, когда агент завершил работу");
@@ -2292,20 +2339,20 @@ impl eframe::App for App {
         let acts = egui::Panel::left("sidebar")
             .exact_size(236.0)
             .resizable(false)
-            .frame(Frame::new().fill(BG_SIDEBAR))
+            .frame(Frame::new().fill(palette::chrome_sidebar()))
             .show(ui, |ui| self.sidebar(ui))
             .inner;
         self.apply(acts, &ctx);
 
         let acts = egui::Panel::bottom("statusbar")
             .exact_size(34.0)
-            .frame(Frame::new().fill(BG_BAR))
+            .frame(Frame::new().fill(palette::chrome_bar()))
             .show(ui, |ui| self.bottom_bar(ui))
             .inner;
         self.apply(acts, &ctx);
 
         let acts = egui::CentralPanel::default()
-            .frame(Frame::new().fill(palette::TERM_BG))
+            .frame(Frame::new().fill(palette::term_bg()))
             .show(ui, |ui| self.central(ui))
             .inner;
         self.apply(acts, &ctx);
@@ -2356,13 +2403,17 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+fn rgb32([r, g, b]: [u8; 3]) -> Color32 {
+    Color32::from_rgb(r, g, b)
+}
+
 fn apply_style(ctx: &egui::Context) {
     let mut v = Visuals::dark();
-    v.panel_fill = BG_SIDEBAR;
+    v.panel_fill = palette::chrome_sidebar();
     v.window_fill = Color32::from_rgb(0x20, 0x20, 0x20);
     v.extreme_bg_color = Color32::from_rgb(0x14, 0x14, 0x14);
     v.override_text_color = None;
-    v.selection.bg_fill = palette::SELECTION_BG;
+    v.selection.bg_fill = palette::selection();
     v.widgets.noninteractive.fg_stroke.color = TXT;
     v.widgets.inactive.bg_fill = Color32::from_rgb(0x26, 0x26, 0x26);
     v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0x26, 0x26, 0x26);
