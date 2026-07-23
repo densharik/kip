@@ -301,17 +301,23 @@ impl App {
     fn push_history(&mut self, cmd: &str) {
         self.session_cmds.retain(|h| h != cmd);
         self.session_cmds.push(cmd.to_string());
-        if self.session_cmds.len() > 200 {
-            let cut = self.session_cmds.len() - 200;
+        if self.session_cmds.len() > 5000 {
+            let cut = self.session_cmds.len() - 5000;
             self.session_cmds.drain(..cut);
         }
-        self.history.retain(|h| h != cmd);
-        self.history.push(cmd.to_string());
-        if self.history.len() > 1400 {
-            let cut = self.history.len() - 1200;
-            self.history.drain(..cut);
+        // History is effectively unlimited (like a shell). Keep history_lc in
+        // lockstep instead of rebuilding it fully - that would be O(n) per submit.
+        if let Some(pos) = self.history.iter().position(|h| h == cmd) {
+            self.history.remove(pos);
+            self.history_lc.remove(pos);
         }
-        self.history_lc = self.history.iter().map(|h| h.to_lowercase()).collect();
+        self.history.push(cmd.to_string());
+        self.history_lc.push(cmd.to_lowercase());
+        if self.history.len() > 200_000 {
+            let cut = self.history.len() - 190_000;
+            self.history.drain(..cut);
+            self.history_lc.drain(..cut);
+        }
     }
 
     /// Re-read the shell history file when it changes (throttled).
@@ -1211,7 +1217,6 @@ impl App {
             ),
             _ => (false, false),
         };
-        let mut skip_changed = false;
         let mut chip_clicked = false;
         let mut chip_rect = Rect::NOTHING;
         {
@@ -1274,12 +1279,8 @@ impl App {
 
                     match &s.phase {
                         Phase::Live(_) => {
-                            if ui
-                                .checkbox(&mut s.skip_permissions, RichText::new("skip-permissions").size(11.0))
-                                .changed()
-                            {
-                                skip_changed = true;
-                            }
+                            // skip-permissions only matters when (re)launching claude,
+                            // so it lives on the restart card, not here.
                             if let Some(cid) = &s.claude_session_id {
                                 ui.label(
                                     RichText::new(short_id(cid)).size(10.5).monospace().color(TXT_FAINT),
@@ -1309,9 +1310,6 @@ impl App {
                     }
                 });
             });
-        }
-        if skip_changed {
-            self.persist();
         }
         self.chip_rect = Some(chip_rect);
         if chip_clicked {
@@ -1400,12 +1398,18 @@ impl App {
         let interactive = !self.settings_open && !self.dir_open;
         let mut submit: Option<String> = None;
 
+        // Multiline once the command has a newline (added with Shift+Enter, which
+        // the singleline consume below lets through to the editor). Plain Enter
+        // still submits. While multiline, arrows move the caret, not history.
+        let multiline = self.cmd_input.contains('\n');
         let (mut enter, mut up, mut down, mut esc) = (false, false, false, false);
         if interactive {
             ctx.input_mut(|i| {
                 enter = consume_plain(i, Key::Enter);
-                up = consume_plain(i, Key::ArrowUp);
-                down = consume_plain(i, Key::ArrowDown);
+                if !multiline {
+                    up = consume_plain(i, Key::ArrowUp);
+                    down = consume_plain(i, Key::ArrowDown);
+                }
                 esc = consume_plain(i, Key::Escape);
                 // Tab would move egui focus away from the editor.
                 consume_plain(i, Key::Tab);
@@ -1419,7 +1423,7 @@ impl App {
             .zip(self.history_lc.iter())
             .rev()
             .filter(|(_, lc)| q.is_empty() || lc.contains(&q))
-            .take(12)
+            .take(40)
             .map(|(h, _)| h.clone())
             .collect();
         display.reverse();
@@ -1481,8 +1485,11 @@ impl App {
         }
 
         let font = FontId::monospace(self.settings.font_size);
+        // Grow the editor with the number of lines (Shift+Enter), capped.
+        let n_lines = (self.cmd_input.matches('\n').count() + 1).clamp(1, 8);
+        let panel_h = 36.0 + (n_lines as f32 - 1.0) * (self.settings.font_size + 6.0);
         let field_rect = egui::Panel::bottom("cmdline")
-            .exact_size(36.0)
+            .exact_size(panel_h)
             .resizable(false)
             .show_separator_line(false)
             .frame(Frame::new().fill(BG_BAR))
@@ -1493,13 +1500,16 @@ impl App {
                     top,
                     Stroke::new(1.0, Color32::from_rgb(0x2a, 0x2a, 0x2a)),
                 );
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
                     ui.add_space(10.0);
                     ui.label(RichText::new(">").font(font.clone()).color(TXT_DIM));
+                    // Multiline so Shift+Enter inserts a newline; plain Enter is
+                    // consumed above and submits, so the editor never sees it.
                     let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.cmd_input)
+                        egui::TextEdit::multiline(&mut self.cmd_input)
                             .frame(Frame::new())
                             .font(font.clone())
+                            .desired_rows(1)
                             .hint_text(RichText::new("команда...").font(font).color(TXT_FAINT))
                             .desired_width(ui.available_width() - 8.0),
                     );
@@ -1552,16 +1562,21 @@ impl App {
                         .show(ui, |ui| {
                             ui.set_width(field_rect.width().min(760.0));
                             ui.label(RichText::new("История").size(9.5).color(TXT_FAINT));
-                            for (i, cmd) in display.iter().enumerate() {
-                                let selected = self.hist_sel == Some(i);
-                                let resp = ui.selectable_label(
-                                    selected,
-                                    RichText::new(truncate_end(cmd, 90)).monospace().size(11.5),
-                                );
-                                if resp.clicked() {
-                                    submit = Some(cmd.clone());
+                            ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                for (i, cmd) in display.iter().enumerate() {
+                                    let selected = self.hist_sel == Some(i);
+                                    let resp = ui.selectable_label(
+                                        selected,
+                                        RichText::new(truncate_end(cmd, 90)).monospace().size(11.5),
+                                    );
+                                    if selected {
+                                        resp.scroll_to_me(None);
+                                    }
+                                    if resp.clicked() {
+                                        submit = Some(cmd.clone());
+                                    }
                                 }
-                            }
+                            });
                             ui.label(
                                 RichText::new("стрелки - выбор   esc - закрыть   enter - выполнить")
                                     .size(9.0)
@@ -1929,8 +1944,11 @@ impl App {
             _ => ("Сессия усыплена".to_string(), "процессы остановлены, память освобождена".to_string()),
         };
 
+        // Lower-middle of the terminal area, floating clear of the bottom.
+        let card_pos = Pos2::new(rect.center().x, rect.top() + rect.height() * 0.68);
         egui::Area::new(ui.id().with(("frozen", s.id)))
-            .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -36.0))
+            .pivot(Align2::CENTER_CENTER)
+            .fixed_pos(card_pos)
             .show(ui.ctx(), |ui| {
                 Frame::new()
                     .fill(Color32::from_rgb(0x1f, 0x1f, 0x1f))
@@ -2391,7 +2409,9 @@ fn load_shell_history() -> Vec<String> {
     let Some(path) = shell_history_path() else { return Vec::new() };
     let Ok(mut f) = std::fs::File::open(&path) else { return Vec::new() };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let tail = 512 * 1024;
+    // Read essentially the whole history (cap the tail only to guard against a
+    // pathologically huge file); the entry cap below is the real bound.
+    let tail = 64 * 1024 * 1024;
     if len > tail {
         let _ = f.seek(SeekFrom::Start(len - tail));
     }
@@ -2426,7 +2446,7 @@ fn load_shell_history() -> Vec<String> {
             continue;
         }
         out.push(cmd.to_string());
-        if out.len() >= 1000 {
+        if out.len() >= 200_000 {
             break;
         }
     }
