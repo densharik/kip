@@ -1,23 +1,23 @@
-// Embed a build id (git commit) so the updater can compare builds without a
-// version number. CI passes KIP_BUILD; a local build falls back to git HEAD.
+// Embed the version as 0.1.<patch>, where patch is the commit count. CI passes
+// KIP_PATCH; a local build derives it from git. The updater compares versions.
 use std::process::Command;
 
 fn main() {
-    let build = std::env::var("KIP_BUILD")
+    let patch = std::env::var("KIP_PATCH")
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| {
             Command::new("git")
-                .args(["rev-parse", "HEAD"])
+                .args(["rev-list", "--count", "HEAD"])
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
-                .map(|o| format!("build-{}", String::from_utf8_lossy(&o.stdout).trim()))
-                .filter(|s| s.len() > 6)
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
         })
-        .unwrap_or_else(|| "dev".into());
-    println!("cargo:rustc-env=KIP_BUILD={build}");
-    println!("cargo:rerun-if-env-changed=KIP_BUILD");
+        .unwrap_or_else(|| "0".into());
+    println!("cargo:rustc-env=KIP_VERSION=0.1.{patch}");
+    println!("cargo:rerun-if-env-changed=KIP_PATCH");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads/main");
 }

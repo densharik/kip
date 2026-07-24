@@ -19,20 +19,21 @@ const ASSET_NAME: &str = "kip-macos.zip";
 #[cfg(all(not(windows), not(target_os = "macos")))]
 const ASSET_NAME: &str = "";
 
-/// Build identity (git commit), embedded by build.rs. Updates are keyed on this
-/// instead of a version number - every released commit is a distinct build.
-pub fn current_build() -> &'static str {
-    env!("KIP_BUILD")
+/// Running version (0.1.<patch>), embedded by build.rs.
+pub fn current_version() -> &'static str {
+    env!("KIP_VERSION")
 }
 
-fn short(build: &str) -> String {
-    build.trim_start_matches("build-").chars().take(7).collect()
-}
-
-/// Short, human-facing form of the running build.
 pub fn current_label() -> String {
-    let b = current_build();
-    if b == "dev" { "dev".into() } else { short(b) }
+    current_version().to_string()
+}
+
+/// Parse "v0.1.17" / "0.1.17" into a comparable tuple.
+fn parse_ver(s: &str) -> (u32, u32, u32) {
+    let mut p = s.trim().trim_start_matches('v').split('.').map(|x| {
+        x.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u32>().unwrap_or(0)
+    });
+    (p.next().unwrap_or(0), p.next().unwrap_or(0), p.next().unwrap_or(0))
 }
 
 #[derive(Clone)]
@@ -75,8 +76,8 @@ fn do_check() -> Result<Option<Release>, String> {
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(|_| "неожиданный ответ GitHub".to_string())?;
     let tag = v["tag_name"].as_str().ok_or("нет tag_name в ответе")?;
-    // Same commit as what is running -> nothing to do.
-    if tag == current_build() {
+    // Not newer than what is running -> nothing to do.
+    if parse_ver(tag) <= parse_ver(current_version()) {
         return Ok(None);
     }
     let find = |name: &str| -> Option<String> {
@@ -89,7 +90,8 @@ fn do_check() -> Result<Option<Release>, String> {
     };
     let asset_url = find(ASSET_NAME).ok_or_else(|| format!("в релизе {tag} нет {ASSET_NAME}"))?;
     let pkg_url = if cfg!(target_os = "macos") { find("kip-installer.pkg") } else { None };
-    Ok(Some(Release { display: short(tag), asset_url, pkg_url }))
+    let display = tag.trim_start_matches('v').to_string();
+    Ok(Some(Release { display, asset_url, pkg_url }))
 }
 
 pub fn check(tx: Sender<UpdateMsg>, egui: egui::Context) {
@@ -324,9 +326,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn short_build() {
-        assert_eq!(short("build-a1b2c3d4e5f6"), "a1b2c3d");
-        assert_eq!(short("dev"), "dev");
-        assert_eq!(short("build-abc"), "abc");
+    fn version_compare() {
+        assert!(parse_ver("v0.1.18") > parse_ver("0.1.17"));
+        assert!(parse_ver("0.1.17") == parse_ver("v0.1.17"));
+        assert!(parse_ver("v0.2.0") > parse_ver("v0.1.99"));
+        assert!(parse_ver("v0.1.5") <= parse_ver("0.1.5"));
     }
 }

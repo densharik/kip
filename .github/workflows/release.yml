@@ -1,8 +1,7 @@
 name: Release
 
-# Every push to main is a release: no version numbers, the build id is the
-# commit. The in-app updater compares its embedded commit against the latest
-# release and updates when they differ.
+# Every push to main is a release, versioned 0.1.<commit-count>. The in-app
+# updater compares its embedded version against the latest release.
 on:
   push:
     branches: [main]
@@ -11,12 +10,27 @@ on:
 permissions:
   contents: write
 
-env:
-  KIP_BUILD: build-${{ github.sha }}
-
 jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      patch: ${{ steps.v.outputs.patch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        run: |
+          P=$(git rev-list --count HEAD)
+          echo "patch=$P" >> "$GITHUB_OUTPUT"
+          echo "version=0.1.$P" >> "$GITHUB_OUTPUT"
+
   windows:
+    needs: meta
     runs-on: windows-latest
+    env:
+      KIP_PATCH: ${{ needs.meta.outputs.patch }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -36,7 +50,10 @@ jobs:
   macos:
     # macos-latest is Apple Silicon, so this builds arm64 natively in one pass.
     # Intel Macs run it through Rosetta 2.
+    needs: meta
     runs-on: macos-latest
+    env:
+      KIP_PATCH: ${{ needs.meta.outputs.patch }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -63,8 +80,8 @@ jobs:
             <key>CFBundleName</key><string>kip</string>
             <key>CFBundleDisplayName</key><string>kip</string>
             <key>CFBundleIdentifier</key><string>com.densharik.kip</string>
-            <key>CFBundleVersion</key><string>0.1.2</string>
-            <key>CFBundleShortVersionString</key><string>0.1.2</string>
+            <key>CFBundleVersion</key><string>${{ needs.meta.outputs.version }}</string>
+            <key>CFBundleShortVersionString</key><string>${{ needs.meta.outputs.version }}</string>
             <key>CFBundleExecutable</key><string>kip</string>
             <key>CFBundleIconFile</key><string>kip</string>
             <key>CFBundlePackageType</key><string>APPL</string>
@@ -93,7 +110,7 @@ jobs:
           chmod +x pkgscripts/postinstall
           pkgbuild --root pkgroot \
             --identifier com.densharik.kip \
-            --version "$(echo ${GITHUB_SHA} | cut -c1-7)" \
+            --version "${{ needs.meta.outputs.version }}" \
             --scripts pkgscripts \
             --install-location /Applications \
             dist/kip-installer.pkg
@@ -105,7 +122,7 @@ jobs:
             dist/kip-installer.pkg
 
   release:
-    needs: [windows, macos]
+    needs: [meta, windows, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -114,8 +131,8 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.sha }}
-          name: build-${{ github.sha }}
+          tag_name: v${{ needs.meta.outputs.version }}
+          name: v${{ needs.meta.outputs.version }}
           target_commitish: ${{ github.sha }}
           files: |
             artifacts/kip-windows/kip.exe

@@ -6,3 +6,7 @@ Licensed under the Apache License, Version 2.0 (see LICENSE).
 This product bundles third-party Rust crates, each under its own license,
 including alacritty_terminal, eframe/egui, dirs, rfd, serde, serde_json,
 libc (Unix), and windows-sys (Windows). See each crate for details.
+
+It also bundles the JetBrains Mono font (resources/JetBrainsMono-Regular.ttf),
+Copyright 2020 The JetBrains Mono Project Authors, licensed under the SIL Open
+Font License 1.1.

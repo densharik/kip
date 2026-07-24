@@ -2198,7 +2198,7 @@ impl App {
                 let mut do_open = false;
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("Сборка {}", update::current_label()))
+                        RichText::new(format!("Версия {}", update::current_label()))
                             .size(11.5)
                             .color(TXT_DIM),
                     );
@@ -2237,7 +2237,7 @@ impl App {
                     UpdateState::Available(r) => {
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(format!("Доступна сборка {}", r.display))
+                                RichText::new(format!("Доступна версия {}", r.display))
                                     .size(11.5)
                                     .color(GIT_ADD),
                             );
@@ -2404,26 +2404,33 @@ impl eframe::App for App {
 }
 
 fn install_fonts(ctx: &egui::Context) {
-    // egui ships a bundled monospace fallback, so a fresh machine still renders
-    // even if none of these system fonts are present.
     let mut fonts = FontDefinitions::default();
+    // Bundled JetBrains Mono guarantees full Latin+Cyrillic coverage so the
+    // terminal renders identically on every machine. macOS Menlo ships as a
+    // .ttc collection that egui mis-loads, which dropped Cyrillic into a
+    // proportional fallback (mixed fonts in the terminal). Kept as the first
+    // monospace so it always backs any glyph a system font is missing.
+    fonts.font_data.insert(
+        "jbmono".into(),
+        Arc::new(FontData::from_static(include_bytes!(
+            "../resources/JetBrainsMono-Regular.ttf"
+        ))),
+    );
+    fonts.families.get_mut(&FontFamily::Monospace).unwrap().insert(0, "jbmono".into());
+
+    // Prefer a native single-file system mono when present (SF Mono on macOS),
+    // with jbmono behind it as the coverage fallback. Menlo.ttc is left out on
+    // purpose - it is the collection that fails to load.
     let candidates = [
-        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/SFNSMono.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "C:\\Windows\\Fonts\\consola.ttf",
         "C:\\Windows\\Fonts\\CascadiaMono.ttf",
     ];
     for path in candidates {
         if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "sys-mono".into(),
-                Arc::new(FontData { font: bytes.into(), index: 0, tweak: Default::default() }),
-            );
-            fonts
-                .families
-                .get_mut(&FontFamily::Monospace)
-                .unwrap()
-                .insert(0, "sys-mono".into());
+            fonts.font_data.insert("sys-mono".into(), Arc::new(FontData::from_owned(bytes)));
+            fonts.families.get_mut(&FontFamily::Monospace).unwrap().insert(0, "sys-mono".into());
             break;
         }
     }

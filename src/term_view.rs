@@ -374,19 +374,33 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         }
     }
 
-    // Scrollback position badge.
+    // Scrollback position badge: how many lines up we are. A drawn up-triangle
+    // instead of an arrow glyph - not every font ships one and it showed as a
+    // tofu box. Keep UI text ASCII-only for the same reason.
     if display_offset > 0 {
-        let text = format!("{display_offset}");
-        let badge_pos = Pos2::new(rect.right() - 12.0, rect.top() + 46.0);
-        let galley_rect = painter.text(
-            badge_pos,
+        let label = format!("{display_offset}");
+        let gr = painter.text(
+            Pos2::new(rect.right() - 12.0, rect.top() + 46.0),
             Align2::RIGHT_TOP,
-            format!("↑ {text}"),
+            &label,
             FontId::proportional(11.0),
             Color32::from_gray(160),
         );
+        let cy = gr.center().y;
+        let tx = gr.left() - 7.0;
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(tx, cy - 3.5),
+                Pos2::new(tx - 4.0, cy + 3.0),
+                Pos2::new(tx + 4.0, cy + 3.0),
+            ],
+            Color32::from_gray(160),
+            Stroke::NONE,
+        ));
+        let mut box_ = gr;
+        box_.min.x -= 13.0;
         painter.rect_stroke(
-            galley_rect.expand(4.0),
+            box_.expand(4.0),
             CornerRadius::same(4),
             Stroke::new(1.0, Color32::from_gray(70)),
             StrokeKind::Outside,
