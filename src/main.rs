@@ -5,6 +5,8 @@
 mod config;
 mod ctx_index;
 mod i18n;
+#[cfg(target_os = "macos")]
+mod mac_service;
 mod plat;
 mod palette;
 mod session;
@@ -355,6 +357,9 @@ impl App {
         update::cleanup();
         app.update_state = UpdateState::Checking;
         update::check(app.upd_tx.clone(), cc.egui_ctx.clone());
+        // Finder "New kip Window Here" -> a new session at the picked folder.
+        #[cfg(target_os = "macos")]
+        mac_service::register(cc.egui_ctx.clone());
         app
     }
 
@@ -1802,6 +1807,7 @@ impl App {
                     );
                     if self.rename_focus {
                         r.request_focus();
+                        select_all_text(ui.ctx(), r.id, self.rename_buf.chars().count());
                         self.rename_focus = false;
                     }
                     r
@@ -2080,6 +2086,7 @@ impl App {
                     );
                     if self.rename_focus {
                         r.request_focus();
+                        select_all_text(ui.ctx(), r.id, self.rename_buf.chars().count());
                         self.rename_focus = false;
                     }
                     r
@@ -3230,6 +3237,17 @@ impl eframe::App for App {
         self.drain_ctx(&ctx);
         self.drain_ctx_index();
         self.drain_update();
+        // Folders opened from Finder's Services menu ("New kip Window Here").
+        #[cfg(target_os = "macos")]
+        {
+            let pending = mac_service::take_pending();
+            if !pending.is_empty() {
+                for dir in pending {
+                    self.spawn(dir, None, &ctx);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
         while let Ok(mut st) = self.stats_rx.try_recv() {
             // The kip tree includes every session's shell as a descendant -
             // subtract them so the first row is kip itself, not the whole app.
@@ -3683,6 +3701,19 @@ fn tilde(path: &std::path::Path) -> String {
 
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
+}
+
+/// Select the whole rename buffer so the first keystroke replaces the old
+/// name instead of appending. Runs the frame focus is requested; the TextEdit
+/// has already stored its state by then, so load-modify-store wins.
+fn select_all_text(ctx: &egui::Context, id: egui::Id, char_len: usize) {
+    use egui::text::{CCursor, CCursorRange};
+    if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(char_len))));
+        state.store(ctx, id);
+    }
 }
 
 /// Backslash-escape a path for the shell; claude also understands this form.

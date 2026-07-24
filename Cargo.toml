@@ -15,6 +15,13 @@ serde_json = "1.0.151"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.186"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+# Only the two classes the Finder Services provider touches; the default
+# feature set drags in Metal/CoreImage/etc. and bloats build time.
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSPasteboard"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
