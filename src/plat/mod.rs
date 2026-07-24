@@ -13,9 +13,10 @@ mod windows;
 pub use windows::*;
 
 /// Per-process resource sample: (label, cpu percent, memory kilobytes), one row
-/// per process tree passed to `sample_stats`. Memory is macOS phys_footprint,
-/// Windows private commit, and `ps` rss on other unix - each summed over the
-/// tree without counting shared pages once per process.
+/// per target passed to `sample_stats` - the whole process tree when its `tree`
+/// flag is set, or only the root process when it is not. Memory is macOS
+/// phys_footprint, Windows private commit, and `ps` rss on other unix - a tree
+/// is summed without counting shared pages once per process.
 pub struct SysStats {
     pub procs: Vec<(String, f32, u64)>,
 }

@@ -189,11 +189,11 @@ fn private_kb(pid: i32) -> u64 {
 
 /// Memory per process tree (private commit in KB). CPU sampling needs two time snapshots
 /// with an interval and is left at 0 for v1; the memory bars stay meaningful.
-pub fn sample_stats(targets: &[(String, i32)]) -> SysStats {
+pub fn sample_stats(targets: &[(String, i32, bool)]) -> SysStats {
     let kids = children_map();
     let procs = targets
         .iter()
-        .map(|(label, root)| {
+        .map(|(label, root, tree)| {
             let mut rss = 0u64;
             let mut seen = HashSet::new();
             let mut stack = vec![*root];
@@ -202,12 +202,28 @@ pub fn sample_stats(targets: &[(String, i32)]) -> SysStats {
                     continue;
                 }
                 rss += private_kb(p);
-                if let Some(cs) = kids.get(&p) {
-                    stack.extend(cs);
+                if *tree {
+                    if let Some(cs) = kids.get(&p) {
+                        stack.extend(cs);
+                    }
                 }
             }
             (label.clone(), 0.0f32, rss)
         })
         .collect();
     SysStats { procs }
+}
+
+/// Kill a process and its whole descendant tree, so a torn-down session's
+/// processes free their memory instead of lingering. `taskkill /T` walks the
+/// child tree; `/F` forces termination.
+pub fn kill_tree(root: i32) {
+    if root <= 0 {
+        return;
+    }
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &root.to_string(), "/T", "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }

@@ -45,10 +45,24 @@ pub struct LiveTerm {
     pub shell_pid: i32,
     pub cols: u16,
     pub rows: u16,
+    /// Kill the shell tree when this LiveTerm drops. True for intentional
+    /// teardown (suspend, close, quit) where the shell is still alive; cleared
+    /// by `finalize_exit`, where the shell already exited and its pid may have
+    /// been reused - killing it then would target an unrelated process.
+    pub kill_on_drop: bool,
 }
 
 impl Drop for LiveTerm {
     fn drop(&mut self) {
+        // Kill the shell and its whole descendant tree. claude and the node
+        // processes it spawns run in their own process groups, so closing the
+        // PTY alone (a lone SIGHUP to the shell) leaves them alive as orphans
+        // under launchd, still eating RAM. Every intentional teardown - suspend,
+        // close tab, quit - drops LiveTerm, so this is the single place that
+        // frees them. finalize_exit clears the flag (the shell already exited).
+        if self.kill_on_drop {
+            crate::plat::kill_tree(self.shell_pid);
+        }
         let _ = self.notifier.0.send(Msg::Shutdown);
         // Windows has no master fd; the Pty (dropped with the event loop) owns
         // its own handle cleanup.
@@ -186,6 +200,12 @@ impl Session {
     }
 
     pub fn finalize_exit(&mut self, code: Option<i32>) {
+        // The shell exited on its own and alacritty already reaped it, so its
+        // pid may now belong to an unrelated process; disarm the kill in
+        // LiveTerm::Drop (its children have reparented to launchd anyway).
+        if let Phase::Live(live) = &mut self.phase {
+            live.kill_on_drop = false;
+        }
         if let Phase::Live(live) = &self.phase {
             self.snapshot = Some(grab_snapshot(&live.term));
             self.save_claude_session();
@@ -351,7 +371,7 @@ pub fn spawn_live(
     let notifier = Notifier(event_loop.channel());
     event_loop.spawn();
 
-    Ok(LiveTerm { term, notifier, master_fd, shell_pid, cols, rows })
+    Ok(LiveTerm { term, notifier, master_fd, shell_pid, cols, rows, kill_on_drop: true })
 }
 
 /// Claude session ids are UUIDs. Everything else (filenames, external JSON)

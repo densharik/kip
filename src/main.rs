@@ -2581,11 +2581,15 @@ impl App {
         let stale = self.stats_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
         if stale && !self.stats_inflight {
             self.stats_inflight = true;
-            let mut targets: Vec<(String, i32)> =
-                vec![("kip".into(), std::process::id() as i32)];
+            // kip is sampled own-process-only (tree = false); each live session
+            // sums its whole shell tree (tree = true). Measuring kip alone keeps
+            // its row equal to the kip process itself, never folding in whatever
+            // happens to sit under it in the process tree.
+            let mut targets: Vec<(String, i32, bool)> =
+                vec![("kip".into(), std::process::id() as i32, false)];
             for s in &self.sessions {
                 if let Some(live) = s.live() {
-                    targets.push((s.display_name(), live.shell_pid));
+                    targets.push((s.display_name(), live.shell_pid, true));
                 }
             }
             let tx = self.stats_tx.clone();
@@ -3248,15 +3252,7 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
-        while let Ok(mut st) = self.stats_rx.try_recv() {
-            // The kip tree includes every session's shell as a descendant -
-            // subtract them so the first row is kip itself, not the whole app.
-            if let Some((first, rest)) = st.procs.split_first_mut() {
-                for (_, cpu, rss) in rest.iter() {
-                    first.1 = (first.1 - cpu).max(0.0);
-                    first.2 = first.2.saturating_sub(*rss);
-                }
-            }
+        while let Ok(st) = self.stats_rx.try_recv() {
             self.stats = Some(st);
             self.stats_at = Some(Instant::now());
             self.stats_inflight = false;

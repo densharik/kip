@@ -44,8 +44,12 @@ fn phys_footprint_kb(pid: i32) -> u64 {
     info.ri_phys_footprint / 1024
 }
 
-/// One `ps` pass; each target's cpu/rss is summed over its whole process tree.
-pub fn sample_stats(targets: &[(String, i32)]) -> SysStats {
+/// One `ps` pass. A target with `tree = true` sums cpu/rss over its whole
+/// process tree; `tree = false` measures only the root process. kip itself is
+/// sampled with `tree = false` so the session trees nested under it are not
+/// folded into its own row (a suspended session leaves its shell/claude alive
+/// under kip, and walking the tree would misattribute their memory to kip).
+pub fn sample_stats(targets: &[(String, i32, bool)]) -> SysStats {
     let mut rows: Vec<(i32, i32, u64, f32)> = Vec::new();
     if let Ok(out) = Command::new("ps").args(["-axo", "pid=,ppid=,rss=,pcpu="]).output() {
         for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -71,7 +75,7 @@ pub fn sample_stats(targets: &[(String, i32)]) -> SysStats {
     }
     let procs = targets
         .iter()
-        .map(|(label, root)| {
+        .map(|(label, root, tree)| {
             let (mut rss, mut cpu) = (0u64, 0f32);
             let mut seen = std::collections::HashSet::new();
             let mut stack = vec![*root];
@@ -93,14 +97,58 @@ pub fn sample_stats(targets: &[(String, i32)]) -> SysStats {
                     }
                     cpu += rows[i].3;
                 }
-                if let Some(kids) = children.get(&pid) {
-                    stack.extend(kids.iter().map(|&i| rows[i].0));
+                if *tree {
+                    if let Some(kids) = children.get(&pid) {
+                        stack.extend(kids.iter().map(|&i| rows[i].0));
+                    }
                 }
             }
             (label.clone(), cpu, rss)
         })
         .collect();
     SysStats { procs }
+}
+
+/// SIGKILL a process and its whole descendant tree. Job control puts each
+/// foreground job (claude, and the node processes it spawns) in its own process
+/// group, so signalling the shell's group alone would miss them - walk the tree
+/// from a `ps` snapshot and kill every pid. Called when a session's terminal is
+/// torn down so its processes actually free their memory instead of lingering
+/// as orphans under launchd. SIGKILL because the shell traps SIGHUP/SIGTERM for
+/// job control; reaping is left to the PTY event loop (shell) and launchd (the
+/// reparented descendants).
+pub fn kill_tree(root: i32) {
+    if root <= 1 {
+        return;
+    }
+    let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
+    if let Ok(out) = Command::new("ps").args(["-axo", "pid=,ppid="]).stdin(Stdio::null()).output() {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut it = line.split_whitespace();
+            if let (Some(Ok(pid)), Some(Ok(ppid))) =
+                (it.next().map(str::parse::<i32>), it.next().map(str::parse::<i32>))
+            {
+                children.entry(ppid).or_default().push(pid);
+            }
+        }
+    }
+    let me = std::process::id() as i32;
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if let Some(kids) = children.get(&pid) {
+            stack.extend(kids);
+        }
+        // Never signal our own process (guards against a reused root pid).
+        if pid > 1 && pid != me {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
