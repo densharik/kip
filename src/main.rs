@@ -270,12 +270,14 @@ struct App {
     /// Last measured grid size, used as the initial size for new PTYs.
     grid: (u16, u16),
     explorer: Explorer,
+    /// Font actually in use - the pick can silently fall back (settings show it).
+    font_applied: &'static str,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let state = load_state();
-        install_fonts(&cc.egui_ctx, &state.settings.font);
+        let font_applied = install_fonts(&cc.egui_ctx, &state.settings.font);
         i18n::set(i18n::resolve(&state.settings.lang));
         palette::apply(&state.settings.theme, state.settings.accent.map(rgb32));
         apply_style(&cc.egui_ctx);
@@ -355,6 +357,7 @@ impl App {
             cell: (8, 17),
             grid: (100, 28),
             explorer: Explorer::default(),
+            font_applied,
         };
         for saved in state.sessions {
             let id = app.next_id;
@@ -3119,10 +3122,31 @@ impl App {
                                     && self.settings.font != k
                                 {
                                     self.settings.font = k.to_string();
-                                    install_fonts(ctx, k);
+                                    self.font_applied = install_fonts(ctx, k);
                                 }
                             }
                         });
+                    ui.end_row();
+
+                    // What is really on screen: the pick can fall back silently,
+                    // and the cell size in physical pixels shows whether the grid
+                    // came out pixel-aligned.
+                    let ppp = ctx.pixels_per_point();
+                    let fid = FontId::monospace(self.settings.font_size);
+                    let (cw, ch) =
+                        ctx.fonts_mut(|f| (f.glyph_width(&fid, '0'), f.row_height(&fid)));
+                    ui.label("");
+                    ui.label(
+                        RichText::new(format!(
+                            "{}: {} · {:.0}×{:.0} px · ppp {ppp:.2}",
+                            tr("рисуется", "rendering"),
+                            self.font_applied,
+                            (cw * ppp).round(),
+                            (ch * ppp).round(),
+                        ))
+                        .font(FontId::proportional(10.5))
+                        .color(palette::text_faint()),
+                    );
                     ui.end_row();
 
                     ui.label(tr("Скроллбэк (строк)", "Scrollback (lines)"));
@@ -3538,7 +3562,10 @@ fn load_font_file(path: &str, index: u32) -> Option<FontData> {
     Some(FontData { font: bytes.into(), index, tweak: Default::default() })
 }
 
-fn install_fonts(ctx: &egui::Context, choice: &str) {
+/// Installs the picked font and returns the label of what actually got applied -
+/// which is not always what was asked for, since a system font can be missing or
+/// fail to load, and that difference is exactly what a user cannot see.
+fn install_fonts(ctx: &egui::Context, choice: &str) -> &'static str {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert(
         "jbmono".into(),
@@ -3551,24 +3578,58 @@ fn install_fonts(ctx: &egui::Context, choice: &str) {
     // misses still lands in a monospace face instead of egui's proportional
     // fallback; egui's own defaults close out the chain (emoji, rare symbols).
     let mut family = Vec::new();
+    let mut picked_path = "";
+    let mut applied = "JetBrains Mono";
     match FONT_CHOICES.iter().find(|(key, _, _)| *key == choice) {
-        Some((_, _, Some((path, index)))) => {
+        Some((_, label, Some((path, index)))) => {
             if let Some(data) = load_font_file(path, *index) {
                 fonts.font_data.insert("sys-mono".into(), Arc::new(data));
                 family.push("sys-mono".to_owned());
+                picked_path = path;
+                applied = label;
             }
         },
-        Some(("hack", _, _)) => family.push("Hack".to_owned()),
+        Some(("hack", _, _)) => {
+            family.push("Hack".to_owned());
+            applied = "Hack";
+        },
         // "jetbrains", plus an unknown key or a system font that would not load.
         _ => {},
     }
-    for name in ["jbmono", "Hack", "Ubuntu-Light", "NotoEmoji-Regular", "emoji-icon-font"] {
+    for name in ["jbmono", "Hack"] {
+        if !family.iter().any(|f| f == name) {
+            family.push(name.to_owned());
+        }
+    }
+
+    // Symbol coverage behind the text fonts: Claude Code prints ✳ ✽ (spinner)
+    // and ⎿ (tool output). Only Menlo has the first two, only Apple Symbols has
+    // the third, so without these they turn into tofu boxes the moment the
+    // picked font is something else.
+    let symbol_files = [
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        "C:\\Windows\\Fonts\\seguisym.ttf",
+    ];
+    for (i, path) in symbol_files.iter().enumerate() {
+        if *path == picked_path {
+            continue; // already in the family as the picked font
+        }
+        if let Some(data) = load_font_file(path, 0) {
+            let name = format!("sym{i}");
+            fonts.font_data.insert(name.clone(), Arc::new(data));
+            family.push(name);
+        }
+    }
+
+    for name in ["Ubuntu-Light", "NotoEmoji-Regular", "emoji-icon-font"] {
         if !family.iter().any(|f| f == name) {
             family.push(name.to_owned());
         }
     }
     fonts.families.insert(FontFamily::Monospace, family);
     ctx.set_fonts(fonts);
+    applied
 }
 
 fn rgb32([r, g, b]: [u8; 3]) -> Color32 {

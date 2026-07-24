@@ -28,6 +28,19 @@ pub struct GridInfo {
     pub grown: bool,
 }
 
+/// Characters that only exist in a color-emoji font, which egui cannot
+/// rasterize (no COLR/sbix support in epaint) - they would draw as tofu boxes.
+/// Claude Code prints ⏺ in front of every message, so this is most of what the
+/// terminal shows. Swap in the closest outline glyph the fonts do have.
+fn substitute(c: char) -> char {
+    match c {
+        '⏺' => '●',
+        '⏹' => '■',
+        '⏵' => '▶',
+        _ => c,
+    }
+}
+
 pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_input: bool) -> GridInfo {
     let rect = ui.available_rect_before_wrap();
     let response = ui.interact(rect, ui.id().with(("term", session.id)), Sense::click_and_drag());
@@ -355,7 +368,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         let (fg, bg) = palette::cell_colors(cell.fg, cell.bg, flags, colors, selected);
 
         if point == cursor.point {
-            cursor_cell = Some((cell.c, bg.unwrap_or(palette::term_bg())));
+            cursor_cell = Some((substitute(cell.c), bg.unwrap_or(palette::term_bg())));
         }
 
         let spacer = flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
@@ -369,7 +382,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         cells.push(DrawCell {
             x,
             y,
-            c: if has_text { cell.c } else { ' ' },
+            c: if has_text { substitute(cell.c) } else { ' ' },
             zw: if has_text { cell.zerowidth().map(|z| z.to_vec()) } else { None },
             fg,
             bg,
