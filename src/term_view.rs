@@ -33,11 +33,20 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     let response = ui.interact(rect, ui.id().with(("term", session.id)), Sense::click_and_drag());
 
     let font_id = FontId::monospace(settings.font_size);
-    let (cell_w, cell_h) =
-        ui.ctx().fonts_mut(|f| (f.glyph_width(&font_id, '0'), f.row_height(&font_id)));
+    // Snap the cell and the grid origin to whole physical pixels. A cell of, say,
+    // 7.83px puts every column on a different subpixel offset, so egui renders
+    // four differently-blurred variants of the same glyph and the column pitch
+    // wobbles by half a pixel - which reads as "the font looks off" no matter
+    // which font is picked. On a whole-pixel grid every column rasterizes the
+    // same way. Costs at most half a pixel of cell width.
+    let ppp = ui.ctx().pixels_per_point();
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let (cell_w, cell_h) = ui
+        .ctx()
+        .fonts_mut(|f| (snap(f.glyph_width(&font_id, '0')), snap(f.row_height(&font_id))));
     let cols = ((rect.width() - 8.0) / cell_w).floor().max(4.0) as u16;
     let rows = ((rect.height() - 4.0) / cell_h).floor().max(2.0) as u16;
-    let origin = rect.min + Vec2::new(4.0, 2.0);
+    let origin = Pos2::new(snap(rect.min.x + 4.0), snap(rect.min.y + 2.0));
 
     let mut info =
         GridInfo { cols, rows, cell_w, cell_h, had_input: false, interacted: false, grown: false };
