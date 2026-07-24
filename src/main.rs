@@ -23,7 +23,8 @@ use alacritty_terminal::term::TermMode;
 use eframe::egui;
 use egui::{
     Align, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Frame,
-    Key, Layout, Margin, Modifiers, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, Vec2, Visuals,
+    Key, Layout, Margin, Modifiers, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind,
+    Vec2, Visuals,
 };
 
 use config::{load_state, save_state, AppState, SavedSession, Settings};
@@ -119,6 +120,40 @@ enum Act {
     /// Dissolve a group: its members become ungrouped.
     DeleteGroup(String),
     Settings,
+    /// Show/hide the file explorer panel.
+    ToggleExplorer,
+}
+
+/// Lightweight file explorer panel (between the session list and the terminal).
+#[derive(Default, PartialEq, Clone, Copy)]
+enum ExMode {
+    #[default]
+    Browse,
+    Search,
+    New,
+}
+
+struct ExEntry {
+    name: String,
+    is_dir: bool,
+}
+
+#[derive(Default)]
+struct Explorer {
+    open: bool,
+    dir: PathBuf,
+    mode: ExMode,
+    query: String,
+    new_name: String,
+    /// Grab keyboard focus for the active input on the frame it opens.
+    focus: bool,
+    /// Cached listing of `dir` (browse mode) and the dir it was read for.
+    list: Vec<ExEntry>,
+    list_dir: Option<PathBuf>,
+    list_at: Option<Instant>,
+    /// Cached recursive search hits and the (dir, query) they were computed for.
+    hits: Vec<PathBuf>,
+    hits_key: Option<(PathBuf, String)>,
 }
 
 /// One entry in the sidebar's vertical layout (a group header or a session row),
@@ -218,6 +253,7 @@ struct App {
     cell: (u16, u16),
     /// Last measured grid size, used as the initial size for new PTYs.
     grid: (u16, u16),
+    explorer: Explorer,
 }
 
 impl App {
@@ -297,6 +333,7 @@ impl App {
             stats_rect: None,
             cell: (8, 17),
             grid: (100, 28),
+            explorer: Explorer::default(),
         };
         for saved in state.sessions {
             let id = app.next_id;
@@ -695,7 +732,7 @@ impl App {
             },
             id,
         );
-        self.attach_live(&mut s, command, ctx);
+        self.attach_live(&mut s, command, None, ctx);
         // Keep it next to its group; ungrouped sessions stay a contiguous block
         // above the groups instead of landing below them (which would break the
         // ungrouped-run adjacency that drag/drop relies on).
@@ -714,14 +751,14 @@ impl App {
         self.persist();
     }
 
-    fn attach_live(&self, s: &mut Session, command: Option<String>, ctx: &egui::Context) {
+    fn attach_live(&self, s: &mut Session, command: Option<String>, seed: Option<&str>, ctx: &egui::Context) {
         let proxy = EventProxy {
             id: s.id,
             tx: self.ev_tx.clone(),
             ctx: ctx.clone(),
             active: self.active_shared.clone(),
         };
-        match spawn_live(s.id, &s.cwd, command, &self.settings, proxy, self.grid.0, self.grid.1, self.cell) {
+        match spawn_live(s.id, &s.cwd, command, &self.settings, proxy, self.grid.0, self.grid.1, self.cell, seed) {
             Ok(live) => {
                 s.phase = Phase::Live(live);
                 s.spawned_at = SystemTime::now();
@@ -754,7 +791,24 @@ impl App {
         #[cfg(windows)]
         let command = base.as_ref().map(|cmd| format!("{cmd}; powershell.exe -NoLogo"));
         let mut s = std::mem::replace(&mut self.sessions[idx], Session::from_saved(SavedSession::default(), 0));
-        self.attach_live(&mut s, command, ctx);
+        // Reopening as a plain terminal: seed the fresh shell's scrollback with
+        // the suspended snapshot so the on-screen history is not wiped. Claude
+        // resume redraws its own conversation, so it needs no seed.
+        let seed = (!with_claude)
+            .then_some(s.snapshot.as_deref())
+            .flatten()
+            .map(|snap| {
+                format!(
+                    "{}\r\n\x1b[90m{}\x1b[0m\r\n",
+                    // Normalize first so an existing CRLF does not become CR CR LF.
+                    snap.replace("\r\n", "\n").replace('\n', "\r\n"),
+                    tr(
+                        "---- терминал открыт заново, история выше ----",
+                        "---- terminal reopened, history above ----",
+                    ),
+                )
+            });
+        self.attach_live(&mut s, command, seed.as_deref(), ctx);
         s.pending_cmd = base.clone();
         if base.is_some() {
             s.burst_until = Some(Instant::now() + Duration::from_secs(3));
@@ -895,6 +949,15 @@ impl App {
                     self.persist();
                 },
                 Act::Settings => self.settings_open = !self.settings_open,
+                Act::ToggleExplorer => {
+                    self.explorer.open = !self.explorer.open;
+                    if self.explorer.open {
+                        // Open on the active session's directory each time.
+                        self.explorer.dir = self.active_cwd();
+                        self.explorer.mode = ExMode::Browse;
+                        self.explorer.list_dir = None;
+                    }
+                },
             }
         }
     }
@@ -1376,6 +1439,13 @@ impl App {
             {
                 acts.push(Act::NewSame);
             }
+            ui.add_space(4.0);
+            let files = ui
+                .selectable_label(self.explorer.open, RichText::new(tr("Файлы", "Files")).size(12.5))
+                .on_hover_text(tr("Проводник файлов", "File explorer"));
+            if files.clicked() {
+                acts.push(Act::ToggleExplorer);
+            }
         });
         ui.add_space(8.0);
 
@@ -1437,6 +1507,176 @@ impl App {
             self.dragging_group = None;
         }
         acts
+    }
+
+    fn explorer_panel(&mut self, ui: &mut egui::Ui) -> Vec<Act> {
+        let dir = self.explorer.dir.clone();
+        // Refresh the browse listing (single-dir read, throttled to 1.5s).
+        let stale = self.explorer.list_dir.as_deref() != Some(dir.as_path())
+            || self.explorer.list_at.is_none_or(|t| t.elapsed().as_millis() > 1500);
+        if stale {
+            self.explorer.list = read_dir_sorted(&dir);
+            self.explorer.list_dir = Some(dir.clone());
+            self.explorer.list_at = Some(Instant::now());
+        }
+        // Recompute recursive search hits only when the query or dir changes.
+        let query = self.explorer.query.trim().to_string();
+        if self.explorer.mode == ExMode::Search && !query.is_empty() {
+            let key = (dir.clone(), query.clone());
+            if self.explorer.hits_key.as_ref() != Some(&key) {
+                let mut hits = Vec::new();
+                ex_search(&dir, &query, &mut hits);
+                self.explorer.hits = hits;
+                self.explorer.hits_key = Some(key);
+            }
+        }
+
+        let mut go_dir: Option<PathBuf> = None;
+        let mut open_file: Option<PathBuf> = None;
+        let mut create = false;
+
+        ui.add_space(10.0);
+        // Header: directory name on the left, magnifier + new-file on the right.
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.to_string_lossy().into_owned());
+            ui.label(RichText::new(truncate_head(&name, 20)).size(12.5).strong().color(palette::text()));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(8.0);
+                let new_on = self.explorer.mode == ExMode::New;
+                if ex_icon_button(ui, new_on, draw_newfile).on_hover_text(tr("Новый файл", "New file")).clicked() {
+                    self.explorer.mode = if new_on { ExMode::Browse } else { ExMode::New };
+                    self.explorer.new_name.clear();
+                    self.explorer.focus = true;
+                }
+                ui.add_space(2.0);
+                let search_on = self.explorer.mode == ExMode::Search;
+                if ex_icon_button(ui, search_on, draw_search).on_hover_text(tr("Поиск", "Search")).clicked() {
+                    self.explorer.mode = if search_on { ExMode::Browse } else { ExMode::Search };
+                    self.explorer.query.clear();
+                    self.explorer.focus = true;
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        // Input row for the active mode.
+        match self.explorer.mode {
+            ExMode::Search => {
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    let te = ui.add(
+                        egui::TextEdit::singleline(&mut self.explorer.query)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(tr("Поиск файлов...", "Find files...")),
+                    );
+                    if self.explorer.focus {
+                        te.request_focus();
+                        self.explorer.focus = false;
+                    }
+                });
+                ui.add_space(4.0);
+            },
+            ExMode::New => {
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    let te = ui.add(
+                        egui::TextEdit::singleline(&mut self.explorer.new_name)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(tr("Имя файла, Enter", "File name, Enter")),
+                    );
+                    if self.explorer.focus {
+                        te.request_focus();
+                        self.explorer.focus = false;
+                    }
+                    if te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        create = true;
+                    }
+                });
+                ui.add_space(4.0);
+            },
+            ExMode::Browse => {},
+        }
+
+        let searching = self.explorer.mode == ExMode::Search && !query.is_empty();
+        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            if searching {
+                if self.explorer.hits.is_empty() {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(tr("Ничего не найдено", "No matches")).size(12.0).color(palette::text_faint()));
+                    });
+                }
+                for hit in &self.explorer.hits {
+                    let rel = hit.strip_prefix(&dir).unwrap_or(hit);
+                    let is_dir = hit.is_dir();
+                    if ex_row(ui, &rel.to_string_lossy(), is_dir).clicked() {
+                        if is_dir {
+                            go_dir = Some(hit.clone());
+                        } else {
+                            open_file = Some(hit.clone());
+                        }
+                    }
+                }
+            } else {
+                if let Some(parent) = dir.parent() {
+                    if ex_row(ui, "..", true).clicked() {
+                        go_dir = Some(parent.to_path_buf());
+                    }
+                }
+                for e in &self.explorer.list {
+                    if ex_row(ui, &e.name, e.is_dir).clicked() {
+                        let p = dir.join(&e.name);
+                        if e.is_dir {
+                            go_dir = Some(p);
+                        } else {
+                            open_file = Some(p);
+                        }
+                    }
+                }
+            }
+            ui.add_space(20.0);
+        });
+
+        if create {
+            let name = self.explorer.new_name.trim().to_string();
+            // Only allow a new file inside the browsed tree: reject empty, absolute,
+            // or `..`-escaping names. create_new never clobbers an existing file.
+            let safe = !name.is_empty()
+                && !std::path::Path::new(&name).components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                });
+            let path = dir.join(&name);
+            let created = safe
+                && path.parent().is_none_or(|p| std::fs::create_dir_all(p).is_ok())
+                && std::fs::OpenOptions::new().write(true).create_new(true).open(&path).is_ok();
+            if created {
+                self.explorer.mode = ExMode::Browse;
+                self.explorer.new_name.clear();
+                self.explorer.list_dir = None; // force a refresh so it shows up
+            }
+            // On failure (bad name / already exists / no permission) keep the New
+            // field open so the no-op is visible rather than silently swallowed.
+        }
+        if let Some(d) = go_dir {
+            self.explorer.dir = d;
+            self.explorer.list_dir = None;
+            self.explorer.mode = ExMode::Browse;
+            self.explorer.query.clear();
+        }
+        if let Some(f) = open_file {
+            self.insert_paths(shell_escape(&f.to_string_lossy()));
+        }
+        Vec::new()
     }
 
     /// Sidebar display order: ungrouped rows first, then each group (header +
@@ -1942,10 +2182,22 @@ impl App {
                             // skip-permissions only matters when (re)launching claude,
                             // so it lives on the restart card, not here.
                             if let Some(cid) = &s.claude_session_id {
-                                ui.label(
-                                    RichText::new(short_id(cid)).size(10.5).monospace().color(palette::text_faint()),
-                                )
-                                .on_hover_text(format!("{}: {cid}", tr("Сохранённая сессия Claude", "Saved Claude session")));
+                                if s.fg_is_claude {
+                                    ui.label(
+                                        RichText::new(short_id(cid)).size(10.5).monospace().color(palette::text_faint()),
+                                    )
+                                    .on_hover_text(format!("{}: {cid}", tr("Сохранённая сессия Claude", "Saved Claude session")));
+                                } else if ui
+                                    .button(
+                                        RichText::new(format!("{} {}", tr("Вернуться в сессию", "Return to session"), short_id(cid)))
+                                            .size(11.0)
+                                            .color(Color32::from_rgb(0xd8, 0xe4, 0xd0)),
+                                    )
+                                    .on_hover_text(format!("claude --resume {cid}"))
+                                    .clicked()
+                                {
+                                    acts.push(Act::Resume(s.id, true));
+                                }
                             }
                         },
                         Phase::Suspended | Phase::Exited(_) => {
@@ -1998,7 +2250,9 @@ impl App {
                 && !self.settings_open
                 && !self.dir_open
                 && self.renaming.is_none()
-                && self.renaming_group.is_none();
+                && self.renaming_group.is_none()
+                // Don't steal focus from the explorer's active text field.
+                && !(self.explorer.open && self.explorer.mode != ExMode::Browse);
             let term_rect = ui.available_rect_before_wrap();
             let s = &mut self.sessions[idx];
             let info = term_view::show(ui, s, &settings, accept);
@@ -2061,7 +2315,9 @@ impl App {
         let interactive = !self.settings_open
             && !self.dir_open
             && self.renaming.is_none()
-            && self.renaming_group.is_none();
+            && self.renaming_group.is_none()
+            // The explorer's search / new-file field owns the keyboard while open.
+            && !(self.explorer.open && self.explorer.mode != ExMode::Browse);
         let mut submit: Option<String> = None;
 
         // Multiline once the command has a newline (added with Shift+Enter, which
@@ -3063,6 +3319,16 @@ impl eframe::App for App {
             .inner;
         self.apply(acts, &ctx);
 
+        if self.explorer.open {
+            let acts = egui::Panel::left("explorer")
+                .exact_size(240.0)
+                .resizable(false)
+                .frame(Frame::new().fill(palette::chrome_sidebar()))
+                .show(ui, |ui| self.explorer_panel(ui))
+                .inner;
+            self.apply(acts, &ctx);
+        }
+
         let acts = egui::Panel::bottom("statusbar")
             .exact_size(34.0)
             .frame(Frame::new().fill(palette::chrome_bar()))
@@ -3268,6 +3534,96 @@ fn truncate_head(s: &str, max: usize) -> String {
     format!("...{tail}")
 }
 
+/// One directory listing, folders first, then case-insensitive by name.
+fn read_dir_sorted(dir: &std::path::Path) -> Vec<ExEntry> {
+    let mut v: Vec<ExEntry> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| ExEntry {
+                is_dir: e.file_type().map(|t| t.is_dir()).unwrap_or(false),
+                name: e.file_name().to_string_lossy().into_owned(),
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    v.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    v
+}
+
+/// Bounded recursive name search: prunes hidden and heavy dirs, caps results
+/// and total entries visited so it stays cheap on the UI thread.
+fn ex_search(root: &std::path::Path, needle: &str, out: &mut Vec<PathBuf>) {
+    const SKIP: &[&str] = &["node_modules", "target", "dist", "build", ".next", ".venv"];
+    const MAX_HITS: usize = 400;
+    const MAX_VISIT: usize = 20_000;
+    let needle = needle.to_lowercase();
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            if out.len() >= MAX_HITS || visited >= MAX_VISIT {
+                return;
+            }
+            visited += 1;
+            let name = e.file_name().to_string_lossy().into_owned();
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if name.to_lowercase().contains(&needle) {
+                out.push(e.path());
+            }
+            if is_dir && !name.starts_with('.') && !SKIP.contains(&name.as_str()) {
+                stack.push(e.path());
+            }
+        }
+    }
+}
+
+/// 24px square icon button with hover/active background; `draw` paints the glyph.
+fn ex_icon_button(ui: &mut egui::Ui, active: bool, draw: fn(&egui::Painter, Pos2, Color32)) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    if active || resp.hovered() {
+        let bg = if active { palette::ui_bg_active() } else { palette::ui_bg_hover() };
+        ui.painter().rect_filled(rect, CornerRadius::same(5), bg);
+    }
+    let col = if active { palette::text() } else { palette::text_dim() };
+    draw(ui.painter(), rect.center(), col);
+    resp
+}
+
+/// Full-width clickable file/dir row with a hover highlight.
+fn ex_row(ui: &mut egui::Ui, label: &str, is_dir: bool) -> egui::Response {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 20.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(4), palette::ui_bg_hover());
+    }
+    let (text, col) =
+        if is_dir { (format!("{label}/"), palette::text()) } else { (label.to_string(), palette::text_dim()) };
+    ui.painter().text(
+        Pos2::new(rect.left() + 12.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        FontId::monospace(12.5),
+        col,
+    );
+    resp
+}
+
+fn draw_search(p: &egui::Painter, c: Pos2, col: Color32) {
+    let center = Pos2::new(c.x - 1.0, c.y - 1.0);
+    p.circle_stroke(center, 4.0, Stroke::new(1.5, col));
+    let a = center + Vec2::angled(std::f32::consts::FRAC_PI_4) * 4.0;
+    let b = center + Vec2::angled(std::f32::consts::FRAC_PI_4) * 8.5;
+    p.line_segment([a, b], Stroke::new(1.5, col));
+}
+
+fn draw_newfile(p: &egui::Painter, c: Pos2, col: Color32) {
+    let page = Rect::from_center_size(c, Vec2::new(9.0, 12.0));
+    p.rect_stroke(page, CornerRadius::same(1), Stroke::new(1.4, col), StrokeKind::Inside);
+    p.line_segment([Pos2::new(c.x - 2.3, c.y), Pos2::new(c.x + 2.3, c.y)], Stroke::new(1.4, col));
+    p.line_segment([Pos2::new(c.x, c.y - 2.3), Pos2::new(c.x, c.y + 2.3)], Stroke::new(1.4, col));
+}
+
 /// Keep the head, char-boundary safe.
 fn truncate_end(s: &str, max: usize) -> String {
     let n = s.chars().count();
@@ -3366,5 +3722,42 @@ fn fmt_dur(d: Duration) -> String {
         format!("{}{} {}{}", s / 60, tr("м", "m"), s % 60, tr("с", "s"))
     } else {
         format!("{}{} {}{}", s / 3600, tr("ч", "h"), s % 3600 / 60, tr("м", "m"))
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{ex_search, read_dir_sorted};
+    use std::fs;
+
+    #[test]
+    fn search_finds_nested_and_prunes_heavy_dirs() {
+        let base = std::env::temp_dir().join(format!("kip_ex_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("src")).unwrap();
+        fs::create_dir_all(base.join("node_modules/pkg")).unwrap();
+        fs::write(base.join("src/main.rs"), "").unwrap();
+        fs::write(base.join("README.md"), "").unwrap();
+        fs::write(base.join("node_modules/pkg/main.rs"), "").unwrap();
+
+        let mut hits = Vec::new();
+        ex_search(&base, "main", &mut hits);
+        // Finds the nested src/main.rs, skips anything under node_modules.
+        assert!(hits.iter().any(|p| p.ends_with("src/main.rs")), "missing src/main.rs: {hits:?}");
+        assert!(!hits.iter().any(|p| p.to_string_lossy().contains("node_modules")), "did not prune node_modules: {hits:?}");
+
+        // Case-insensitive.
+        let mut hits2 = Vec::new();
+        ex_search(&base, "readme", &mut hits2);
+        assert!(hits2.iter().any(|p| p.ends_with("README.md")), "case-insensitive miss: {hits2:?}");
+
+        // Listing puts folders before files.
+        let list = read_dir_sorted(&base);
+        let first_file = list.iter().position(|e| !e.is_dir);
+        let last_dir = list.iter().rposition(|e| e.is_dir);
+        if let (Some(f), Some(d)) = (first_file, last_dir) {
+            assert!(d < f, "folders should sort before files: {:?}", list.iter().map(|e| (&e.name, e.is_dir)).collect::<Vec<_>>());
+        }
+        let _ = fs::remove_dir_all(&base);
     }
 }

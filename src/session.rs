@@ -273,6 +273,7 @@ pub fn spawn_live(
     cols: u16,
     rows: u16,
     cell_size: (u16, u16),
+    seed: Option<&str>,
 ) -> std::io::Result<LiveTerm> {
     #[cfg(not(windows))]
     let shell = {
@@ -327,6 +328,15 @@ pub fn spawn_live(
     };
     let term = Term::new(term_config, &TermSize::new(cols as usize, rows as usize), proxy.clone());
     let term = Arc::new(FairMutex::new(term));
+
+    // Preload scrollback (e.g. a suspended session's snapshot) before the shell
+    // runs, so the on-screen history survives "reopen as terminal". Done before
+    // the event loop starts, so the shell's prompt lands after the history.
+    if let Some(seed) = seed {
+        let mut parser =
+            alacritty_terminal::vte::ansi::Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+        parser.advance(&mut *term.lock(), seed.as_bytes());
+    }
 
     let event_loop = match EventLoop::new(term.clone(), proxy, pty, false, false) {
         Ok(el) => el,
@@ -666,6 +676,30 @@ mod tests {
         let argv = format!("/Users/x/.local/share/claude/versions/2.1.217 --resume {SID}");
         assert!(parse_resume_hint(&argv).is_none());
         assert!(matches!(parse_resume_hint_argv(&argv), Some(ResumeHint::Sid(s)) if s == SID));
+    }
+
+    #[test]
+    fn seed_lands_in_scrollback() {
+        // The "reopen as terminal" seed must be parsed into the grid before the
+        // shell runs, so the suspended snapshot stays on screen. Feed the same
+        // bytes spawn_live feeds and read them back.
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::index::{Column, Point};
+        use alacritty_terminal::grid::Dimensions;
+
+        let size = TermSize::new(80, 24);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let seed = "line one\r\nline two\r\n";
+        let mut parser =
+            alacritty_terminal::vte::ansi::Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+        parser.advance(&mut term, seed.as_bytes());
+
+        let grid = term.grid();
+        let start = Point::new(grid.topmost_line(), Column(0));
+        let end = Point::new(grid.bottommost_line(), Column(grid.columns() - 1));
+        let text = term.bounds_to_string(start, end);
+        assert!(text.contains("line one") && text.contains("line two"), "seed missing: {text:?}");
     }
 
     #[test]
