@@ -102,18 +102,30 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     // Keyboard input.
     if focused {
         let events = ui.input(|i| i.events.clone());
+        let mut seen_keys: Vec<Key> = Vec::new();
         for event in events {
             match event {
                 Event::Text(t) => {
                     out.extend_from_slice(t.as_bytes());
                 },
-                Event::Key { key, physical_key, pressed: true, modifiers, .. } => {
+                Event::Key { key, physical_key, pressed: true, repeat, modifiers, .. } => {
                     // Fall back to the physical key so Ctrl+C etc. work in non-latin layouts.
                     let key = if key_letter(key).is_none() {
                         physical_key.unwrap_or(key)
                     } else {
                         key
                     };
+                    // A slow launch frame batches a held key's OS auto-repeats into one
+                    // frame; forwarding the whole burst walks the app's history in a
+                    // single shot. Cap auto-repeats to one press per key per frame (the
+                    // command editor is already capped this way via consume_plain).
+                    let dup = seen_keys.contains(&key);
+                    if !dup {
+                        seen_keys.push(key);
+                    }
+                    if repeat && dup {
+                        continue;
+                    }
                     if let Some(bytes) = encode_key(key, modifiers, mode, fg_is_claude) {
                         out.extend_from_slice(&bytes);
                     }
