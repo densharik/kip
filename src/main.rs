@@ -303,6 +303,9 @@ impl App {
             app.next_id += 1;
             app.sessions.push(Session::from_saved(saved, id));
         }
+        // Saved state from older builds may not be in display order; make the vec
+        // contiguous so drag/drop math is correct from the first interaction.
+        app.normalize_order();
         if app.sessions.is_empty() {
             app.spawn(dirs::home_dir().unwrap_or_else(|| "/".into()), None, &cc.egui_ctx);
         }
@@ -516,6 +519,7 @@ impl App {
             },
         };
         self.sessions.insert(insert, s);
+        self.normalize_order();
         self.persist();
     }
 
@@ -692,13 +696,20 @@ impl App {
             id,
         );
         self.attach_live(&mut s, command, ctx);
-        // Keep it next to its group instead of always at the very bottom.
-        let pos = group
-            .as_ref()
-            .and_then(|g| self.sessions.iter().rposition(|x| x.group.as_ref() == Some(g)))
-            .map(|p| p + 1)
-            .unwrap_or(self.sessions.len());
+        // Keep it next to its group; ungrouped sessions stay a contiguous block
+        // above the groups instead of landing below them (which would break the
+        // ungrouped-run adjacency that drag/drop relies on).
+        let pos = match &group {
+            Some(g) => self
+                .sessions
+                .iter()
+                .rposition(|x| x.group.as_ref() == Some(g))
+                .map(|p| p + 1)
+                .unwrap_or(self.sessions.len()),
+            None => self.sessions.iter().position(|x| x.group.is_some()).unwrap_or(self.sessions.len()),
+        };
         self.sessions.insert(pos, s);
+        self.normalize_order();
         self.set_active(Some(id));
         self.persist();
     }
@@ -808,6 +819,7 @@ impl App {
                 Act::BeginRename(id) => {
                     if let Some(idx) = self.idx_of(id) {
                         self.renaming = Some(id);
+                        self.renaming_group = None;
                         self.rename_buf = self.sessions[idx].display_name();
                         self.rename_focus = true;
                     }
@@ -877,6 +889,9 @@ impl App {
                         }
                     }
                     self.collapsed_groups.remove(&name);
+                    // Ex-members were ungrouped in place, mid-vec; pull them back
+                    // into the ungrouped block so ordering stays contiguous.
+                    self.normalize_order();
                     self.persist();
                 },
                 Act::Settings => self.settings_open = !self.settings_open,
@@ -1335,6 +1350,22 @@ impl App {
 
     fn sidebar(&mut self, ui: &mut egui::Ui) -> Vec<Act> {
         let mut acts = Vec::new();
+        // A rename editor can outlive its target: the last group member gets
+        // dragged out, the group is dissolved, or Cmd+W closes the renamed
+        // session. The editor then stops being drawn, so nothing commits or
+        // cancels it, and a stuck renaming* flag freezes terminal input
+        // (accept/interactive gate on it). Drop the orphan so input never
+        // dead-ends.
+        if self.renaming.is_some_and(|id| self.idx_of(id).is_none()) {
+            self.renaming = None;
+        }
+        if self
+            .renaming_group
+            .as_deref()
+            .is_some_and(|g| !self.sessions.iter().any(|s| s.group.as_deref() == Some(g)))
+        {
+            self.renaming_group = None;
+        }
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.add_space(10.0);
@@ -1432,6 +1463,21 @@ impl App {
             }
         }
         out
+    }
+
+    /// Reorder `sessions` into sidebar display order: ungrouped first, then each
+    /// group's members contiguously. Reorders only, never drops. `resolve_drop`
+    /// and the drag insertion math read vec adjacency, so they only stay correct
+    /// while the vec matches what is drawn; run this after any grouping/order
+    /// change (and once on load) to keep that invariant.
+    fn normalize_order(&mut self) {
+        let order: Vec<u64> = self
+            .sidebar_order()
+            .into_iter()
+            .filter_map(|s| if let Slot::Row(id) = s { Some(id) } else { None })
+            .collect();
+        self.sessions
+            .sort_by_key(|s| order.iter().position(|&id| id == s.id).unwrap_or(usize::MAX));
     }
 
     /// A group header: colored band, collapse triangle, name, member count.
