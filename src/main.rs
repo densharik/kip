@@ -274,8 +274,8 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        install_fonts(&cc.egui_ctx);
         let state = load_state();
+        install_fonts(&cc.egui_ctx, &state.settings.font);
         i18n::set(i18n::resolve(&state.settings.lang));
         palette::apply(&state.settings.theme, state.settings.accent.map(rgb32));
         apply_style(&cc.egui_ctx);
@@ -3103,6 +3103,28 @@ impl App {
                     ui.add(egui::Slider::new(&mut self.settings.font_size, 9.0..=20.0).step_by(0.5));
                     ui.end_row();
 
+                    ui.label(tr("Шрифт", "Font"));
+                    let choices = available_fonts();
+                    let cur_font = choices
+                        .iter()
+                        .find(|(k, _)| *k == self.settings.font)
+                        .map(|(_, l)| *l)
+                        .unwrap_or("JetBrains Mono");
+                    egui::ComboBox::from_id_salt("term-font")
+                        .selected_text(cur_font)
+                        .width(160.0)
+                        .show_ui(ui, |ui| {
+                            for (k, label) in choices {
+                                if ui.selectable_label(self.settings.font == k, label).clicked()
+                                    && self.settings.font != k
+                                {
+                                    self.settings.font = k.to_string();
+                                    install_fonts(ctx, k);
+                                }
+                            }
+                        });
+                    ui.end_row();
+
                     ui.label(tr("Скроллбэк (строк)", "Scrollback (lines)"));
                     ui.add(
                         egui::DragValue::new(&mut self.settings.scrollback)
@@ -3478,35 +3500,74 @@ impl eframe::App for App {
     }
 }
 
-fn install_fonts(ctx: &egui::Context) {
+/// Terminal fonts offered in settings, in menu order: (key, label, file to
+/// load). `None` means the font already ships inside the binary - "jbmono" is
+/// the bundled JetBrains Mono, "Hack" is egui's own default monospace. Which
+/// one looks right is a matter of taste (Menlo is thinner than Hack, SF Mono is
+/// wider), so this is a setting rather than a guess.
+const FONT_CHOICES: &[(&str, &str, Option<(&str, u32)>)] = &[
+    // Index 1 of Menlo.ttc is Menlo Bold - a heavier terminal on displays where
+    // egui's grayscale antialiasing renders Regular too thin.
+    ("menlo", "Menlo", Some(("/System/Library/Fonts/Menlo.ttc", 0))),
+    ("menlo-bold", "Menlo Bold", Some(("/System/Library/Fonts/Menlo.ttc", 1))),
+    ("sfmono", "SF Mono", Some(("/System/Library/Fonts/SFNSMono.ttf", 0))),
+    ("monaco", "Monaco", Some(("/System/Library/Fonts/Monaco.ttf", 0))),
+    ("consolas", "Consolas", Some(("C:\\Windows\\Fonts\\consola.ttf", 0))),
+    ("cascadia", "Cascadia Mono", Some(("C:\\Windows\\Fonts\\CascadiaMono.ttf", 0))),
+    ("dejavu", "DejaVu Sans Mono", Some(("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 0))),
+    ("jetbrains", "JetBrains Mono", None),
+    ("hack", "Hack", None),
+];
+
+/// The choices whose file is actually present on this machine.
+fn available_fonts() -> Vec<(&'static str, &'static str)> {
+    FONT_CHOICES
+        .iter()
+        .filter(|(_, _, src)| src.is_none_or(|(path, _)| std::fs::metadata(path).is_ok()))
+        .map(|(key, label, _)| (*key, *label))
+        .collect()
+}
+
+/// Read a font file, rejecting anything that is not an sfnt container: epaint
+/// panics on a font it fails to parse, and this reads whatever the OS ships.
+fn load_font_file(path: &str, index: u32) -> Option<FontData> {
+    let bytes = std::fs::read(path).ok()?;
+    if !matches!(bytes.get(..4)?, b"\x00\x01\x00\x00" | b"true" | b"OTTO" | b"ttcf") {
+        return None;
+    }
+    Some(FontData { font: bytes.into(), index, tweak: Default::default() })
+}
+
+fn install_fonts(ctx: &egui::Context, choice: &str) {
     let mut fonts = FontDefinitions::default();
-    // The native system mono is the primary terminal font - Menlo on macOS,
-    // which is what the terminal has always used and looks right. Bundled
-    // JetBrains Mono stays in the family only as a coverage fallback, so that
-    // if a system font is missing a glyph (or fails to load entirely) Cyrillic
-    // still renders in a monospace font instead of a proportional one.
     fonts.font_data.insert(
         "jbmono".into(),
         Arc::new(FontData::from_static(include_bytes!(
             "../resources/JetBrainsMono-Regular.ttf"
         ))),
     );
-    fonts.families.get_mut(&FontFamily::Monospace).unwrap().insert(0, "jbmono".into());
 
-    let candidates = [
-        "/System/Library/Fonts/Menlo.ttc",
-        "/System/Library/Fonts/SFNSMono.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "C:\\Windows\\Fonts\\consola.ttf",
-        "C:\\Windows\\Fonts\\CascadiaMono.ttf",
-    ];
-    for path in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert("sys-mono".into(), Arc::new(FontData::from_owned(bytes)));
-            fonts.families.get_mut(&FontFamily::Monospace).unwrap().insert(0, "sys-mono".into());
-            break;
+    // The picked font first, then the bundled JetBrains Mono, so a glyph it
+    // misses still lands in a monospace face instead of egui's proportional
+    // fallback; egui's own defaults close out the chain (emoji, rare symbols).
+    let mut family = Vec::new();
+    match FONT_CHOICES.iter().find(|(key, _, _)| *key == choice) {
+        Some((_, _, Some((path, index)))) => {
+            if let Some(data) = load_font_file(path, *index) {
+                fonts.font_data.insert("sys-mono".into(), Arc::new(data));
+                family.push("sys-mono".to_owned());
+            }
+        },
+        Some(("hack", _, _)) => family.push("Hack".to_owned()),
+        // "jetbrains", plus an unknown key or a system font that would not load.
+        _ => {},
+    }
+    for name in ["jbmono", "Hack", "Ubuntu-Light", "NotoEmoji-Regular", "emoji-icon-font"] {
+        if !family.iter().any(|f| f == name) {
+            family.push(name.to_owned());
         }
     }
+    fonts.families.insert(FontFamily::Monospace, family);
     ctx.set_fonts(fonts);
 }
 
@@ -3858,6 +3919,23 @@ fn fmt_dur(d: Duration) -> String {
         format!("{}{} {}{}", s / 60, tr("м", "m"), s % 60, tr("с", "s"))
     } else {
         format!("{}{} {}{}", s / 3600, tr("ч", "h"), s % 3600 / 60, tr("м", "m"))
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    /// epaint panics on a font it cannot parse, so every choice the settings
+    /// offer has to actually lay out text on this machine.
+    #[test]
+    fn every_offered_font_renders() {
+        let ctx = egui::Context::default();
+        for (key, _) in super::available_fonts() {
+            super::install_fonts(&ctx, key);
+            let _ = ctx.run_ui(Default::default(), |ui| {
+                let w = ui.ctx().fonts_mut(|f| f.glyph_width(&egui::FontId::monospace(13.0), '0'));
+                assert!(w > 0.0, "{key}: no glyph width");
+            });
+        }
     }
 }
 

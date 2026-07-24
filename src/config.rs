@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Settings {
     pub font_size: f32,
+    /// Terminal font key (see FONT_CHOICES in main.rs).
+    pub font: String,
     /// Global UI zoom, 1.0 = 100%.
     pub ui_scale: f32,
     pub scrollback: usize,
@@ -34,6 +36,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             font_size: 13.0,
+            font: "menlo".into(),
             ui_scale: 1.2,
             scrollback: 5000,
             idle_suspend_min: 10,
