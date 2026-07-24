@@ -2458,12 +2458,11 @@ impl eframe::App for App {
 
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-    // Bundled JetBrains Mono guarantees full Latin+Cyrillic coverage so the
-    // terminal renders identically on every machine. macOS Menlo ships as a
-    // .ttc collection that egui mis-loads, which dropped Cyrillic into a
-    // proportional fallback (mixed fonts in the terminal). A system font is
-    // inserted ahead of it below when present; jbmono stays in the family as
-    // the fallback that backs any glyph the system font is missing.
+    // The native system mono is the primary terminal font - Menlo on macOS,
+    // which is what the terminal has always used and looks right. Bundled
+    // JetBrains Mono stays in the family only as a coverage fallback, so that
+    // if a system font is missing a glyph (or fails to load entirely) Cyrillic
+    // still renders in a monospace font instead of a proportional one.
     fonts.font_data.insert(
         "jbmono".into(),
         Arc::new(FontData::from_static(include_bytes!(
@@ -2472,10 +2471,8 @@ fn install_fonts(ctx: &egui::Context) {
     );
     fonts.families.get_mut(&FontFamily::Monospace).unwrap().insert(0, "jbmono".into());
 
-    // Prefer a native single-file system mono when present (SF Mono on macOS),
-    // with jbmono behind it as the coverage fallback. Menlo.ttc is left out on
-    // purpose - it is the collection that fails to load.
     let candidates = [
+        "/System/Library/Fonts/Menlo.ttc",
         "/System/Library/Fonts/SFNSMono.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "C:\\Windows\\Fonts\\consola.ttf",
