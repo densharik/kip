@@ -29,10 +29,16 @@ cat > "$IN" 2>/dev/null || run_prev
 line=$(tr -d '\n\r' < "$IN" 2>/dev/null)
 sid=$(printf '%s' "$line" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F-]\{8,64\}\)".*/\1/p')
 # The context percentage is context_window.used_percentage. Claude 2.1.215+
-# also puts used_percentage inside rate_limits (five_hour/seven_day); strip
-# that block first so the greedy match cannot pick a rate-limit number instead.
-ctx=$(printf '%s' "$line" | sed 's/"rate_limits".*//' \
-    | sed -n 's/.*"used_percentage"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\(\.[0-9][0-9]*\)\{0,1\}\).*/\1/p')
+# also puts a used_percentage inside rate_limits (five_hour/seven_day). Anchor
+# the match to the context_window object ([^}]* stays inside it) so JSON key
+# order does not matter and a rate-limit number can never be picked instead.
+ctx=$(printf '%s' "$line" | sed -n 's/.*"context_window"[[:space:]]*:[[:space:]]*{[^}]*"used_percentage"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\(\.[0-9][0-9]*\)\{0,1\}\).*/\1/p')
+# Fallback for shapes with no context_window wrapper: strip rate_limits, then
+# take the remaining used_percentage.
+if [ -z "$ctx" ]; then
+    ctx=$(printf '%s' "$line" | sed 's/"rate_limits".*//' \
+        | sed -n 's/.*"used_percentage"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\(\.[0-9][0-9]*\)\{0,1\}\).*/\1/p')
+fi
 
 # ctx 0 = no data yet (claude still booting), not an actual 0% session.
 if [ -n "$sid" ] && [ -n "$ctx" ] && [ "$ctx" != "0" ] && [ "$ctx" != "0.0" ]; then
