@@ -97,8 +97,10 @@ jobs:
         run: |
           mkdir -p pkgroot pkgscripts
           cp -R dist/kip.app pkgroot/
-          # Hand the installed app to the logged-in user so in-app updates can
-          # replace it in place, without a password on every update.
+          # Give the installed app to the logged-in user. The in-app updater
+          # then tries an in-place swap first (passwordless when /Applications
+          # is writable, e.g. for admins), and falls back to this .pkg with a
+          # password prompt when macOS blocks replacing the bundle.
           cat > pkgscripts/postinstall <<'SH'
           #!/bin/sh
           u="${INSTALL_PKG_SESSION_OWNER:-$(/usr/bin/stat -f%Su /dev/console)}"

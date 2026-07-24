@@ -2113,7 +2113,7 @@ impl App {
                         .iter()
                         .find(|(k, _)| *k == self.settings.lang)
                         .map(|(_, l)| *l)
-                        .unwrap_or("Auto");
+                        .unwrap_or(tr("Авто", "Auto"));
                     egui::ComboBox::from_id_salt("lang")
                         .selected_text(cur_lang)
                         .width(160.0)
@@ -2449,8 +2449,9 @@ fn install_fonts(ctx: &egui::Context) {
     // Bundled JetBrains Mono guarantees full Latin+Cyrillic coverage so the
     // terminal renders identically on every machine. macOS Menlo ships as a
     // .ttc collection that egui mis-loads, which dropped Cyrillic into a
-    // proportional fallback (mixed fonts in the terminal). Kept as the first
-    // monospace so it always backs any glyph a system font is missing.
+    // proportional fallback (mixed fonts in the terminal). A system font is
+    // inserted ahead of it below when present; jbmono stays in the family as
+    // the fallback that backs any glyph the system font is missing.
     fonts.font_data.insert(
         "jbmono".into(),
         Arc::new(FontData::from_static(include_bytes!(

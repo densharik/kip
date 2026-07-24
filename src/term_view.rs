@@ -140,7 +140,12 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         }
     }
 
-    // Mouse wheel scrolling.
+    // Mouse wheel. Order matters. If the app enabled mouse reporting, send wheel
+    // events so it scrolls its own view - this is what Warp does and what Claude
+    // Code expects. Sending arrow keys to a mouse-reporting app made the wheel
+    // walk Claude's prompt history instead of scrolling. Only fall back to arrow
+    // keys for alt-screen apps that use alternate-scroll without mouse reporting
+    // (less, vim); otherwise scroll our own scrollback.
     if response.hovered() {
         let dy = ui.input(|i| i.smooth_scroll_delta.y);
         if dy != 0.0 {
@@ -149,7 +154,14 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
             let lines = (session.scroll_accum / cell_h).trunc() as i32;
             if lines != 0 {
                 session.scroll_accum -= lines as f32 * cell_h;
-                if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+                if mode.intersects(TermMode::MOUSE_MODE) {
+                    let (col, row) =
+                        wheel_cell(response.hover_pos(), origin, cell_w, cell_h, cols, rows);
+                    let sgr = mode.contains(TermMode::SGR_MOUSE);
+                    for _ in 0..lines.abs() {
+                        out.extend_from_slice(&wheel_report(lines > 0, col, row, sgr));
+                    }
+                } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
                     let seq: &[u8] = if lines > 0 {
                         if mode.contains(TermMode::APP_CURSOR) { b"\x1bOA" } else { b"\x1b[A" }
                     } else if mode.contains(TermMode::APP_CURSOR) {
@@ -412,6 +424,38 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     }
 
     info
+}
+
+/// Cell (1-based col, row) under the pointer, for mouse wheel reports.
+fn wheel_cell(
+    pos: Option<Pos2>,
+    origin: Pos2,
+    cell_w: f32,
+    cell_h: f32,
+    cols: u16,
+    rows: u16,
+) -> (usize, usize) {
+    match pos {
+        Some(p) => {
+            let c = (((p.x - origin.x) / cell_w) as i32).clamp(0, cols as i32 - 1) + 1;
+            let r = (((p.y - origin.y) / cell_h) as i32).clamp(0, rows as i32 - 1) + 1;
+            (c as usize, r as usize)
+        },
+        None => (1, 1),
+    }
+}
+
+/// Encode a mouse wheel event: button 64 = up, 65 = down. SGR (1006) form when
+/// the app enabled it, otherwise the legacy X10 form.
+fn wheel_report(up: bool, col: usize, row: usize, sgr: bool) -> Vec<u8> {
+    let cb = if up { 64 } else { 65 };
+    if sgr {
+        format!("\x1b[<{cb};{col};{row}M").into_bytes()
+    } else {
+        let cx = (col.min(223) + 32) as u8;
+        let cy = (row.min(223) + 32) as u8;
+        vec![0x1b, b'[', b'M', (cb + 32) as u8, cx, cy]
+    }
 }
 
 fn selection_contains(range: &SelectionRange, point: Point) -> bool {

@@ -269,10 +269,15 @@ fn relaunch(bundle: &Path) -> Result<(), String> {
 fn do_apply(rel: &Release) -> Result<(), String> {
     let cur = std::env::current_exe().map_err(|e| format!("{}: {e}", tr("нет пути к бинарнику", "no path to binary")))?;
     let bundle = bundle_of(&cur)?;
-    if !swap_install(&bundle, rel)? {
+    if swap_install(&bundle, rel)? {
+        // Replaced in place - relaunch where we already are.
+        relaunch(&bundle)
+    } else {
         pkg_install(rel)?;
+        // The .pkg always installs to /Applications, which may differ from where
+        // we ran; relaunch the freshly installed copy, not the old one.
+        relaunch(Path::new("/Applications/kip.app"))
     }
-    relaunch(&bundle)
 }
 
 #[cfg(all(not(windows), not(target_os = "macos")))]
@@ -283,9 +288,10 @@ fn do_apply(_rel: &Release) -> Result<(), String> {
 pub fn apply(rel: Release, tx: Sender<UpdateMsg>, egui: egui::Context) {
     std::thread::spawn(move || {
         // On success do_apply relaunches and exits; only errors return here.
-        let err = do_apply(&rel).unwrap_err();
-        if tx.send(UpdateMsg::Applied(Err(err))).is_ok() {
-            egui.request_repaint();
+        if let Err(err) = do_apply(&rel) {
+            if tx.send(UpdateMsg::Applied(Err(err))).is_ok() {
+                egui.request_repaint();
+            }
         }
     });
 }
