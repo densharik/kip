@@ -1,9 +1,10 @@
 //! In-app self-update from GitHub Releases. Network via curl (present on macOS
 //! and Windows 10+); no extra crates. Check runs in the background and reports
 //! over an mpsc channel. Applying: Windows swaps the exe in place; macOS
-//! replaces the .app bundle in place (no password) and falls back to the
-//! release .pkg via the system installer (one password) when the app is
-//! root-owned. Both relaunch on success.
+//! replaces the .app bundle in place (no password) and, when the app's folder
+//! is not writable, falls back to a single-password `osascript` swap that
+//! copies the already-downloaded bundle into place as root. Both relaunch on
+//! success.
 
 use std::path::Path;
 use std::process::Command;
@@ -45,10 +46,6 @@ fn parse_ver(s: &str) -> (u32, u32, u32) {
 pub struct Release {
     pub display: String,
     pub asset_url: String,
-    /// macOS .pkg installer URL, the admin fallback when the app is root-owned.
-    /// None on other platforms.
-    #[allow(dead_code)]
-    pub pkg_url: Option<String>,
 }
 
 pub enum UpdateMsg {
@@ -94,9 +91,8 @@ fn do_check() -> Result<Option<Release>, String> {
             .map(str::to_string)
     };
     let asset_url = find(ASSET_NAME).ok_or_else(|| format!("{} {tag} {} {ASSET_NAME}", tr("в релизе", "release"), tr("нет", "has no")))?;
-    let pkg_url = if cfg!(target_os = "macos") { find("kip-installer.pkg") } else { None };
     let display = tag.trim_start_matches('v').to_string();
-    Ok(Some(Release { display, asset_url, pkg_url }))
+    Ok(Some(Release { display, asset_url }))
 }
 
 pub fn check(tx: Sender<UpdateMsg>, egui: egui::Context) {
@@ -156,23 +152,32 @@ fn bundle_of(cur: &Path) -> Result<std::path::PathBuf, String> {
     Ok(b.to_path_buf())
 }
 
-/// Try to replace the bundle in place, no password. Ok(true) = done,
-/// Ok(false) = permission denied (caller should use the admin .pkg), Err = a
-/// hard failure (download/unpack).
+/// Single-quote a string for /bin/sh, so paths with spaces or quotes survive.
 #[cfg(target_os = "macos")]
-fn swap_install(bundle: &Path, rel: &Release) -> Result<bool, String> {
-    let parent = bundle.parent().ok_or(tr("нет каталога бандла", "no bundle directory"))?;
-    let probe = parent.join(".kip-write-test");
-    if std::fs::write(&probe, b"x").is_err() {
-        return Ok(false);
-    }
-    let _ = std::fs::remove_file(&probe);
+fn sh_q(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
 
+/// Escape a string for an AppleScript double-quoted literal (only `\` and `"`
+/// are special there). Lets us inline the whole shell command into
+/// `do shell script "..."` instead of dropping a script file for root to run.
+#[cfg(target_os = "macos")]
+fn osa_q(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Download the release zip and unpack it, returning (temp dir to clean up,
+/// the extracted kip.app inside it).
+#[cfg(target_os = "macos")]
+fn fetch_bundle(rel: &Release) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
     let tmp = std::env::temp_dir().join(format!("kip-swap-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| format!("temp: {e}"))?;
     let zip = tmp.join("kip.zip");
-    download(&rel.asset_url, &zip)?;
+    if let Err(e) = download(&rel.asset_url, &zip) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
     let ok = Command::new("ditto")
         .args(["-x", "-k"])
         .arg(&zip)
@@ -181,32 +186,57 @@ fn swap_install(bundle: &Path, rel: &Release) -> Result<bool, String> {
         .map(|s| s.success())
         .unwrap_or(false);
     if !ok {
+        let _ = std::fs::remove_dir_all(&tmp);
         return Err(tr("не удалось распаковать архив", "could not unpack archive").into());
     }
     let newapp = tmp.join("kip.app");
     if !newapp.exists() {
+        let _ = std::fs::remove_dir_all(&tmp);
         return Err(tr("в архиве нет kip.app", "archive has no kip.app").into());
     }
     let _ = Command::new("xattr").args(["-cr"]).arg(&newapp).status();
+    Ok((tmp, newapp))
+}
+
+/// Try to replace the bundle in place, no password. Ok(true) = done,
+/// Ok(false) = blocked by permissions (caller escalates to admin_swap), Err = a
+/// hard failure. Any leftover we cannot clear (e.g. a root-owned staged copy
+/// from a previous run) also routes to the admin path instead of erroring.
+#[cfg(target_os = "macos")]
+fn try_swap(bundle: &Path, newapp: &Path) -> Result<bool, String> {
+    let parent = bundle.parent().ok_or(tr("нет каталога бандла", "no bundle directory"))?;
+    // Cheap probe: if the app's folder is not writable, an in-place swap cannot
+    // work - go straight to the admin path.
+    let probe = parent.join(".kip-write-test");
+    if std::fs::write(&probe, b"x").is_err() {
+        return Ok(false);
+    }
+    let _ = std::fs::remove_file(&probe);
 
     // Copy next to the target (same filesystem) so the final swap is atomic.
     let staged = parent.join("kip.app.new");
     let _ = std::fs::remove_dir_all(&staged);
+    if std::fs::symlink_metadata(&staged).is_ok() {
+        return Ok(false);
+    }
     let staged_ok = Command::new("ditto")
-        .arg(&newapp)
+        .arg(newapp)
         .arg(&staged)
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
     if !staged_ok {
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&staged);
         return Ok(false);
     }
     let backup = parent.join("kip.app.old");
     let _ = std::fs::remove_dir_all(&backup);
+    if std::fs::symlink_metadata(&backup).is_ok() {
+        let _ = std::fs::remove_dir_all(&staged);
+        return Ok(false);
+    }
     if let Err(e) = std::fs::rename(bundle, &backup) {
         let _ = std::fs::remove_dir_all(&staged);
-        let _ = std::fs::remove_dir_all(&tmp);
         if e.kind() == std::io::ErrorKind::PermissionDenied {
             return Ok(false);
         }
@@ -214,36 +244,47 @@ fn swap_install(bundle: &Path, rel: &Release) -> Result<bool, String> {
     }
     if let Err(e) = std::fs::rename(&staged, bundle) {
         let _ = std::fs::rename(&backup, bundle);
-        let _ = std::fs::remove_dir_all(&tmp);
         return Err(format!("{}: {e}", tr("замена бандла", "bundle swap")));
     }
     let _ = std::fs::remove_dir_all(&backup);
-    let _ = std::fs::remove_dir_all(&tmp);
     Ok(true)
 }
 
-/// Admin fallback: run the release .pkg through the system installer. One
-/// password prompt; the .pkg hands the app to the user so the next update can
-/// use the passwordless swap path.
+/// Admin fallback: replace the bundle with a single `osascript` password
+/// prompt. A root shell command stages the already-downloaded bundle beside
+/// the target, swaps it in (keeping the old one as a backup until the new one
+/// is promoted, so a failed `ditto` never destroys the app), hands it to the
+/// logged-in user, and clears quarantine - so the next update goes passwordless.
+///
+/// The command is inlined into the AppleScript rather than written to a temp
+/// file: a same-user process could otherwise swap that file between write and
+/// root execution (a local privilege-escalation window).
 #[cfg(target_os = "macos")]
-fn pkg_install(rel: &Release) -> Result<(), String> {
-    let pkg_url = rel.pkg_url.as_deref().ok_or(tr("в релизе нет .pkg", "release has no .pkg"))?;
-    let tmp = std::env::temp_dir().join(format!("kip-pkg-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).map_err(|e| format!("temp: {e}"))?;
-    let pkg = tmp.join("kip.pkg");
-    download(pkg_url, &pkg)?;
-    // `quoted form of` handles shell quoting inside the AppleScript command.
+fn admin_swap(bundle: &Path, newapp: &Path) -> Result<(), String> {
+    let b = sh_q(&bundle.to_string_lossy());
+    let n = sh_q(&newapp.to_string_lossy());
+    // `chown` and the `stat` lookup are best-effort; `xattr -cr` must run so the
+    // relaunched app is not held back by quarantine, so nothing before it may
+    // trip `set -e`.
     let script = format!(
-        "do shell script \"installer -pkg \" & quoted form of \"{}\" & \" -target /\" \
-         with administrator privileges",
-        pkg.display()
+        "set -e; \
+         u=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true); \
+         /bin/rm -rf {b}.old {b}.new; \
+         /usr/bin/ditto {n} {b}.new; \
+         /bin/mv {b} {b}.old; \
+         /bin/mv {b}.new {b}; \
+         /bin/rm -rf {b}.old; \
+         if [ -n \"$u\" ] && [ \"$u\" != root ]; then /usr/sbin/chown -R \"$u:staff\" {b} || true; fi; \
+         /usr/bin/xattr -cr {b}"
+    );
+    let osa = format!(
+        "do shell script \"{}\" with administrator privileges",
+        osa_q(&script)
     );
     let out = Command::new("osascript")
-        .args(["-e", &script])
+        .args(["-e", &osa])
         .output()
         .map_err(|e| format!("osascript: {e}"))?;
-    let _ = std::fs::remove_dir_all(&tmp);
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         if err.contains("-128") {
@@ -272,15 +313,18 @@ fn relaunch(bundle: &Path) -> Result<(), String> {
 fn do_apply(rel: &Release) -> Result<(), String> {
     let cur = std::env::current_exe().map_err(|e| format!("{}: {e}", tr("нет пути к бинарнику", "no path to binary")))?;
     let bundle = bundle_of(&cur)?;
-    if swap_install(&bundle, rel)? {
-        // Replaced in place - relaunch where we already are.
-        relaunch(&bundle)
-    } else {
-        pkg_install(rel)?;
-        // The .pkg always installs to /Applications, which may differ from where
-        // we ran; relaunch the freshly installed copy, not the old one.
-        relaunch(Path::new("/Applications/kip.app"))
-    }
+    let (tmp, newapp) = fetch_bundle(rel)?;
+    // Passwordless in-place swap first; escalate to a single admin prompt only
+    // when the app's folder is not writable. Either way the same bundle path is
+    // replaced, so we relaunch exactly where we already run.
+    let res = match try_swap(&bundle, &newapp) {
+        Ok(true) => Ok(()),
+        Ok(false) => admin_swap(&bundle, &newapp),
+        Err(e) => Err(e),
+    };
+    let _ = std::fs::remove_dir_all(&tmp);
+    res?;
+    relaunch(&bundle)
 }
 
 #[cfg(all(not(windows), not(target_os = "macos")))]
