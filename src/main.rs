@@ -23,6 +23,8 @@ use std::time::{Duration, Instant, SystemTime};
 use alacritty_terminal::event::{Event as TermEvent, Notify, WindowSize};
 use alacritty_terminal::term::TermMode;
 use eframe::egui;
+use egui::text::CCursor;
+use egui::text_selection::CCursorRange;
 use egui::{
     Align, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Frame,
     Key, Layout, Margin, Modifiers, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind,
@@ -257,6 +259,12 @@ struct App {
     /// Unfiltered subdirs of dir_path, refreshed at most every 2s while the popup is open.
     dir_cache: Vec<String>,
     dir_cache_at: Option<(PathBuf, Instant)>,
+    /// Inline "new folder" editor inside the switcher: Some = its name is being
+    /// typed. `new_dir_focus` selects the placeholder on the first frame so that
+    /// typing replaces it.
+    new_dir: Option<String>,
+    new_dir_focus: bool,
+    new_dir_err: Option<String>,
     chip_rect: Option<Rect>,
     stats_tx: Sender<plat::SysStats>,
     stats_rx: Receiver<plat::SysStats>,
@@ -347,6 +355,9 @@ impl App {
             dir_path: dirs::home_dir().unwrap_or_else(|| "/".into()),
             dir_cache: Vec::new(),
             dir_cache_at: None,
+            new_dir: None,
+            new_dir_focus: false,
+            new_dir_err: None,
             chip_rect: None,
             stats_tx,
             stats_rx,
@@ -2820,6 +2831,10 @@ impl App {
     /// Directory switcher over the path chip: navigating runs `cd` in the shell.
     fn dir_popup(&mut self, ctx: &egui::Context) {
         if !self.dir_open {
+            // Catches every way the popup can close - the path chip, switching
+            // session, Escape - so a half-typed folder name never comes back.
+            self.new_dir = None;
+            self.new_dir_err = None;
             return;
         }
         let Some(chip) = self.chip_rect else { return };
@@ -2830,7 +2845,15 @@ impl App {
             enter = consume_plain(i, Key::Enter);
         });
         if esc {
-            self.dir_open = false;
+            // Escape backs out of the folder editor first, the popup second.
+            if self.new_dir.take().is_none() {
+                self.dir_open = false;
+            }
+            self.new_dir_err = None;
+            return;
+        }
+        if enter && self.new_dir.is_some() {
+            self.create_dir_and_enter(ctx);
             return;
         }
 
@@ -2882,7 +2905,49 @@ impl App {
                                 .hint_text(tr("Поиск папок...", "Search folders..."))
                                 .desired_width(f32::INFINITY),
                         );
-                        resp.request_focus();
+                        // The search field owns the keyboard except while a new
+                        // folder name is being typed.
+                        if self.new_dir.is_none() {
+                            resp.request_focus();
+                        }
+                        ui.separator();
+
+                        match self.new_dir.clone() {
+                            None => {
+                                let label = RichText::new(tr("+ Новая папка", "+ New folder"))
+                                    .size(11.5)
+                                    .color(palette::text_dim());
+                                if ui.add(egui::Button::new(label).frame(false)).clicked() {
+                                    self.new_dir =
+                                        Some(tr("Новая папка", "New folder").to_string());
+                                    self.new_dir_focus = true;
+                                    self.new_dir_err = None;
+                                }
+                            },
+                            Some(mut name) => {
+                                let out = egui::TextEdit::singleline(&mut name)
+                                    .font(FontId::proportional(12.5))
+                                    .desired_width(f32::INFINITY)
+                                    .show(ui);
+                                if self.new_dir_focus {
+                                    out.response.request_focus();
+                                    let end = CCursor::new(name.chars().count());
+                                    let mut state = out.state;
+                                    state.cursor.set_char_range(Some(CCursorRange::two(
+                                        CCursor::new(0),
+                                        end,
+                                    )));
+                                    state.store(ui.ctx(), out.response.id);
+                                    self.new_dir_focus = false;
+                                }
+                                self.new_dir = Some(name);
+                                if let Some(err) = &self.new_dir_err {
+                                    ui.label(
+                                        RichText::new(truncate_end(err, 60)).size(10.5).color(GIT_DEL),
+                                    );
+                                }
+                            },
+                        }
                         ui.separator();
                         ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                             if self.dir_path.parent().is_some()
@@ -2933,6 +2998,28 @@ impl App {
         }
     }
 
+    /// Create the folder named in the inline editor and step into it. A failure
+    /// (name taken, read-only parent) keeps the editor open with the reason.
+    fn create_dir_and_enter(&mut self, ctx: &egui::Context) {
+        let name = self.new_dir.as_deref().unwrap_or_default().trim().to_string();
+        if name.is_empty() {
+            return; // Enter on an empty field does nothing, the editor stays
+        }
+        self.new_dir = None;
+        match std::fs::create_dir(self.dir_path.join(&name)) {
+            Ok(()) => {
+                self.new_dir_err = None;
+                self.dir_cache_at = None;
+                self.dir_navigate(Some(name), ctx);
+            },
+            Err(e) => {
+                self.new_dir_err = Some(e.to_string());
+                self.new_dir = Some(name);
+                self.new_dir_focus = true;
+            },
+        }
+    }
+
     fn dir_navigate(&mut self, step: Option<String>, ctx: &egui::Context) {
         let new_path = match &step {
             None => match self.dir_path.parent() {
@@ -2959,6 +3046,8 @@ impl App {
         }
         self.dir_path = new_path;
         self.dir_query.clear();
+        self.new_dir = None;
+        self.new_dir_err = None;
     }
 
     fn frozen_view(&mut self, ui: &mut egui::Ui, idx: usize, acts: &mut Vec<Act>) {
