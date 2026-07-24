@@ -118,7 +118,15 @@ pub fn sample_stats(targets: &[(String, i32, bool)]) -> SysStats {
 /// job control; reaping is left to the PTY event loop (shell) and launchd (the
 /// reparented descendants).
 pub fn kill_tree(root: i32) {
-    if root <= 1 {
+    kill_trees(&[root]);
+}
+
+/// Same for a batch of roots, sharing ONE `ps` snapshot. The idle-suspend sweep
+/// can tear down several sessions in a single tick, and it runs on the UI
+/// thread - a fork+exec per session there is a visible stall.
+pub fn kill_trees(roots: &[i32]) {
+    let roots: Vec<i32> = roots.iter().copied().filter(|&p| p > 1).collect();
+    if roots.is_empty() {
         return;
     }
     let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
@@ -134,7 +142,7 @@ pub fn kill_tree(root: i32) {
     }
     let me = std::process::id() as i32;
     let mut seen = std::collections::HashSet::new();
-    let mut stack = vec![root];
+    let mut stack = roots;
     while let Some(pid) = stack.pop() {
         if !seen.insert(pid) {
             continue;

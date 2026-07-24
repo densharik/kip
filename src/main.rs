@@ -51,9 +51,13 @@ fn main() -> eframe::Result {
     // If kip itself was launched from a Claude Code session, its CLAUDE* markers
     // leak into our shells and a claude started there thinks it is a child session
     // and disables transcript saving (breaking resume and context tracking).
+    // CLAUDE_CONFIG_DIR is configuration, not a nesting marker: claude_dir() reads
+    // it to find sessions/transcripts, and dropping it here would leave us looking
+    // in ~/.claude while the shells (which re-export it from the user's rc) run a
+    // claude that writes somewhere else.
     let claude_vars: Vec<String> = std::env::vars()
         .map(|(k, _)| k)
-        .filter(|k| k.starts_with("CLAUDE"))
+        .filter(|k| k.starts_with("CLAUDE") && k != "CLAUDE_CONFIG_DIR")
         .collect();
     for k in claude_vars {
         // Safe: nothing else is running yet.
@@ -98,6 +102,9 @@ enum Act {
     /// bool = resume the saved Claude session (vs plain shell). Either way the
     /// same session is revived in place - no new tab.
     Resume(u64, bool),
+    /// Type the resume command into a session's LIVE shell. Unlike `Resume` this
+    /// touches no PTY: the terminal keeps its cwd, environment and scrollback.
+    ResumeInPlace(u64),
     /// Cmd+W: suspend a live session, remove a frozen one.
     Close(u64),
     /// X button / "Удалить": always removes, killing a live session.
@@ -236,6 +243,13 @@ struct App {
     session_cmds: Vec<String>,
     hist_mtime: Option<SystemTime>,
     last_hist_check: Option<Instant>,
+    /// Background histfile reads: (entries, lowercase mirror).
+    hist_tx: Sender<(Vec<String>, Vec<String>)>,
+    hist_rx: Receiver<(Vec<String>, Vec<String>)>,
+    hist_inflight: bool,
+    /// A read has landed at least once (an absent histfile stays empty forever,
+    /// and must not re-spawn a reader every 5s).
+    hist_loaded: bool,
     /// Directory switcher popup over the path chip.
     dir_open: bool,
     dir_query: String,
@@ -272,6 +286,7 @@ impl App {
         let (ctxi_tx, ctxi_rx) = mpsc::channel();
         let (stats_tx, stats_rx) = mpsc::channel();
         let (upd_tx, upd_rx) = mpsc::channel();
+        let (hist_tx, hist_rx) = mpsc::channel();
         let jsonl_map: ctx_index::SharedMap = Default::default();
         ctx_index::spawn_initial_scan(jsonl_map.clone());
         ctx_index::sweep();
@@ -321,6 +336,10 @@ impl App {
             session_cmds: Vec::new(),
             hist_mtime: None,
             last_hist_check: None,
+            hist_tx,
+            hist_rx,
+            hist_inflight: false,
+            hist_loaded: false,
             dir_open: false,
             dir_query: String::new(),
             dir_path: dirs::home_dir().unwrap_or_else(|| "/".into()),
@@ -437,8 +456,12 @@ impl App {
         }
     }
 
-    /// Re-read the shell history file when it changes (throttled).
-    fn refresh_history(&mut self) {
+    /// Re-read the shell history file when it changes (throttled). The read,
+    /// the dedup and the lowercase mirror are the expensive part - tens of ms on
+    /// a multi-megabyte histfile - and EVERY command run in any shell touches the
+    /// file's mtime, so this fires regularly while working. It runs off the UI
+    /// thread and lands in `drain_history`.
+    fn refresh_history(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         if self.last_hist_check.is_some_and(|t| now.duration_since(t) < Duration::from_secs(5)) {
             return;
@@ -447,17 +470,40 @@ impl App {
         let mtime = shell_history_path()
             .and_then(|p| std::fs::metadata(p).ok())
             .and_then(|m| m.modified().ok());
-        if mtime == self.hist_mtime && !self.history.is_empty() {
+        if self.hist_inflight || (mtime == self.hist_mtime && self.hist_loaded) {
             return;
         }
         self.hist_mtime = mtime;
-        let mut hist = load_shell_history();
-        for cmd in &self.session_cmds {
-            hist.retain(|h| h != cmd);
-            hist.push(cmd.clone());
+        self.hist_inflight = true;
+        let tx = self.hist_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let hist = load_shell_history();
+            let lc: Vec<String> = hist.iter().map(|h| h.to_lowercase()).collect();
+            if tx.send((hist, lc)).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Adopt a finished background read. `session_cmds` is the authoritative
+    /// record of what THIS run sent, replayed on top of every snapshot - so a
+    /// command submitted while the read was in flight is not swallowed by it.
+    fn drain_history(&mut self) {
+        while let Ok((mut hist, mut lc)) = self.hist_rx.try_recv() {
+            self.hist_inflight = false;
+            self.hist_loaded = true;
+            for cmd in &self.session_cmds {
+                if let Some(p) = hist.iter().position(|h| h == cmd) {
+                    hist.remove(p);
+                    lc.remove(p);
+                }
+                hist.push(cmd.clone());
+                lc.push(cmd.to_lowercase());
+            }
+            self.history = hist;
+            self.history_lc = lc;
         }
-        self.history = hist;
-        self.history_lc = self.history.iter().map(|h| h.to_lowercase()).collect();
     }
 
     /// Insert file path text where input currently goes: the command editor at
@@ -684,10 +730,24 @@ impl App {
         }
     }
 
+    /// Write back a pending inline rename instead of dropping it. The editor
+    /// loses focus and the click that ended it land in the SAME frame, and
+    /// sidebar rows queue their actions top-down: clicking a row above the one
+    /// being renamed put Select first, which used to clear `renaming` and turn
+    /// the queued RenameCommit into a no-op, silently losing the typed name.
+    /// Empty buffer clears the override, same as RenameCommit.
+    fn commit_rename(&mut self) {
+        let Some(id) = self.renaming.take() else { return };
+        let Some(idx) = self.idx_of(id) else { return };
+        let name = self.rename_buf.trim();
+        self.sessions[idx].custom_name = (!name.is_empty()).then(|| name.to_string());
+        self.persist();
+    }
+
     /// Switch the active session, dropping per-session UI state (popup, input, history nav).
     fn set_active(&mut self, id: Option<u64>) {
+        self.commit_rename();
         self.active = id;
-        self.renaming = None;
         self.dir_open = false;
         self.cmd_input.clear();
         self.hist_query.clear();
@@ -852,6 +912,13 @@ impl App {
                 Act::Resume(id, with_claude) => {
                     self.resume(id, with_claude, ctx);
                     self.persist();
+                },
+                Act::ResumeInPlace(id) => {
+                    if let Some(idx) = self.idx_of(id) {
+                        if let Some(cmd) = self.sessions[idx].resume_command(&self.settings) {
+                            self.send_command_to(idx, &cmd, ctx);
+                        }
+                    }
                 },
                 Act::Close(id) => {
                     if let Some(idx) = self.idx_of(id) {
@@ -1145,6 +1212,7 @@ impl App {
             let active = self.active;
             let idle_limit = self.settings.idle_suspend_min as u64 * 60;
             let mut suspend_any = false;
+            let mut kill_pids: Vec<i32> = Vec::new();
 
             for s in &mut self.sessions {
                 let (master_fd, shell_pid) = match &s.phase {
@@ -1223,9 +1291,20 @@ impl App {
                     && (!busy_now || is_claude)
                     && s.last_activity.elapsed().as_secs() >= idle_limit
                 {
+                    // Disarm the per-session kill and collect the pid: this sweep
+                    // can suspend several sessions at once, and LiveTerm::drop
+                    // would run a `ps` for each of them right here on the UI
+                    // thread. One batched snapshot below does the same work once.
+                    if let Phase::Live(l) = &mut s.phase {
+                        l.kill_on_drop = false;
+                    }
+                    kill_pids.push(shell_pid);
                     s.suspend();
                     suspend_any = true;
                 }
+            }
+            if !kill_pids.is_empty() {
+                plat::kill_trees(&kill_pids);
             }
             if suspend_any {
                 self.persist();
@@ -1419,13 +1498,20 @@ impl App {
     fn sidebar(&mut self, ui: &mut egui::Ui) -> Vec<Act> {
         let mut acts = Vec::new();
         // A rename editor can outlive its target: the last group member gets
-        // dragged out, the group is dissolved, or Cmd+W closes the renamed
-        // session. The editor then stops being drawn, so nothing commits or
-        // cancels it, and a stuck renaming* flag freezes terminal input
-        // (accept/interactive gate on it). Drop the orphan so input never
-        // dead-ends.
-        if self.renaming.is_some_and(|id| self.idx_of(id).is_none()) {
-            self.renaming = None;
+        // dragged out, the group is dissolved, Cmd+W closes the renamed session,
+        // or its group is collapsed and the row stops being drawn. The editor
+        // then stops being drawn, so nothing commits or cancels it, and a stuck
+        // renaming* flag freezes terminal input (accept/interactive gate on it).
+        // Commit the orphan so input never dead-ends and the edit is not lost.
+        let orphan = self.renaming.is_some_and(|id| match self.idx_of(id) {
+            None => true,
+            Some(i) => self.sessions[i]
+                .group
+                .as_deref()
+                .is_some_and(|g| self.collapsed_groups.contains(g)),
+        });
+        if orphan {
+            self.commit_rename();
         }
         if self
             .renaming_group
@@ -2194,16 +2280,28 @@ impl App {
                                         RichText::new(short_id(cid)).size(10.5).monospace().color(palette::text_faint()),
                                     )
                                     .on_hover_text(format!("{}: {cid}", tr("Сохранённая сессия Claude", "Saved Claude session")));
-                                } else if ui
-                                    .button(
-                                        RichText::new(format!("{} {}", tr("Вернуться в сессию", "Return to session"), short_id(cid)))
-                                            .size(11.0)
-                                            .color(Color32::from_rgb(0xd8, 0xe4, 0xd0)),
-                                    )
-                                    .on_hover_text(format!("claude --resume {cid}"))
-                                    .clicked()
-                                {
-                                    acts.push(Act::Resume(s.id, true));
+                                } else {
+                                    // Type the resume into the shell that is already
+                                    // running instead of respawning the terminal: a
+                                    // respawn drops LiveTerm, which SIGKILLs the whole
+                                    // process tree, and this button sits one stray
+                                    // click away from a build the user is watching.
+                                    // Disabled outright while anything else holds the
+                                    // foreground, since the shell would not read it.
+                                    let btn = ui
+                                        .add_enabled(
+                                            !busy_now,
+                                            egui::Button::new(
+                                                RichText::new(format!("{} {}", tr("Вернуться в сессию", "Return to session"), short_id(cid)))
+                                                    .size(11.0)
+                                                    .color(Color32::from_rgb(0xd8, 0xe4, 0xd0)),
+                                            ),
+                                        )
+                                        .on_hover_text(format!("claude --resume {cid}"))
+                                        .on_disabled_hover_text(tr("Терминал занят", "Terminal busy"));
+                                    if btn.clicked() {
+                                        acts.push(Act::ResumeInPlace(s.id));
+                                    }
                                 }
                             }
                         },
@@ -2317,8 +2415,8 @@ impl App {
     /// Command editor pinned under the terminal + filtered history popup.
     /// Returns a command to execute.
     fn cmd_panel(&mut self, ui: &mut egui::Ui) -> Option<String> {
-        self.refresh_history();
         let ctx = ui.ctx().clone();
+        self.refresh_history(&ctx);
         let interactive = !self.settings_open
             && !self.dir_open
             && self.renaming.is_none()
@@ -2373,10 +2471,12 @@ impl App {
         let mut caret_end = false;
         if up {
             if hist_visible {
+                // A background history reload can shrink the filtered list under
+                // a stale hist_sel, so clamp before stepping up; indexing it raw
+                // panics. (The Down branch already guards with i + 1 < show_n.)
                 let sel = match self.hist_sel {
                     None => show_n - 1,
-                    Some(0) => 0,
-                    Some(i) => i - 1,
+                    Some(i) => i.min(show_n - 1).saturating_sub(1),
                 };
                 self.hist_sel = Some(sel);
                 self.cmd_input = display[sel].clone();
@@ -3120,11 +3220,13 @@ impl App {
                             "Ставит крошечный скрипт в ~/.kip/bin и подключает его statusline-хуком \
                              Claude Code - % будет ровно тот, что видит сам Claude.\n\
                              Уже настроенный statusline не ломается: он оборачивается и продолжает \
-                             работать. Снятие галочки возвращает всё как было.",
+                             работать. Снятие галочки отключает хук и возвращает прежний statusline; \
+                             сам скрипт остаётся в ~/.kip/bin.",
                             "Installs a tiny script in ~/.kip/bin and wires it as a Claude Code \
                              statusline hook - the % is exactly what Claude itself shows.\n\
                              An existing statusline is not broken: it gets wrapped and keeps \
-                             working. Unchecking restores everything.",
+                             working. Unchecking unwires the hook and restores the previous \
+                             statusline; the script itself stays in ~/.kip/bin.",
                         ));
                     if resp.changed() {
                         let res = if hook_on {
@@ -3241,6 +3343,7 @@ impl eframe::App for App {
         self.drain_ctx(&ctx);
         self.drain_ctx_index();
         self.drain_update();
+        self.drain_history();
         // Folders opened from Finder's Services menu ("New kip Window Here").
         #[cfg(target_os = "macos")]
         {
@@ -3497,7 +3600,9 @@ fn load_shell_history() -> Vec<String> {
         }
         .trim_end_matches('\\')
         .trim();
-        if cmd.is_empty() || !seen.insert(cmd.to_string()) {
+        // Borrowed key: the dedup allocated a String per line, including the
+        // duplicates it then threw away.
+        if cmd.is_empty() || !seen.insert(cmd) {
             continue;
         }
         out.push(cmd.to_string());
@@ -3538,8 +3643,11 @@ fn draw_star(p: &egui::Painter, c: Pos2, r: f32, color: Color32) {
     }
 }
 
-/// Keep the tail of a long path/string, char-boundary safe.
+/// Keep the tail of a long path/string, char-boundary safe. Budgets below the
+/// ellipsis itself are clamped: `max - 3` would wrap in release and hand
+/// `skip`/`take` a huge count, returning a string LONGER than the input.
 fn truncate_head(s: &str, max: usize) -> String {
+    let max = max.max(3);
     let n = s.chars().count();
     if n <= max {
         return s.to_string();
@@ -3638,8 +3746,9 @@ fn draw_newfile(p: &egui::Painter, c: Pos2, col: Color32) {
     p.line_segment([Pos2::new(c.x, c.y - 2.3), Pos2::new(c.x, c.y + 2.3)], Stroke::new(1.4, col));
 }
 
-/// Keep the head, char-boundary safe.
+/// Keep the head, char-boundary safe. See `truncate_head` for the clamp.
 fn truncate_end(s: &str, max: usize) -> String {
+    let max = max.max(3);
     let n = s.chars().count();
     if n <= max {
         return s.to_string();
@@ -3786,5 +3895,21 @@ mod explorer_tests {
             assert!(d < f, "folders should sort before files: {:?}", list.iter().map(|e| (&e.name, e.is_dir)).collect::<Vec<_>>());
         }
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn truncate_clamps_budget_below_ellipsis() {
+        use super::{truncate_end, truncate_head};
+        // max < 3 used to wrap `max - 3` in release and hand take()/skip() a
+        // huge count - truncate_end then returned a string LONGER than input.
+        for max in 0..=3 {
+            assert_eq!(truncate_end("abcdefgh", max), "...");
+            assert_eq!(truncate_head("abcdefgh", max), "...");
+        }
+        // Normal budgets unchanged, multibyte never split.
+        assert_eq!(truncate_end("abcdefgh", 5), "ab...");
+        assert_eq!(truncate_head("abcdefgh", 5), "...gh");
+        assert_eq!(truncate_end("abc", 8), "abc");
+        assert_eq!(truncate_end("привет", 5), "пр...");
     }
 }

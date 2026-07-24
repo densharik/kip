@@ -170,7 +170,14 @@ impl Session {
     /// captured id - several sessions in the same directory must never converge
     /// on whichever transcript happens to be newest.
     pub fn save_claude_session(&mut self) {
-        let fg_pid = self.live().and_then(|l| crate::plat::foreground_pgid(l.master_fd, l.shell_pid));
+        // Only a foreground process that is NOT the shell itself can be claude.
+        // Without this filter an idle terminal still scanned the whole sessions
+        // directory looking for a pid-exact hit that cannot exist - wasted work
+        // on the UI thread, which runs this for every session on suspend and on
+        // exit.
+        let fg_pid = self.live().and_then(|l| {
+            crate::plat::foreground_pgid(l.master_fd, l.shell_pid).filter(|pg| *pg != l.shell_pid)
+        });
         let hit = fg_pid
             .and_then(|_| find_claude_meta(&self.cwd, None, fg_pid, self.spawned_at))
             .filter(|m| m.score >= 3);

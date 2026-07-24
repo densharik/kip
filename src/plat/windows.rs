@@ -227,3 +227,11 @@ pub fn kill_tree(root: i32) {
         .stderr(std::process::Stdio::null())
         .spawn();
 }
+
+/// Batch form, mirroring `plat::unix`. taskkill is spawned without waiting, so
+/// there is nothing to share between roots here.
+pub fn kill_trees(roots: &[i32]) {
+    for &root in roots {
+        kill_tree(root);
+    }
+}
