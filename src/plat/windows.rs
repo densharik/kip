@@ -145,6 +145,25 @@ pub fn clipboard_paths() -> Option<String> {
 /// deferred to a later version; the sidebar unread markers still work.
 pub fn notify(_title: &str, _body: &str, _sound: bool) {}
 
+/// Open `path` in the OS default handler, or reveal (select) it in Explorer
+/// when `reveal` is set. Fire-and-forget; failures are silent.
+pub fn open_path(path: &std::path::Path, reveal: bool) {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new("explorer");
+    if reveal {
+        // explorer parses "/select,<path>" as a single argument.
+        cmd.arg(format!("/select,{}", path.display()));
+    } else {
+        cmd.arg(path);
+    }
+    let spawned = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    if let Ok(mut child) = spawned {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
 /// Private commit (bytes -> KB) of one process. `WorkingSetSize` counts every
 /// shared DLL once per process, so summing it over a tree multiplies shared
 /// code by the process count; `PrivateUsage` excludes shared pages and sums

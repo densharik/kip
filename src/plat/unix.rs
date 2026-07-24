@@ -328,3 +328,40 @@ pub fn notify(title: &str, body: &str, sound: bool) {
         });
     }
 }
+
+/// Open `path` in the OS default handler, or reveal (select) it in the file
+/// manager when `reveal` is set. Fire-and-forget; failures are silent.
+pub fn open_path(path: &std::path::Path, reveal: bool) {
+    #[cfg(target_os = "macos")]
+    let spawned = {
+        let mut cmd = Command::new("open");
+        if reveal {
+            cmd.arg("-R");
+        }
+        cmd.arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let spawned = {
+        // No portable "reveal" on Linux; open the enclosing directory instead.
+        let target = if reveal {
+            path.parent().unwrap_or(path).to_path_buf()
+        } else {
+            path.to_path_buf()
+        };
+        Command::new("xdg-open")
+            .arg(target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    if let Ok(mut child) = spawned {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}

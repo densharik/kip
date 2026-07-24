@@ -43,9 +43,12 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         GridInfo { cols, rows, cell_w, cell_h, had_input: false, interacted: false, grown: false };
 
     let fg_is_claude = session.fg_is_claude;
+    let session_id = session.id;
+    let session_cwd = session.cwd.clone();
     let crate::session::Phase::Live(live) = &mut session.phase else {
         return info;
     };
+    let shell_pid = live.shell_pid;
 
     if accept_input {
         response.request_focus();
@@ -99,6 +102,13 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     let mode = *term.mode();
     let mut out: Vec<u8> = Vec::new();
 
+    // A link popup swallows Escape (it closes the menu, see link_menu) instead of
+    // letting it reach claude and cancel whatever it is doing.
+    let menu_open = ui
+        .ctx()
+        .data(|d| d.get_temp::<(std::path::PathBuf, Pos2)>(egui::Id::new(("kip_link_menu", session_id))))
+        .is_some();
+
     // Keyboard input.
     if focused {
         let events = ui.input(|i| i.events.clone());
@@ -115,6 +125,9 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                     } else {
                         key
                     };
+                    if menu_open && key == Key::Escape {
+                        continue;
+                    }
                     // A slow launch frame batches a held key's OS auto-repeats into one
                     // frame; forwarding the whole burst walks the app's history in a
                     // single shot. Cap auto-repeats to one press per key per frame (the
@@ -202,6 +215,47 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         (Point::new(Line(row - display_offset as i32), Column(col)), side)
     };
 
+    // A filesystem path under the pointer becomes a clickable link (Warp-style):
+    // hover underlines it, a plain click opens an Open / Reveal menu. Skip while
+    // drag-selecting so a selection stroke over a path shows no stray underline.
+    let mut hovered_link: Option<(Rect, std::path::PathBuf)> = None;
+    if let Some(pos) = response.hover_pos().filter(|_| !response.dragged()) {
+        let rel = pos - origin;
+        let col = (rel.x / cell_w) as i32;
+        let row = (rel.y / cell_h) as i32;
+        if rel.x >= 0.0 && rel.y >= 0.0 && col < cols as i32 && row < rows as i32 {
+            let line = Line(row - display_offset as i32);
+            let grid = term.grid();
+            let chars: Vec<char> = (0..cols as usize).map(|c| grid[line][Column(c)].c).collect();
+            if let Some((span, token)) = link_span(&chars, col as usize) {
+                // Hit the filesystem only when the token changed since the last
+                // frame; a parked pointer (or a redraw storm) must not stat every
+                // frame, which would also freeze the UI over a hung network mount.
+                let probe_id = egui::Id::new(("kip_link_probe", session_id));
+                let cached =
+                    ui.ctx().data(|d| d.get_temp::<(String, Option<std::path::PathBuf>)>(probe_id));
+                let resolved = match &cached {
+                    Some((t, r)) if *t == token => r.clone(),
+                    _ => {
+                        let r = probe_path(&token, shell_pid, &session_cwd);
+                        ui.ctx().data_mut(|d| d.insert_temp(probe_id, (token.clone(), r.clone())));
+                        r
+                    },
+                };
+                if let Some(p) = resolved {
+                    let x0 = origin.x + span.start as f32 * cell_w;
+                    let x1 = origin.x + span.end as f32 * cell_w;
+                    let y = origin.y + row as f32 * cell_h;
+                    hovered_link = Some((
+                        Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1, y + cell_h)),
+                        p,
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut clicked_link: Option<(std::path::PathBuf, Pos2)> = None;
     if let Some(pos) = response.interact_pointer_pos() {
         info.interacted = true;
         let (point, side) = pos_to_point(pos);
@@ -222,8 +276,15 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                 sel.update(point, side);
             }
         } else if response.clicked() {
-            term.selection = None;
+            if let Some((_, path)) = &hovered_link {
+                clicked_link = Some((path.clone(), pos));
+            } else {
+                term.selection = None;
+            }
         }
+    }
+    if hovered_link.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
     // Copy-on-select: as soon as a selection gesture completes.
@@ -349,6 +410,15 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         }
     }
 
+    // Underline the path under the pointer so it reads as clickable.
+    if let Some((lrect, _)) = &hovered_link {
+        let uy = lrect.bottom() - 1.0;
+        painter.line_segment(
+            [Pos2::new(lrect.left(), uy), Pos2::new(lrect.right(), uy)],
+            Stroke::new(1.0, palette::group_accent()),
+        );
+    }
+
     // Cursor.
     if show_cursor {
         let vp_line = cursor.point.line.0 + display_offset as i32;
@@ -442,7 +512,140 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         live.notifier.notify(out);
     }
 
+    link_menu(ui, session_id, clicked_link);
+
     info
+}
+
+/// The Open / Reveal popup for a clicked path link. State lives in egui memory
+/// (keyed by session) so it survives across frames without borrowing `session`.
+fn link_menu(ui: &mut Ui, session_id: u64, clicked: Option<(std::path::PathBuf, Pos2)>) {
+    use crate::i18n::tr;
+    let menu_id = egui::Id::new(("kip_link_menu", session_id));
+    let opened_now = clicked.is_some();
+    if let Some((path, pos)) = clicked {
+        ui.ctx().data_mut(|d| d.insert_temp(menu_id, (path, pos)));
+    }
+    let Some((path, pos)) = ui.ctx().data(|d| d.get_temp::<(std::path::PathBuf, Pos2)>(menu_id))
+    else {
+        return;
+    };
+    let reveal_label = if cfg!(target_os = "macos") {
+        tr("Показать в Finder", "Reveal in Finder")
+    } else if cfg!(windows) {
+        tr("Показать в проводнике", "Show in Explorer")
+    } else {
+        tr("Показать в папке", "Show in folder")
+    };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut close = false;
+    let area = egui::Area::new(menu_id.with("popup"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .constrain(true)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(160.0);
+                ui.label(egui::RichText::new(name).weak().small());
+                if ui.button(tr("Открыть", "Open")).clicked() {
+                    crate::plat::open_path(&path, false);
+                    close = true;
+                }
+                if ui.button(reveal_label).clicked() {
+                    crate::plat::open_path(&path, true);
+                    close = true;
+                }
+            });
+        });
+    // Dismiss on a press outside the popup (but not the click that just opened
+    // it) or on Escape (the keyboard handler withholds that Escape from claude).
+    let outside = !opened_now
+        && ui.input(|i| i.pointer.any_pressed())
+        && ui
+            .ctx()
+            .input(|i| i.pointer.interact_pos())
+            .is_none_or(|p| !area.response.rect.contains(p));
+    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    if close || outside || escape {
+        ui.ctx().data_mut(|d| d.remove::<(std::path::PathBuf, Pos2)>(menu_id));
+    }
+}
+
+/// Characters allowed inside a path token. Stops at whitespace and the
+/// shell/markup delimiters that never sit mid-path in agent output.
+fn is_link_char(c: char) -> bool {
+    !c.is_whitespace()
+        && !matches!(
+            c,
+            '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '|' | '*' | '?'
+        )
+}
+
+/// The maximal path token covering column `col`, with a trailing `:line[:col]`
+/// reference and sentence punctuation stripped. Returns the path's column span
+/// and the token string, or `None` when `col` does not sit on a path.
+fn link_span(chars: &[char], col: usize) -> Option<(std::ops::Range<usize>, String)> {
+    if col >= chars.len() || !is_link_char(chars[col]) {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 && is_link_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = col + 1;
+    while end < chars.len() && is_link_char(chars[end]) {
+        end += 1;
+    }
+    // Drop trailing sentence punctuation ("edited foo.rs." -> "foo.rs").
+    while end > start && matches!(chars[end - 1], '.' | ',' | ';') {
+        end -= 1;
+    }
+    // Drop a trailing :line[:col] reference ("main.rs:42:10" -> "main.rs").
+    for _ in 0..2 {
+        let mut d = end;
+        while d > start && chars[d - 1].is_ascii_digit() {
+            d -= 1;
+        }
+        if d < end && d > start && chars[d - 1] == ':' {
+            end = d - 1;
+        } else {
+            break;
+        }
+    }
+    if col >= end {
+        // Pointer is over the stripped ref/punctuation, not the path itself.
+        return None;
+    }
+    Some((start..end, chars[start..end].iter().collect()))
+}
+
+/// Resolve `token` against the shell's cwd and confirm it exists on disk. The
+/// path-shape prefilter (slash, dot, or `~`) keeps plain prose words - the bulk
+/// of what the pointer rests on - off the filesystem entirely.
+fn probe_path(
+    token: &str,
+    shell_pid: i32,
+    fallback_cwd: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if !(token.contains('/') || token.contains('.') || token.starts_with('~')) {
+        return None;
+    }
+    let cwd = crate::plat::pid_cwd(shell_pid).unwrap_or_else(|| fallback_cwd.to_path_buf());
+    let p = resolve_link(token, &cwd)?;
+    p.exists().then_some(p)
+}
+
+/// Resolve a path token to an absolute path: `~` expands to home, relative
+/// tokens resolve against `cwd`. No filesystem access.
+fn resolve_link(token: &str, cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    if token == "~" {
+        return dirs::home_dir();
+    }
+    if let Some(rest) = token.strip_prefix("~/") {
+        return dirs::home_dir().map(|h| h.join(rest));
+    }
+    let p = std::path::Path::new(token);
+    Some(if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) })
 }
 
 /// Cell (1-based col, row) under the pointer, for mouse wheel reports.
@@ -638,4 +841,45 @@ fn encode_key(key: Key, mods: Modifiers, mode: TermMode, claude: bool) -> Option
         _ => return None,
     };
     Some(seq)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::link_span;
+
+    fn span(s: &str, col: usize) -> Option<(std::ops::Range<usize>, String)> {
+        link_span(&s.chars().collect::<Vec<_>>(), col)
+    }
+
+    #[test]
+    fn relative_path() {
+        assert_eq!(span("edit src/main.rs now", 8), Some((5..16, "src/main.rs".into())));
+    }
+
+    #[test]
+    fn strips_line_ref() {
+        assert_eq!(span("at src/main.rs:42:10 x", 5), Some((3..14, "src/main.rs".into())));
+    }
+
+    #[test]
+    fn strips_trailing_period() {
+        assert_eq!(span("see foo.rs.", 5), Some((4..10, "foo.rs".into())));
+    }
+
+    #[test]
+    fn stops_at_backtick() {
+        // `src/main.rs` -> the backticks bound the token.
+        assert_eq!(span("`src/main.rs`", 3), Some((1..12, "src/main.rs".into())));
+    }
+
+    #[test]
+    fn none_on_whitespace() {
+        assert_eq!(span("a b", 1), None);
+    }
+
+    #[test]
+    fn none_over_line_number() {
+        // Hovering the "42" (past the stripped path) yields no link.
+        assert_eq!(span("main.rs:42", 8), None);
+    }
 }
