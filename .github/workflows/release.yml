@@ -94,8 +94,13 @@ jobs:
                 <dict><key>default</key><string>New kip Window Here</string></dict>
                 <key>NSMessage</key><string>openInKip</string>
                 <key>NSPortName</key><string>kip</string>
-                <key>NSSendFileTypes</key>
-                <array><string>public.folder</string></array>
+                <key>NSRequiredContext</key>
+                <dict><key>NSTextContent</key><string>FilePath</string></dict>
+                <key>NSSendTypes</key>
+                <array>
+                  <string>NSFilenamesPboardType</string>
+                  <string>public.plain-text</string>
+                </array>
               </dict>
             </array>
           </dict>

@@ -1,16 +1,19 @@
 //! macOS Finder Services integration: "New kip Window Here". An `NSServices`
-//! entry in Info.plist adds the item to Finder's Services submenu for folders;
-//! macOS routes the pick to the provider registered here, which queues the
-//! chosen folder(s) for the egui loop to open as new sessions - the same way
-//! Warp/iTerm expose "New Window Here".
+//! entry in Info.plist adds the item to Finder's Services submenu for files and
+//! folders; macOS routes the pick to the provider registered here, which queues
+//! the chosen folder (a file's containing folder) for the egui loop to open as
+//! a new session - the same way Warp/iTerm expose "New Window Here".
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{define_class, msg_send, AnyThread, MainThreadMarker};
-use objc2_app_kit::{NSApplication, NSPasteboard, NSPasteboardType, NSUpdateDynamicServices};
+use objc2_app_kit::{
+    NSApplication, NSPasteboard, NSPasteboardType, NSPasteboardTypeString, NSUpdateDynamicServices,
+};
 use objc2_foundation::NSString;
 
 /// Folders picked via the Service, waiting for the UI loop to open them.
@@ -45,22 +48,42 @@ impl Provider {
     }
 }
 
-/// Read the selected folder paths off the service pasteboard and queue them.
+/// Read the selected paths off the service pasteboard and queue a directory for
+/// each: a folder as-is, otherwise a file's containing folder (the "...Here"
+/// behaviour of Warp/iTerm). Duplicate folders collapse to one session.
 fn handle(pboard: &NSPasteboard) {
+    let mut raw: Vec<String> = Vec::new();
     #[allow(deprecated)]
-    let ty: &NSPasteboardType = unsafe { objc2_app_kit::NSFilenamesPboardType };
-    let Some(list) = pboard.propertyListForType(ty) else {
-        return;
-    };
-    // `list` is an NSArray<NSString> of file paths; read it via raw message
+    let files_ty: &NSPasteboardType = unsafe { objc2_app_kit::NSFilenamesPboardType };
+    // Finder selections arrive as a filenames array; read it via raw message
     // sends to avoid pinning the generic element type.
-    let count: usize = unsafe { msg_send![&*list, count] };
-    let mut dirs = Vec::new();
-    for i in 0..count {
-        let s: Retained<NSString> = unsafe { msg_send![&*list, objectAtIndex: i] };
-        let p = PathBuf::from(s.to_string());
-        if p.is_dir() {
-            dirs.push(p);
+    if let Some(list) = pboard.propertyListForType(files_ty) {
+        let count: usize = unsafe { msg_send![&*list, count] };
+        for i in 0..count {
+            let s: Retained<NSString> = unsafe { msg_send![&*list, objectAtIndex: i] };
+            raw.push(s.to_string());
+        }
+    }
+    // Fallback: a plain-text selection that is itself a path.
+    if raw.is_empty() {
+        if let Some(s) = pboard.stringForType(unsafe { NSPasteboardTypeString }) {
+            raw.push(s.to_string());
+        }
+    }
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut seen = HashSet::new();
+    for r in raw {
+        let p = PathBuf::from(r.trim());
+        let dir = if p.is_dir() {
+            Some(p)
+        } else {
+            p.parent().filter(|d| d.is_dir()).map(Path::to_path_buf)
+        };
+        if let Some(d) = dir {
+            if seen.insert(d.clone()) {
+                dirs.push(d);
+            }
         }
     }
     if dirs.is_empty() {
