@@ -96,6 +96,9 @@ enum Act {
     Suspend(u64),
     /// bool = resume the saved Claude session (vs plain shell).
     Resume(u64, bool),
+    /// Open a fresh plain terminal in this session's directory, leaving the
+    /// session (and its snapshot history) untouched.
+    OpenTerminal(u64),
     /// Cmd+W: suspend a live session, remove a frozen one.
     Close(u64),
     /// X button / "Удалить": always removes, killing a live session.
@@ -549,6 +552,15 @@ impl App {
                 Act::Resume(id, with_claude) => {
                     self.resume(id, with_claude, ctx);
                     self.persist();
+                },
+                Act::OpenTerminal(id) => {
+                    // Keep the session suspended so its Claude history is not lost;
+                    // just open a new plain terminal in the same directory.
+                    if let Some(idx) = self.idx_of(id) {
+                        let cwd = self.sessions[idx].cwd.clone();
+                        self.spawn(cwd, None, ctx);
+                        self.persist();
+                    }
                 },
                 Act::Close(id) => {
                     if let Some(idx) = self.idx_of(id) {
@@ -1207,7 +1219,7 @@ impl App {
                         ui.close();
                     }
                     if ui.button(tr("Открыть терминал", "Open terminal")).clicked() {
-                        acts.push(Act::Resume(s.id, false));
+                        acts.push(Act::OpenTerminal(s.id));
                         ui.close();
                     }
                     if ui.button(tr("Удалить", "Delete")).clicked() {
@@ -2024,7 +2036,7 @@ impl App {
                                     }
                                 }
                                 if ui.button(RichText::new(tr("Открыть терминал", "Open terminal")).size(12.5)).clicked() {
-                                    acts.push(Act::Resume(s.id, false));
+                                    acts.push(Act::OpenTerminal(s.id));
                                 }
                                 if ui.button(RichText::new(tr("Удалить", "Delete")).size(12.5).color(TXT_DIM)).clicked() {
                                     acts.push(Act::Remove(s.id));
