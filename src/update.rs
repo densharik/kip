@@ -9,6 +9,8 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc::Sender;
 
+use crate::i18n::tr;
+
 const LATEST_API: &str = "https://api.github.com/repos/densharik/kip/releases/latest";
 const RELEASES_URL: &str = "https://github.com/densharik/kip/releases/latest";
 
@@ -55,7 +57,7 @@ pub enum UpdateMsg {
 
 fn do_check() -> Result<Option<Release>, String> {
     if ASSET_NAME.is_empty() {
-        return Err("автообновление доступно только на macOS и Windows".into());
+        return Err(tr("автообновление доступно только на macOS и Windows", "auto-update is only on macOS and Windows").into());
     }
     let out = Command::new("curl")
         .args([
@@ -69,13 +71,13 @@ fn do_check() -> Result<Option<Release>, String> {
             LATEST_API,
         ])
         .output()
-        .map_err(|e| format!("curl не запустился: {e}"))?;
+        .map_err(|e| format!("{}: {e}", tr("curl не запустился", "curl failed to start")))?;
     if !out.status.success() {
-        return Err("не удалось связаться с GitHub".into());
+        return Err(tr("не удалось связаться с GitHub", "could not reach GitHub").into());
     }
     let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|_| "неожиданный ответ GitHub".to_string())?;
-    let tag = v["tag_name"].as_str().ok_or("нет tag_name в ответе")?;
+        serde_json::from_slice(&out.stdout).map_err(|_| tr("неожиданный ответ GitHub", "unexpected GitHub response").to_string())?;
+    let tag = v["tag_name"].as_str().ok_or(tr("нет tag_name в ответе", "no tag_name in response"))?;
     // Not newer than what is running -> nothing to do.
     if parse_ver(tag) <= parse_ver(current_version()) {
         return Ok(None);
@@ -88,7 +90,7 @@ fn do_check() -> Result<Option<Release>, String> {
             .and_then(|x| x["browser_download_url"].as_str())
             .map(str::to_string)
     };
-    let asset_url = find(ASSET_NAME).ok_or_else(|| format!("в релизе {tag} нет {ASSET_NAME}"))?;
+    let asset_url = find(ASSET_NAME).ok_or_else(|| format!("{} {tag} {} {ASSET_NAME}", tr("в релизе", "release"), tr("нет", "has no")))?;
     let pkg_url = if cfg!(target_os = "macos") { find("kip-installer.pkg") } else { None };
     let display = tag.trim_start_matches('v').to_string();
     Ok(Some(Release { display, asset_url, pkg_url }))
@@ -111,29 +113,29 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
         .output()
         .map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
-        return Err("скачивание не удалось".into());
+        return Err(tr("скачивание не удалось", "download failed").into());
     }
     let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
     if size < 100_000 {
-        return Err("скачанный файл повреждён".into());
+        return Err(tr("скачанный файл повреждён", "downloaded file is corrupt").into());
     }
     Ok(())
 }
 
 #[cfg(windows)]
 fn do_apply(rel: &Release) -> Result<(), String> {
-    let cur = std::env::current_exe().map_err(|e| format!("нет пути к exe: {e}"))?;
-    let dir = cur.parent().ok_or("нет каталога exe")?;
+    let cur = std::env::current_exe().map_err(|e| format!("{}: {e}", tr("нет пути к exe", "no path to exe")))?;
+    let dir = cur.parent().ok_or(tr("нет каталога exe", "no exe directory"))?;
     let new = dir.join("kip.update.exe");
     download(&rel.asset_url, &new)?;
     let old = dir.join("kip.old.exe");
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(&cur, &old).map_err(|e| format!("нет прав на замену: {e}"))?;
+    std::fs::rename(&cur, &old).map_err(|e| format!("{}: {e}", tr("нет прав на замену", "no permission to replace")))?;
     if let Err(e) = std::fs::rename(&new, &cur) {
         let _ = std::fs::rename(&old, &cur);
-        return Err(format!("замена не удалась: {e}"));
+        return Err(format!("{}: {e}", tr("замена не удалась", "replace failed")));
     }
-    Command::new(&cur).spawn().map_err(|e| format!("не удалось перезапустить: {e}"))?;
+    Command::new(&cur).spawn().map_err(|e| format!("{}: {e}", tr("не удалось перезапустить", "failed to relaunch")))?;
     std::process::exit(0);
 }
 
@@ -144,9 +146,9 @@ fn bundle_of(cur: &Path) -> Result<std::path::PathBuf, String> {
         .parent()
         .and_then(|p| p.parent())
         .and_then(|p| p.parent())
-        .ok_or("не найден .app бандл")?;
+        .ok_or(tr("не найден .app бандл", ".app bundle not found"))?;
     if b.extension().and_then(|e| e.to_str()) != Some("app") {
-        return Err("запущен не из .app - обнови вручную".into());
+        return Err(tr("запущен не из .app - обнови вручную", "not running from .app - update manually").into());
     }
     Ok(b.to_path_buf())
 }
@@ -156,7 +158,7 @@ fn bundle_of(cur: &Path) -> Result<std::path::PathBuf, String> {
 /// hard failure (download/unpack).
 #[cfg(target_os = "macos")]
 fn swap_install(bundle: &Path, rel: &Release) -> Result<bool, String> {
-    let parent = bundle.parent().ok_or("нет каталога бандла")?;
+    let parent = bundle.parent().ok_or(tr("нет каталога бандла", "no bundle directory"))?;
     let probe = parent.join(".kip-write-test");
     if std::fs::write(&probe, b"x").is_err() {
         return Ok(false);
@@ -176,11 +178,11 @@ fn swap_install(bundle: &Path, rel: &Release) -> Result<bool, String> {
         .map(|s| s.success())
         .unwrap_or(false);
     if !ok {
-        return Err("не удалось распаковать архив".into());
+        return Err(tr("не удалось распаковать архив", "could not unpack archive").into());
     }
     let newapp = tmp.join("kip.app");
     if !newapp.exists() {
-        return Err("в архиве нет kip.app".into());
+        return Err(tr("в архиве нет kip.app", "archive has no kip.app").into());
     }
     let _ = Command::new("xattr").args(["-cr"]).arg(&newapp).status();
 
@@ -205,12 +207,12 @@ fn swap_install(bundle: &Path, rel: &Release) -> Result<bool, String> {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
             return Ok(false);
         }
-        return Err(format!("не сдвинуть старую версию: {e}"));
+        return Err(format!("{}: {e}", tr("не сдвинуть старую версию", "could not move the old version")));
     }
     if let Err(e) = std::fs::rename(&staged, bundle) {
         let _ = std::fs::rename(&backup, bundle);
         let _ = std::fs::remove_dir_all(&tmp);
-        return Err(format!("замена бандла: {e}"));
+        return Err(format!("{}: {e}", tr("замена бандла", "bundle swap")));
     }
     let _ = std::fs::remove_dir_all(&backup);
     let _ = std::fs::remove_dir_all(&tmp);
@@ -222,7 +224,7 @@ fn swap_install(bundle: &Path, rel: &Release) -> Result<bool, String> {
 /// use the passwordless swap path.
 #[cfg(target_os = "macos")]
 fn pkg_install(rel: &Release) -> Result<(), String> {
-    let pkg_url = rel.pkg_url.as_deref().ok_or("в релизе нет .pkg")?;
+    let pkg_url = rel.pkg_url.as_deref().ok_or(tr("в релизе нет .pkg", "release has no .pkg"))?;
     let tmp = std::env::temp_dir().join(format!("kip-pkg-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| format!("temp: {e}"))?;
@@ -242,9 +244,9 @@ fn pkg_install(rel: &Release) -> Result<(), String> {
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         if err.contains("-128") {
-            return Err("обновление отменено".into());
+            return Err(tr("обновление отменено", "update cancelled").into());
         }
-        return Err(format!("установка не удалась: {}", err.trim()));
+        return Err(format!("{}: {}", tr("установка не удалась", "install failed"), err.trim()));
     }
     Ok(())
 }
@@ -259,13 +261,13 @@ fn relaunch(bundle: &Path) -> Result<(), String> {
         .arg("-c")
         .arg(format!("sleep 1; open -n {quoted}"))
         .spawn()
-        .map_err(|e| format!("перезапуск: {e}"))?;
+        .map_err(|e| format!("{}: {e}", tr("перезапуск", "relaunch")))?;
     std::process::exit(0);
 }
 
 #[cfg(target_os = "macos")]
 fn do_apply(rel: &Release) -> Result<(), String> {
-    let cur = std::env::current_exe().map_err(|e| format!("нет пути к бинарнику: {e}"))?;
+    let cur = std::env::current_exe().map_err(|e| format!("{}: {e}", tr("нет пути к бинарнику", "no path to binary")))?;
     let bundle = bundle_of(&cur)?;
     if !swap_install(&bundle, rel)? {
         pkg_install(rel)?;
@@ -275,7 +277,7 @@ fn do_apply(rel: &Release) -> Result<(), String> {
 
 #[cfg(all(not(windows), not(target_os = "macos")))]
 fn do_apply(_rel: &Release) -> Result<(), String> {
-    Err("автообновление доступно только на macOS и Windows".into())
+    Err(tr("автообновление доступно только на macOS и Windows", "auto-update is only on macOS and Windows").into())
 }
 
 pub fn apply(rel: Release, tx: Sender<UpdateMsg>, egui: egui::Context) {

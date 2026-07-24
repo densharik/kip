@@ -26,6 +26,8 @@ pub struct Settings {
     pub theme: String,
     /// Optional selection-highlight override; None uses the preset's color.
     pub accent: Option<[u8; 3]>,
+    /// UI language: "auto" | "ru" | "en".
+    pub lang: String,
 }
 
 impl Default for Settings {
@@ -45,6 +47,7 @@ impl Default for Settings {
             prev_statusline: None,
             theme: "tomorrow".into(),
             accent: None,
+            lang: "auto".into(),
         }
     }
 }

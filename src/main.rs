@@ -4,6 +4,7 @@
 
 mod config;
 mod ctx_index;
+mod i18n;
 mod plat;
 mod palette;
 mod session;
@@ -25,6 +26,7 @@ use egui::{
 };
 
 use config::{load_state, save_state, AppState, SavedSession, Settings};
+use i18n::tr;
 use session::{poll_git, spawn_live, EventProxy, GitStats, Phase, Session};
 
 const TICK: Duration = Duration::from_secs(2);
@@ -170,6 +172,7 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
         let state = load_state();
+        i18n::set(i18n::resolve(&state.settings.lang));
         palette::apply(&state.settings.theme, state.settings.accent.map(rgb32));
         apply_style(&cc.egui_ctx);
         cc.egui_ctx.set_zoom_factor(state.settings.ui_scale.clamp(0.5, 2.0));
@@ -492,7 +495,8 @@ impl App {
             },
             Err(e) => {
                 s.phase = Phase::Exited(None);
-                s.snapshot = Some(format!("Не удалось запустить терминал: {e}"));
+                s.snapshot =
+                    Some(format!("{}: {e}", tr("Не удалось запустить терминал", "Failed to start terminal")));
             },
         }
     }
@@ -613,7 +617,7 @@ impl App {
                         s.unread = true;
                         if self.settings.notify_bell {
                             let name = s.display_name();
-                            plat::notify("kip", &format!("{name}: сигнал терминала"), self.settings.notify_sound);
+                            plat::notify("kip", &format!("{name}: {}", tr("сигнал терминала", "terminal bell")), self.settings.notify_sound);
                         }
                     }
                 },
@@ -808,7 +812,7 @@ impl App {
                         if self.settings.notify_job_done {
                             plat::notify(
                                 "kip",
-                                &format!("{}: агент завершил работу ({})", s.display_name(), fmt_dur(dur)),
+                                &format!("{}: {} ({})", s.display_name(), tr("агент завершил работу", "agent finished"), fmt_dur(dur)),
                                 self.settings.notify_sound,
                             );
                         }
@@ -1028,8 +1032,8 @@ impl App {
         ui.horizontal(|ui| {
             ui.add_space(10.0);
             if ui
-                .button(RichText::new("+ Терминал").size(12.5))
-                .on_hover_text("Новый терминал в директории активной сессии (Cmd+T)")
+                .button(RichText::new(tr("+ Терминал", "+ Terminal")).size(12.5))
+                .on_hover_text(tr("Новый терминал в директории активной сессии (Cmd+T)", "New terminal in the active session's directory (Cmd+T)"))
                 .clicked()
             {
                 acts.push(Act::NewSame);
@@ -1170,7 +1174,7 @@ impl App {
             let st = Stroke::new(1.5, fg);
             ui.painter().line_segment([mark + Vec2::new(-d, -d), mark + Vec2::new(d, d)], st);
             ui.painter().line_segment([mark + Vec2::new(-d, d), mark + Vec2::new(d, -d)], st);
-            close_resp.on_hover_text("Закрыть сессию");
+            close_resp.on_hover_text(tr("Закрыть сессию", "Close session"));
         } else if s.unread {
             ui.painter().circle_filled(mark, 3.0, UNREAD);
         } else if s.keep_awake {
@@ -1183,30 +1187,30 @@ impl App {
         resp.context_menu(|ui| {
             match &s.phase {
                 Phase::Live(_) => {
-                    if ui.button("Усыпить").clicked() {
+                    if ui.button(tr("Усыпить", "Suspend")).clicked() {
                         acts.push(Act::Suspend(s.id));
                         ui.close();
                     }
-                    let label = if s.keep_awake { "Разрешить усыпление" } else { "Не усыплять" };
+                    let label = if s.keep_awake { tr("Разрешить усыпление", "Allow suspend") } else { tr("Не усыплять", "Keep awake") };
                     if ui.button(label).clicked() {
                         acts.push(Act::ToggleAwake(s.id));
                         ui.close();
                     }
-                    if ui.button("Закрыть").clicked() {
+                    if ui.button(tr("Закрыть", "Close")).clicked() {
                         acts.push(Act::Remove(s.id));
                         ui.close();
                     }
                 },
                 _ => {
-                    if s.claude_session_id.is_some() && ui.button("Продолжить Claude").clicked() {
+                    if s.claude_session_id.is_some() && ui.button(tr("Продолжить Claude", "Resume Claude")).clicked() {
                         acts.push(Act::Resume(s.id, true));
                         ui.close();
                     }
-                    if ui.button("Открыть терминал").clicked() {
+                    if ui.button(tr("Открыть терминал", "Open terminal")).clicked() {
                         acts.push(Act::Resume(s.id, false));
                         ui.close();
                     }
-                    if ui.button("Удалить").clicked() {
+                    if ui.button(tr("Удалить", "Delete")).clicked() {
                         acts.push(Act::Remove(s.id));
                         ui.close();
                     }
@@ -1220,7 +1224,7 @@ impl App {
         let Some(idx) = self.active_idx() else {
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
-                ui.label(RichText::new("Нет активной сессии").size(11.5).color(TXT_FAINT));
+                ui.label(RichText::new(tr("Нет активной сессии", "No active session")).size(11.5).color(TXT_FAINT));
             });
             return acts;
         };
@@ -1248,8 +1252,8 @@ impl App {
                             RichText::new(truncate_head(&path_full, 44)).monospace().size(11.5).color(TXT),
                         ),
                     )
-                    .on_hover_text(format!("{path_full}\nСменить папку"))
-                    .on_disabled_hover_text("Терминал занят");
+                    .on_hover_text(format!("{path_full}\n{}", tr("Сменить папку", "Change folder")))
+                    .on_disabled_hover_text(tr("Терминал занят", "Terminal busy"));
                 if chip.clicked() {
                     chip_clicked = true;
                 }
@@ -1269,12 +1273,12 @@ impl App {
                             );
                         } else {
                             ui.add_space(2.0);
-                            ui.label(RichText::new("чисто").size(11.0).color(TXT_FAINT));
+                            ui.label(RichText::new(tr("чисто", "clean")).size(11.0).color(TXT_FAINT));
                         }
                     },
                     Some(_) => {
                         ui.add_space(6.0);
-                        ui.label(RichText::new("не git").size(11.0).color(TXT_FAINT));
+                        ui.label(RichText::new(tr("не git", "not git")).size(11.0).color(TXT_FAINT));
                     },
                     None => {},
                 }
@@ -1283,12 +1287,12 @@ impl App {
                     ui.add_space(10.0);
                     let upd = matches!(self.update_state, UpdateState::Available(_));
                     let label = if upd {
-                        RichText::new("Настройки").size(11.5).color(GIT_ADD).strong()
+                        RichText::new(tr("Настройки", "Settings")).size(11.5).color(GIT_ADD).strong()
                     } else {
-                        RichText::new("Настройки").size(11.5)
+                        RichText::new(tr("Настройки", "Settings")).size(11.5)
                     };
                     let btn = ui.button(label);
-                    let btn = if upd { btn.on_hover_text("Доступно обновление") } else { btn };
+                    let btn = if upd { btn.on_hover_text(tr("Доступно обновление", "Update available")) } else { btn };
                     if btn.clicked() {
                         acts.push(Act::Settings);
                     }
@@ -1302,7 +1306,7 @@ impl App {
                                 ui.label(
                                     RichText::new(short_id(cid)).size(10.5).monospace().color(TXT_FAINT),
                                 )
-                                .on_hover_text(format!("Сохранённая сессия Claude: {cid}"));
+                                .on_hover_text(format!("{}: {cid}", tr("Сохранённая сессия Claude", "Saved Claude session")));
                             }
                         },
                         Phase::Suspended | Phase::Exited(_) => {
@@ -1310,12 +1314,12 @@ impl App {
                             // terminal area; the status bar just shows state.
                             if let Phase::Exited(code) = &s.phase {
                                 let txt = match code {
-                                    Some(c) => format!("завершено, код {c}"),
-                                    None => "завершено".into(),
+                                    Some(c) => format!("{} {c}", tr("завершено, код", "exited, code")),
+                                    None => tr("завершено", "done").into(),
                                 };
                                 ui.label(RichText::new(txt).size(11.0).color(TXT_FAINT));
                             } else {
-                                ui.label(RichText::new("усыплена").size(11.0).color(TXT_FAINT));
+                                ui.label(RichText::new(tr("усыплена", "suspended")).size(11.0).color(TXT_FAINT));
                             }
                         },
                     }
@@ -1534,7 +1538,7 @@ impl App {
                             .font(font.clone())
                             .desired_rows(1)
                             .return_key(egui::KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter))
-                            .hint_text(RichText::new("команда...").font(font).color(TXT_FAINT))
+                            .hint_text(RichText::new(tr("команда...", "command...")).font(font).color(TXT_FAINT))
                             .desired_width(ui.available_width() - 8.0),
                     );
                     if interactive {
@@ -1585,7 +1589,7 @@ impl App {
                         .inner_margin(Margin::symmetric(10, 8))
                         .show(ui, |ui| {
                             ui.set_width(field_rect.width().min(760.0));
-                            ui.label(RichText::new("История").size(9.5).color(TXT_FAINT));
+                            ui.label(RichText::new(tr("История", "History")).size(9.5).color(TXT_FAINT));
                             ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                                 for (i, cmd) in display.iter().enumerate() {
                                     let selected = self.hist_sel == Some(i);
@@ -1602,7 +1606,7 @@ impl App {
                                 }
                             });
                             ui.label(
-                                RichText::new("стрелки - выбор   esc - закрыть   enter - выполнить")
+                                RichText::new(tr("стрелки - выбор   esc - закрыть   enter - выполнить", "arrows - select   esc - close   enter - run"))
                                     .size(9.0)
                                     .color(TXT_FAINT),
                             );
@@ -1699,10 +1703,10 @@ impl App {
                     .show(ui, |ui| {
                         let w = 240.0;
                         ui.set_min_width(w);
-                        ui.label(RichText::new("Ресурсы").size(10.0).strong().color(TXT_DIM));
+                        ui.label(RichText::new(tr("Ресурсы", "Resources")).size(10.0).strong().color(TXT_DIM));
                         ui.add_space(6.0);
                         let Some(st) = &self.stats else {
-                            ui.label(RichText::new("измеряю...").size(11.0).color(TXT_FAINT));
+                            ui.label(RichText::new(tr("измеряю...", "measuring...")).size(11.0).color(TXT_FAINT));
                             return;
                         };
                         let max_rss = st.procs.iter().map(|p| p.2).max().unwrap_or(1).max(1);
@@ -1776,7 +1780,7 @@ impl App {
                         p.text(
                             rect.left_top(),
                             Align2::LEFT_TOP,
-                            "всего",
+                            tr("всего", "total"),
                             FontId::proportional(10.5),
                             TXT_FAINT,
                         );
@@ -1854,7 +1858,7 @@ impl App {
                             egui::TextEdit::singleline(&mut self.dir_query)
                                 .frame(Frame::new())
                                 .font(FontId::proportional(12.5))
-                                .hint_text("Поиск папок...")
+                                .hint_text(tr("Поиск папок...", "Search folders..."))
                                 .desired_width(f32::INFINITY),
                         );
                         resp.request_focus();
@@ -1862,7 +1866,7 @@ impl App {
                         ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                             if self.dir_path.parent().is_some()
                                 && ui
-                                    .selectable_label(false, RichText::new("..  (наверх)").size(12.0).color(TXT_DIM))
+                                    .selectable_label(false, RichText::new(tr("..  (наверх)", "..  (up)")).size(12.0).color(TXT_DIM))
                                     .clicked()
                             {
                                 nav = Some(None);
@@ -1876,7 +1880,7 @@ impl App {
                                 }
                             }
                             if dirs.is_empty() {
-                                ui.label(RichText::new("нет подпапок").size(11.0).color(TXT_FAINT));
+                                ui.label(RichText::new(tr("нет подпапок", "no subfolders")).size(11.0).color(TXT_FAINT));
                             }
                         });
                         ui.label(
@@ -1963,9 +1967,12 @@ impl App {
         }
 
         let (title, hint) = match &s.phase {
-            Phase::Exited(Some(code)) => ("Процесс завершён".to_string(), format!("код выхода {code}")),
-            Phase::Exited(None) => ("Процесс завершён".to_string(), String::new()),
-            _ => ("Сессия усыплена".to_string(), "процессы остановлены, память освобождена".to_string()),
+            Phase::Exited(Some(code)) => (
+                tr("Процесс завершён", "Process exited").to_string(),
+                format!("{} {code}", tr("код выхода", "exit code")),
+            ),
+            Phase::Exited(None) => (tr("Процесс завершён", "Process exited").to_string(), String::new()),
+            _ => (tr("Сессия усыплена", "Session suspended").to_string(), tr("процессы остановлены, память освобождена", "processes stopped, memory freed").to_string()),
         };
 
         // Lower-middle of the terminal area, floating clear of the bottom.
@@ -2009,17 +2016,17 @@ impl App {
                             ui.horizontal(|ui| {
                                 if s.claude_session_id.is_some() {
                                     let btn = egui::Button::new(
-                                        RichText::new("Продолжить Claude").size(12.5).color(Color32::from_rgb(0xd8, 0xe4, 0xd0)),
+                                        RichText::new(tr("Продолжить Claude", "Resume Claude")).size(12.5).color(Color32::from_rgb(0xd8, 0xe4, 0xd0)),
                                     )
                                     .fill(Color32::from_rgb(0x2e, 0x3a, 0x2a));
                                     if ui.add(btn).clicked() {
                                         acts.push(Act::Resume(s.id, true));
                                     }
                                 }
-                                if ui.button(RichText::new("Открыть терминал").size(12.5)).clicked() {
+                                if ui.button(RichText::new(tr("Открыть терминал", "Open terminal")).size(12.5)).clicked() {
                                     acts.push(Act::Resume(s.id, false));
                                 }
-                                if ui.button(RichText::new("Удалить").size(12.5).color(TXT_DIM)).clicked() {
+                                if ui.button(RichText::new(tr("Удалить", "Delete")).size(12.5).color(TXT_DIM)).clicked() {
                                     acts.push(Act::Remove(s.id));
                                 }
                             });
@@ -2037,14 +2044,14 @@ impl App {
         ui.vertical_centered(|ui| {
             ui.add_space(rect.height() * 0.35);
             ui.label(RichText::new("kip").size(22.0).color(TXT_DIM));
-            ui.label(RichText::new("Нет открытых сессий").size(12.5).color(TXT_FAINT));
+            ui.label(RichText::new(tr("Нет открытых сессий", "No open sessions")).size(12.5).color(TXT_FAINT));
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 ui.add_space(rect.width() / 2.0 - 130.0);
-                if ui.button("Новый терминал").clicked() {
+                if ui.button(tr("Новый терминал", "New terminal")).clicked() {
                     acts.push(Act::NewSame);
                 }
-                if ui.button("Выбрать папку...").clicked() {
+                if ui.button(tr("Выбрать папку...", "Choose folder...")).clicked() {
                     acts.push(Act::NewPick);
                 }
             });
@@ -2053,7 +2060,7 @@ impl App {
 
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.settings_open;
-        egui::Window::new("Настройки")
+        egui::Window::new(tr("Настройки", "Settings"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -2061,42 +2068,69 @@ impl App {
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
                 egui::Grid::new("settings-grid").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                    ui.label("Масштаб интерфейса");
+                    ui.label(tr("Масштаб интерфейса", "UI scale"));
                     let resp = ui.add(
                         egui::Slider::new(&mut self.settings.ui_scale, 0.75..=1.75)
                             .step_by(0.05)
                             .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
                     )
-                    .on_hover_text("Также работает Cmd+= / Cmd+- / Cmd+0");
+                    .on_hover_text(tr("Также работает Cmd+= / Cmd+- / Cmd+0", "Also works: Cmd+= / Cmd+- / Cmd+0"));
                     // Apply on release so the layout does not jump under the drag.
                     if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
                         ctx.set_zoom_factor(self.settings.ui_scale);
                     }
                     ui.end_row();
 
-                    ui.label("Размер шрифта");
+                    ui.label(tr("Размер шрифта", "Font size"));
                     ui.add(egui::Slider::new(&mut self.settings.font_size, 9.0..=20.0).step_by(0.5));
                     ui.end_row();
 
-                    ui.label("Скроллбэк (строк)");
+                    ui.label(tr("Скроллбэк (строк)", "Scrollback (lines)"));
                     ui.add(
                         egui::DragValue::new(&mut self.settings.scrollback)
                             .range(200..=50_000)
                             .speed(100),
                     )
-                    .on_hover_text("Применяется к новым терминалам");
+                    .on_hover_text(tr("Применяется к новым терминалам", "Applies to new terminals"));
                     ui.end_row();
 
-                    ui.label("Усыплять после (мин)");
+                    ui.label(tr("Усыплять после (мин)", "Suspend after (min)"));
                     ui.add(egui::DragValue::new(&mut self.settings.idle_suspend_min).range(0..=240))
-                        .on_hover_text("0 = не усыплять. Сессия без вывода дольше этого времени завершается с возможностью продолжить");
+                        .on_hover_text(tr("0 = не усыплять. Сессия без вывода дольше этого времени завершается с возможностью продолжить", "0 = never. A session idle longer than this is suspended and can be resumed"));
                     ui.end_row();
 
-                    ui.label("Команда Claude");
+                    ui.label(tr("Команда Claude", "Claude command"));
                     ui.add(egui::TextEdit::singleline(&mut self.settings.claude_cmd).desired_width(160.0));
                     ui.end_row();
 
-                    ui.label("Тема");
+                    ui.label(tr("Язык", "Language"));
+                    let langs = [
+                        ("auto", tr("Авто", "Auto")),
+                        ("ru", "Русский"),
+                        ("en", "English"),
+                    ];
+                    let cur_lang = langs
+                        .iter()
+                        .find(|(k, _)| *k == self.settings.lang)
+                        .map(|(_, l)| *l)
+                        .unwrap_or("Auto");
+                    egui::ComboBox::from_id_salt("lang")
+                        .selected_text(cur_lang)
+                        .width(160.0)
+                        .show_ui(ui, |ui| {
+                            for (k, label) in langs {
+                                if ui.selectable_label(self.settings.lang == k, label).clicked()
+                                    && self.settings.lang != k
+                                {
+                                    self.settings.lang = k.to_string();
+                                    i18n::set(i18n::resolve(k));
+                                    ctx.request_repaint();
+                                }
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label(tr("Тема", "Theme"));
                     let cur = palette::PRESETS
                         .iter()
                         .find(|p| p.key == self.settings.theme)
@@ -2121,7 +2155,7 @@ impl App {
                         });
                     ui.end_row();
 
-                    ui.label("Акцент выделения");
+                    ui.label(tr("Акцент выделения", "Selection accent"));
                     ui.horizontal(|ui| {
                         let s = palette::selection();
                         let mut acc = self.settings.accent.unwrap_or([s.r(), s.g(), s.b()]);
@@ -2130,7 +2164,7 @@ impl App {
                             theme_changed = true;
                         }
                         if self.settings.accent.is_some()
-                            && ui.small_button("сброс").clicked()
+                            && ui.small_button(tr("сброс", "reset")).clicked()
                         {
                             self.settings.accent = None;
                             theme_changed = true;
@@ -2145,13 +2179,16 @@ impl App {
                     }
                 });
                 ui.separator();
-                ui.checkbox(&mut self.settings.notify_job_done, "Уведомлять, когда агент завершил работу");
-                ui.checkbox(&mut self.settings.notify_bell, "Уведомлять по сигналу терминала (bell)");
-                ui.checkbox(&mut self.settings.notify_sound, "Звук уведомлений");
-                ui.checkbox(&mut self.settings.copy_on_select, "Копировать выделенное сразу в буфер");
+                ui.checkbox(&mut self.settings.notify_job_done, tr("Уведомлять, когда агент завершил работу", "Notify when the agent finishes"));
+                ui.checkbox(&mut self.settings.notify_bell, tr("Уведомлять по сигналу терминала (bell)", "Notify on terminal bell"));
+                ui.checkbox(&mut self.settings.notify_sound, tr("Звук уведомлений", "Notification sound"));
+                ui.checkbox(&mut self.settings.copy_on_select, tr("Копировать выделенное сразу в буфер", "Copy selection to clipboard immediately"));
                 ui.checkbox(
                     &mut self.settings.skip_permissions_default,
-                    "skip-permissions по умолчанию для новых сессий",
+                    tr(
+                        "skip-permissions по умолчанию для новых сессий",
+                        "skip-permissions by default for new sessions",
+                    ),
                 );
                 // The exact-% statusline hook is a POSIX shell script; on
                 // Windows the badge falls back to the transcript estimate.
@@ -2160,13 +2197,17 @@ impl App {
                     ui.separator();
                     let mut hook_on = self.settings.ctx_hook;
                     let resp = ui
-                        .checkbox(&mut hook_on, "Точный % контекста Claude (statusline-хук)")
-                        .on_hover_text(
+                        .checkbox(&mut hook_on, tr("Точный % контекста Claude (statusline-хук)", "Exact Claude context % (statusline hook)"))
+                        .on_hover_text(tr(
                             "Ставит крошечный скрипт в ~/.kip/bin и подключает его statusline-хуком \
                              Claude Code - % будет ровно тот, что видит сам Claude.\n\
                              Уже настроенный statusline не ломается: он оборачивается и продолжает \
                              работать. Снятие галочки возвращает всё как было.",
-                        );
+                            "Installs a tiny script in ~/.kip/bin and wires it as a Claude Code \
+                             statusline hook - the % is exactly what Claude itself shows.\n\
+                             An existing statusline is not broken: it gets wrapped and keeps \
+                             working. Unchecking restores everything.",
+                        ));
                     if resp.changed() {
                         let res = if hook_on {
                             ctx_index::install_hook(&mut self.settings)
@@ -2198,14 +2239,14 @@ impl App {
                 let mut do_open = false;
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("Версия {}", update::current_label()))
+                        RichText::new(format!("{} {}", tr("Версия", "Version"), update::current_label()))
                             .size(11.5)
                             .color(TXT_DIM),
                     );
                     if ui
                         .add_enabled(
                             !busy,
-                            egui::Button::new(RichText::new("Проверить обновления").size(11.5)),
+                            egui::Button::new(RichText::new(tr("Проверить обновления", "Check for updates")).size(11.5)),
                         )
                         .clicked()
                     {
@@ -2214,35 +2255,35 @@ impl App {
                 });
                 match &self.update_state {
                     UpdateState::Checking => {
-                        ui.label(RichText::new("проверяю...").size(10.5).color(TXT_FAINT));
+                        ui.label(RichText::new(tr("проверяю...", "checking...")).size(10.5).color(TXT_FAINT));
                     },
                     UpdateState::UpToDate => {
                         ui.label(
-                            RichText::new("установлена последняя версия").size(10.5).color(TXT_FAINT),
+                            RichText::new(tr("установлена последняя версия", "you're on the latest version")).size(10.5).color(TXT_FAINT),
                         );
                     },
                     UpdateState::Working => {
                         ui.label(
-                            RichText::new("загружаю и устанавливаю, сейчас перезапущусь...")
+                            RichText::new(tr("загружаю и устанавливаю, сейчас перезапущусь...", "downloading and installing, restarting soon..."))
                                 .size(10.5)
                                 .color(ORANGE),
                         );
                     },
                     UpdateState::Failed(e) => {
                         ui.label(RichText::new(e).size(10.5).color(GIT_DEL));
-                        if ui.button(RichText::new("Открыть страницу загрузки").size(11.0)).clicked() {
+                        if ui.button(RichText::new(tr("Открыть страницу загрузки", "Open download page")).size(11.0)).clicked() {
                             do_open = true;
                         }
                     },
                     UpdateState::Available(r) => {
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(format!("Доступна версия {}", r.display))
+                                RichText::new(format!("{} {}", tr("Доступна версия", "Update available:"), r.display))
                                     .size(11.5)
                                     .color(GIT_ADD),
                             );
                             if ui
-                                .button(RichText::new("Обновить").size(11.5).color(GIT_ADD))
+                                .button(RichText::new(tr("Обновить", "Update")).size(11.5).color(GIT_ADD))
                                 .clicked()
                             {
                                 do_update = Some(r.clone());
@@ -2341,7 +2382,7 @@ impl eframe::App for App {
             painter.text(
                 r.center(),
                 Align2::CENTER_CENTER,
-                "Отпусти - вставлю путь к файлу",
+                tr("Отпусти - вставлю путь к файлу", "Drop to insert the file path"),
                 FontId::proportional(15.0),
                 TXT,
             );
@@ -2650,10 +2691,10 @@ fn fmt_mem(rss_kb: u64) -> String {
 fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
     if s < 60 {
-        format!("{s}с")
+        format!("{s}{}", tr("с", "s"))
     } else if s < 3600 {
-        format!("{}м {}с", s / 60, s % 60)
+        format!("{}{} {}{}", s / 60, tr("м", "m"), s % 60, tr("с", "s"))
     } else {
-        format!("{}ч {}м", s / 3600, s % 3600 / 60)
+        format!("{}{} {}{}", s / 3600, tr("ч", "h"), s % 3600 / 60, tr("м", "m"))
     }
 }

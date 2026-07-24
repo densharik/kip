@@ -12,6 +12,8 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::i18n::tr;
+
 use crate::config::Settings;
 use crate::session::{claude_dir, project_dir, valid_sid};
 
@@ -519,9 +521,9 @@ fn restore_root(root: &mut serde_json::Value, prev_ser: &str) -> bool {
 fn read_settings_root(path: &Path) -> Result<serde_json::Value, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text)
-            .map_err(|_| "settings.json Claude не парсится - не трогаю его".to_string()),
+            .map_err(|_| tr("settings.json Claude не парсится - не трогаю его", "Claude settings.json does not parse - leaving it alone").to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
-        Err(e) => Err(format!("чтение settings.json: {e}")),
+        Err(e) => Err(format!("{}: {e}", tr("чтение settings.json", "reading settings.json"))),
     }
 }
 
@@ -531,19 +533,19 @@ fn write_settings_root(path: &Path, root: &serde_json::Value) -> Result<(), Stri
     }
     let json = serde_json::to_vec_pretty(root).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("json.kip-tmp");
-    std::fs::write(&tmp, json).map_err(|e| format!("запись settings.json: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("замена settings.json: {e}"))
+    std::fs::write(&tmp, json).map_err(|e| format!("{}: {e}", tr("запись settings.json", "writing settings.json")))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", tr("замена settings.json", "replacing settings.json")))
 }
 
 /// Copy the embedded script to ~/.kip/bin (the .app path is not stable -
 /// moves, updates, duplicates; this one is). Idempotent, run on every start
 /// while the hook is enabled so updates propagate.
 pub fn write_hook_script() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("нет домашней директории")?;
+    let home = dirs::home_dir().ok_or(tr("нет домашней директории", "no home directory"))?;
     let bin = home.join(".kip").join("bin");
     std::fs::create_dir_all(&bin).map_err(|e| format!("mkdir {}: {e}", bin.display()))?;
     let p = bin.join("kip-ctx-hook.sh");
-    std::fs::write(&p, HOOK_SCRIPT).map_err(|e| format!("запись хука: {e}"))?;
+    std::fs::write(&p, HOOK_SCRIPT).map_err(|e| format!("{}: {e}", tr("запись хука", "writing hook")))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -566,7 +568,7 @@ fn recover_prev(cmd: &str) -> String {
 
 pub fn install_hook(settings: &mut Settings) -> Result<(), String> {
     write_hook_script()?;
-    let path = claude_settings_path().ok_or("нет домашней директории")?;
+    let path = claude_settings_path().ok_or(tr("нет домашней директории", "no home directory"))?;
     let mut root = read_settings_root(&path)?;
     if let Some(prev) = wrap_root(&mut root) {
         settings.prev_statusline = Some(prev);
@@ -580,7 +582,7 @@ pub fn install_hook(settings: &mut Settings) -> Result<(), String> {
 }
 
 pub fn uninstall_hook(settings: &mut Settings) -> Result<(), String> {
-    let path = claude_settings_path().ok_or("нет домашней директории")?;
+    let path = claude_settings_path().ok_or(tr("нет домашней директории", "no home directory"))?;
     let mut root = read_settings_root(&path)?;
     let prev = settings.prev_statusline.clone().unwrap_or_default();
     if restore_root(&mut root, &prev) {
