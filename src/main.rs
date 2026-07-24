@@ -11,6 +11,7 @@ mod session;
 mod term_view;
 mod update;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -33,9 +34,8 @@ const TICK: Duration = Duration::from_secs(2);
 const GIT_INTERVAL: Duration = Duration::from_secs(7);
 const BUSY_NOTIFY_MIN: Duration = Duration::from_secs(5);
 
-const TXT: Color32 = Color32::from_rgb(0xc4, 0xc4, 0xc4);
-const TXT_DIM: Color32 = Color32::from_rgb(0x7a, 0x7a, 0x7a);
-const TXT_FAINT: Color32 = Color32::from_rgb(0x5a, 0x5a, 0x5a);
+// Theme-adaptive text/surface colors live in palette:: (text(), popup_bg(),
+// border(), ...). These mid-tone status accents read on both light and dark.
 const GIT_ADD: Color32 = Color32::from_rgb(0x8f, 0xb5, 0x7a);
 const GIT_DEL: Color32 = Color32::from_rgb(0xc4, 0x7a, 0x7a);
 const DOT_BUSY: Color32 = Color32::from_rgb(0x8f, 0xb5, 0x7a);
@@ -43,8 +43,6 @@ const DOT_LIVE: Color32 = Color32::from_rgb(0x8a, 0x8a, 0x8a);
 const DOT_EXITED: Color32 = Color32::from_rgb(0xb0, 0x70, 0x70);
 const UNREAD: Color32 = Color32::from_rgb(0x9c, 0xb5, 0xcc);
 const ORANGE: Color32 = Color32::from_rgb(0xd4, 0xa0, 0x5a);
-const POPUP_BG: Color32 = Color32::from_rgb(0x1f, 0x1f, 0x1f);
-const POPUP_STROKE: Color32 = Color32::from_rgb(0x35, 0x35, 0x35);
 
 fn main() -> eframe::Result {
     // If kip itself was launched from a Claude Code session, its CLAUDE* markers
@@ -104,7 +102,43 @@ enum Act {
     /// X button / "Удалить": always removes, killing a live session.
     Remove(u64),
     ToggleAwake(u64),
+    /// Start inline editing of a session's title.
+    BeginRename(u64),
+    /// Commit the rename buffer as the session's custom name (empty = reset to auto).
+    RenameCommit(u64),
+    RenameCancel,
+    /// Move a session: set its group and drop it before `before` (None = end of
+    /// that group's run). Backs both drag & drop and the context-menu group menu.
+    MoveSession { id: u64, group: Option<String>, before: Option<u64> },
+    /// Put a session into a fresh group and immediately rename that group.
+    NewGroup(u64),
+    ToggleGroup(String),
+    BeginRenameGroup(String),
+    RenameGroupCommit(String),
+    /// Dissolve a group: its members become ungrouped.
+    DeleteGroup(String),
     Settings,
+}
+
+/// One entry in the sidebar's vertical layout (a group header or a session row),
+/// captured each frame to resolve where a drag would drop.
+struct DropItem {
+    rect: Rect,
+    id: Option<u64>,
+    group: Option<String>,
+    is_header: bool,
+}
+
+struct DropTarget {
+    group: Option<String>,
+    before: Option<u64>,
+    line_y: f32,
+}
+
+/// One line of the sidebar in display order.
+enum Slot {
+    Header(String),
+    Row(u64),
 }
 
 struct App {
@@ -135,6 +169,18 @@ struct App {
     last_tick: Instant,
     /// When the last background update check ran.
     last_update_check: Instant,
+    /// Id of the session whose title is being edited inline (double-click rename).
+    renaming: Option<u64>,
+    /// Name of the group whose header is being renamed inline (mutually exclusive
+    /// with `renaming`; both feed `rename_buf`).
+    renaming_group: Option<String>,
+    rename_buf: String,
+    /// Grab keyboard focus for the rename field on its first frame only.
+    rename_focus: bool,
+    /// Session id being dragged in the sidebar (reorder / move between groups).
+    dragging: Option<u64>,
+    /// Collapsed group names.
+    collapsed_groups: HashSet<String>,
     /// Command editor pinned under the terminal.
     cmd_input: String,
     /// The typed text used as the history filter (nav-fill does not change it).
@@ -217,6 +263,12 @@ impl App {
             settings_open: false,
             last_tick: Instant::now(),
             last_update_check: Instant::now(),
+            renaming: None,
+            renaming_group: None,
+            rename_buf: String::new(),
+            rename_focus: false,
+            dragging: None,
+            collapsed_groups: state.collapsed_groups.into_iter().collect(),
             cmd_input: String::new(),
             hist_query: String::new(),
             hist_sel: None,
@@ -300,9 +352,17 @@ impl App {
     }
 
     fn persist(&self) {
+        // Only keep collapse state for groups that still exist.
+        let live: HashSet<&String> = self.sessions.iter().filter_map(|s| s.group.as_ref()).collect();
         save_state(&AppState {
             settings: self.settings.clone(),
             sessions: self.sessions.iter().map(|s| s.to_saved()).collect(),
+            collapsed_groups: self
+                .collapsed_groups
+                .iter()
+                .filter(|g| live.contains(g))
+                .cloned()
+                .collect(),
         });
     }
 
@@ -420,9 +480,89 @@ impl App {
         self.persist();
     }
 
+    /// Reorder within the session vec and set the dragged session's group.
+    /// `before` = the session to drop in front of (None = end of that group's run).
+    fn move_session(&mut self, id: u64, group: Option<String>, before: Option<u64>) {
+        if before == Some(id) {
+            // Dropped onto itself; only the group might still need updating.
+            if let Some(i) = self.idx_of(id) {
+                if self.sessions[i].group != group {
+                    self.sessions[i].group = group;
+                    self.persist();
+                }
+            }
+            return;
+        }
+        let Some(pos) = self.idx_of(id) else { return };
+        let mut s = self.sessions.remove(pos);
+        s.group = group.clone();
+        let insert = match before.and_then(|b| self.idx_of(b)) {
+            Some(p) => p,
+            None => match self.sessions.iter().rposition(|x| x.group == group) {
+                Some(p) => p + 1,
+                None => {
+                    // No members yet: ungrouped lands above the first group, a
+                    // brand-new group at the very end.
+                    if group.is_none() {
+                        self.sessions.iter().position(|x| x.group.is_some()).unwrap_or(self.sessions.len())
+                    } else {
+                        self.sessions.len()
+                    }
+                },
+            },
+        };
+        self.sessions.insert(insert, s);
+        self.persist();
+    }
+
+    fn unique_group_name(&self) -> String {
+        let base = tr("Группа", "Group");
+        let taken: HashSet<&str> = self.sessions.iter().filter_map(|s| s.group.as_deref()).collect();
+        if !taken.contains(base) {
+            return base.to_string();
+        }
+        (2..).map(|n| format!("{base} {n}")).find(|c| !taken.contains(c.as_str())).unwrap()
+    }
+
+    /// Where a drop at pointer-y `py` would land, given the frame's row/header
+    /// geometry. `before`/`group` feed `move_session`; `line_y` draws the marker.
+    fn resolve_drop(&self, items: &[DropItem], py: f32) -> Option<DropTarget> {
+        let first = items.first()?;
+        if py < first.rect.top() {
+            return Some(DropTarget { group: first.group.clone(), before: first.id, line_y: first.rect.top() });
+        }
+        let last = items.last()?;
+        if py > last.rect.bottom() {
+            let g = items.iter().rev().find(|i| i.id.is_some()).and_then(|i| i.group.clone());
+            return Some(DropTarget { group: g, before: None, line_y: last.rect.bottom() });
+        }
+        // The item under the pointer, else the nearest one above it.
+        let hit = items
+            .iter()
+            .find(|i| py >= i.rect.top() && py <= i.rect.bottom())
+            .or_else(|| items.iter().rfind(|i| i.rect.bottom() <= py))
+            .unwrap_or(first);
+        if hit.is_header {
+            let before = self.sessions.iter().find(|s| s.group == hit.group).map(|s| s.id);
+            return Some(DropTarget { group: hit.group.clone(), before, line_y: hit.rect.bottom() });
+        }
+        let sid = hit.id?;
+        if py < hit.rect.center().y {
+            Some(DropTarget { group: hit.group.clone(), before: Some(sid), line_y: hit.rect.top() })
+        } else {
+            let next = self
+                .idx_of(sid)
+                .and_then(|p| self.sessions.get(p + 1))
+                .filter(|n| n.group == hit.group)
+                .map(|n| n.id);
+            Some(DropTarget { group: hit.group.clone(), before: next, line_y: hit.rect.bottom() })
+        }
+    }
+
     /// Switch the active session, dropping per-session UI state (popup, input, history nav).
     fn set_active(&mut self, id: Option<u64>) {
         self.active = id;
+        self.renaming = None;
         self.dir_open = false;
         self.cmd_input.clear();
         self.hist_query.clear();
@@ -456,11 +596,16 @@ impl App {
     fn spawn(&mut self, cwd: PathBuf, command: Option<String>, ctx: &egui::Context) {
         let id = self.next_id;
         self.next_id += 1;
+        // A new terminal joins the active session's group (create a sibling in
+        // whatever project/group you are looking at).
+        let group = self.active_idx().and_then(|i| self.sessions[i].group.clone());
         let mut s = Session::from_saved(
             SavedSession {
                 cwd,
                 claude_session_id: None,
                 claude_title: None,
+                custom_name: None,
+                group: group.clone(),
                 skip_permissions: self.settings.skip_permissions_default,
                 keep_awake: false,
                 snapshot: None,
@@ -468,7 +613,13 @@ impl App {
             id,
         );
         self.attach_live(&mut s, command, ctx);
-        self.sessions.push(s);
+        // Keep it next to its group instead of always at the very bottom.
+        let pos = group
+            .as_ref()
+            .and_then(|g| self.sessions.iter().rposition(|x| x.group.as_ref() == Some(g)))
+            .map(|p| p + 1)
+            .unwrap_or(self.sessions.len());
+        self.sessions.insert(pos, s);
         self.set_active(Some(id));
         self.persist();
     }
@@ -583,6 +734,79 @@ impl App {
                         self.sessions[idx].keep_awake = !self.sessions[idx].keep_awake;
                         self.persist();
                     }
+                },
+                Act::BeginRename(id) => {
+                    if let Some(idx) = self.idx_of(id) {
+                        self.renaming = Some(id);
+                        self.rename_buf = self.sessions[idx].display_name();
+                        self.rename_focus = true;
+                    }
+                },
+                Act::RenameCommit(id) => {
+                    if self.renaming == Some(id) {
+                        if let Some(idx) = self.idx_of(id) {
+                            let name = self.rename_buf.trim();
+                            // Empty = clear the override, falling back to the
+                            // Claude/directory name.
+                            self.sessions[idx].custom_name =
+                                (!name.is_empty()).then(|| name.to_string());
+                            self.persist();
+                        }
+                        self.renaming = None;
+                    }
+                },
+                Act::RenameCancel => {
+                    self.renaming = None;
+                    self.renaming_group = None;
+                },
+                Act::MoveSession { id, group, before } => self.move_session(id, group, before),
+                Act::NewGroup(id) => {
+                    let name = self.unique_group_name();
+                    self.move_session(id, Some(name.clone()), None);
+                    self.renaming_group = Some(name.clone());
+                    self.renaming = None;
+                    self.rename_buf = name;
+                    self.rename_focus = true;
+                },
+                Act::ToggleGroup(name) => {
+                    if !self.collapsed_groups.remove(&name) {
+                        self.collapsed_groups.insert(name);
+                    }
+                    self.persist();
+                },
+                Act::BeginRenameGroup(name) => {
+                    self.rename_buf = name.clone();
+                    self.renaming_group = Some(name);
+                    self.renaming = None;
+                    self.rename_focus = true;
+                },
+                Act::RenameGroupCommit(old) => {
+                    if self.renaming_group.as_deref() == Some(old.as_str()) {
+                        let new = self.rename_buf.trim().to_string();
+                        // Empty or a name that already exists = keep the old one.
+                        let clash = self.sessions.iter().any(|s| s.group.as_deref() == Some(new.as_str()));
+                        if !new.is_empty() && (new == old || !clash) {
+                            for s in &mut self.sessions {
+                                if s.group.as_deref() == Some(old.as_str()) {
+                                    s.group = Some(new.clone());
+                                }
+                            }
+                            if self.collapsed_groups.remove(&old) {
+                                self.collapsed_groups.insert(new);
+                            }
+                            self.persist();
+                        }
+                        self.renaming_group = None;
+                    }
+                },
+                Act::DeleteGroup(name) => {
+                    for s in &mut self.sessions {
+                        if s.group.as_deref() == Some(name.as_str()) {
+                            s.group = None;
+                        }
+                    }
+                    self.collapsed_groups.remove(&name);
+                    self.persist();
                 },
                 Act::Settings => self.settings_open = !self.settings_open,
             }
@@ -1053,38 +1277,190 @@ impl App {
         });
         ui.add_space(8.0);
 
+        let mut items: Vec<DropItem> = Vec::new();
+        let mut released = false;
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            let ids: Vec<u64> = self.sessions.iter().map(|s| s.id).collect();
-            for id in ids {
-                let idx = self.idx_of(id).unwrap();
-                self.session_row(ui, idx, &mut acts);
+            for slot in self.sidebar_order() {
+                match slot {
+                    Slot::Header(name) => {
+                        let collapsed = self.collapsed_groups.contains(&name);
+                        let rect = self.group_header(ui, &name, collapsed, &mut acts);
+                        items.push(DropItem { rect, id: None, group: Some(name), is_header: true });
+                    },
+                    Slot::Row(id) => {
+                        let idx = self.idx_of(id).unwrap();
+                        let group = self.sessions[idx].group.clone();
+                        // Hide members of a collapsed group (header still shows).
+                        if group.as_ref().is_some_and(|g| self.collapsed_groups.contains(g)) {
+                            continue;
+                        }
+                        let (rect, rel) = self.session_row(ui, idx, &mut acts);
+                        released |= rel;
+                        items.push(DropItem { rect, id: Some(id), group, is_header: false });
+                    },
+                }
             }
+            ui.add_space(40.0);
         });
+
+        // Drag overlay: insertion marker every frame, the move on release.
+        if let Some(drag) = self.dragging {
+            let py = ui.input(|i| i.pointer.interact_pos()).map(|p| p.y);
+            if let Some(tgt) = py.and_then(|py| self.resolve_drop(&items, py)) {
+                let x = ui.max_rect().x_range();
+                ui.painter().hline(x, tgt.line_y, Stroke::new(2.0, palette::accent_bar()));
+                if released {
+                    acts.push(Act::MoveSession { id: drag, group: tgt.group, before: tgt.before });
+                }
+            }
+            ui.ctx().request_repaint();
+        }
+        if released {
+            self.dragging = None;
+        }
         acts
     }
 
-    fn session_row(&self, ui: &mut egui::Ui, idx: usize, acts: &mut Vec<Act>) {
+    /// Sidebar display order: ungrouped rows first, then each group (header +
+    /// its members) in first-appearance order.
+    fn sidebar_order(&self) -> Vec<Slot> {
+        let mut out = Vec::new();
+        for s in &self.sessions {
+            if s.group.is_none() {
+                out.push(Slot::Row(s.id));
+            }
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for s in &self.sessions {
+            let Some(g) = s.group.as_deref() else { continue };
+            if seen.contains(&g) {
+                continue;
+            }
+            seen.push(g);
+            out.push(Slot::Header(g.to_string()));
+            for m in &self.sessions {
+                if m.group.as_deref() == Some(g) {
+                    out.push(Slot::Row(m.id));
+                }
+            }
+        }
+        out
+    }
+
+    /// A group header: collapse triangle, name, member count. Returns its rect
+    /// (a drop target). Click toggles collapse, double-click renames.
+    fn group_header(&mut self, ui: &mut egui::Ui, name: &str, collapsed: bool, acts: &mut Vec<Act>) -> Rect {
+        let editing = self.renaming_group.as_deref() == Some(name);
+        let count = self.sessions.iter().filter(|s| s.group.as_deref() == Some(name)).count();
+        let (rect, resp) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::click());
+        if !ui.is_rect_visible(rect) {
+            return rect;
+        }
+        let hovered = ui.rect_contains_pointer(rect);
+        let painter = ui.painter();
+        let tri_c = Pos2::new(rect.min.x + 14.0, rect.center().y);
+        let tri_col = if hovered { palette::text() } else { palette::text_dim() };
+        draw_caret(painter, tri_c, collapsed, tri_col);
+        if !editing {
+            painter.text(
+                Pos2::new(rect.min.x + 26.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                truncate_end(name, 22),
+                FontId::proportional(11.0),
+                palette::text_dim(),
+            );
+        }
+        painter.text(
+            Pos2::new(rect.max.x - 12.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            format!("{count}"),
+            FontId::proportional(10.0),
+            palette::text_faint(),
+        );
+
+        if resp.clicked() {
+            acts.push(Act::ToggleGroup(name.to_string()));
+        }
+        if resp.double_clicked() {
+            acts.push(Act::BeginRenameGroup(name.to_string()));
+        }
+        resp.context_menu(|ui| {
+            if ui.button(tr("Переименовать группу", "Rename group")).clicked() {
+                acts.push(Act::BeginRenameGroup(name.to_string()));
+                ui.close();
+            }
+            if ui.button(tr("Расформировать группу", "Ungroup")).clicked() {
+                acts.push(Act::DeleteGroup(name.to_string()));
+                ui.close();
+            }
+        });
+
+        if editing {
+            let cctx = ui.ctx().clone();
+            let width = rect.width() - 30.0;
+            let field = egui::Area::new(egui::Id::new(("group-rename", name)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(Pos2::new(rect.min.x + 22.0, rect.center().y - 13.0))
+                .show(&cctx, |ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.rename_buf)
+                            .font(FontId::proportional(11.5))
+                            .desired_width(width),
+                    );
+                    if self.rename_focus {
+                        r.request_focus();
+                        self.rename_focus = false;
+                    }
+                    r
+                })
+                .inner;
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                acts.push(Act::RenameCancel);
+            } else if field.lost_focus() {
+                acts.push(Act::RenameGroupCommit(name.to_string()));
+            }
+        }
+        rect
+    }
+
+    /// Returns the row rect (a drag drop target) and whether a drag ended on it.
+    fn session_row(&mut self, ui: &mut egui::Ui, idx: usize, acts: &mut Vec<Act>) -> (Rect, bool) {
+        let id = self.sessions[idx].id;
+        let renaming = self.renaming == Some(id);
+        let is_dragging = self.dragging == Some(id);
         let s = &self.sessions[idx];
         let selected = self.active == Some(s.id);
         let row_h = 48.0;
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::click());
+        let (rect, resp) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::click_and_drag());
         if !ui.is_rect_visible(rect) {
-            return;
+            return (rect, false);
         }
+        let drag_started = !renaming && resp.drag_started();
+        let released = is_dragging && resp.drag_stopped();
         // Geometric hover: overlapping child widgets (close button, ctx corner)
         // must not make the row highlight and the button flicker.
         let hovered = ui.rect_contains_pointer(rect);
         let painter = ui.painter();
 
         if selected {
-            painter.rect_filled(rect, 0.0, Color32::from_rgb(0x24, 0x24, 0x24));
+            painter.rect_filled(rect, 0.0, palette::row_sel_bg());
             painter.rect_filled(
                 Rect::from_min_size(rect.min, Vec2::new(2.0, row_h)),
                 0.0,
-                Color32::from_rgb(0x9a, 0x9a, 0x9a),
+                palette::accent_bar(),
             );
         } else if hovered {
-            painter.rect_filled(rect, 0.0, Color32::from_rgb(0x1f, 0x1f, 0x1f));
+            painter.rect_filled(rect, 0.0, palette::row_hover_bg());
+        }
+        if is_dragging {
+            painter.rect_stroke(
+                rect.shrink(2.0),
+                CornerRadius::same(4),
+                Stroke::new(1.0, palette::accent_bar()),
+                egui::StrokeKind::Inside,
+            );
         }
 
         // Status: green = working (recent output), orange = waiting for input,
@@ -1105,7 +1481,7 @@ impl App {
                 painter.circle_filled(dot, 3.0, DOT_LIVE);
             },
             Phase::Suspended => {
-                painter.circle_stroke(dot, 3.0, Stroke::new(1.2, TXT_DIM));
+                painter.circle_stroke(dot, 3.0, Stroke::new(1.2, palette::text_dim()));
             },
             Phase::Exited(code) => {
                 let color = if code.is_some_and(|c| c != 0) { DOT_EXITED } else { Color32::from_gray(0x6a) };
@@ -1119,17 +1495,31 @@ impl App {
         let mut name_max = 26;
         if let Some(e) = ctx_entry {
             let pct = e.pct.clamp(1.0, 100.0);
+            let lt = palette::light();
             let (bg, fg) = if pct >= 70.0 {
                 // Pulse at ~10fps while visible.
                 let t = ui.input(|i| i.time);
                 let a = ((t * 4.0).sin() * 0.5 + 0.5) as f32;
                 let lerp = |lo: u8, hi: u8| (lo as f32 + (hi as f32 - lo as f32) * a) as u8;
-                (
-                    Color32::from_rgb(lerp(0x38, 0x5c), lerp(0x1e, 0x22), lerp(0x1e, 0x22)),
-                    Color32::from_rgb(0xe2, 0x8f, 0x8f),
-                )
+                if lt {
+                    (
+                        Color32::from_rgb(0xf4, lerp(0xce, 0xbc), lerp(0xce, 0xbc)),
+                        Color32::from_rgb(0xb0, 0x2b, 0x2b),
+                    )
+                } else {
+                    (
+                        Color32::from_rgb(lerp(0x38, 0x5c), lerp(0x1e, 0x22), lerp(0x1e, 0x22)),
+                        Color32::from_rgb(0xe2, 0x8f, 0x8f),
+                    )
+                }
             } else if pct >= 50.0 {
-                (Color32::from_rgb(0x33, 0x2f, 0x1a), Color32::from_rgb(0xd4, 0xc4, 0x5a))
+                if lt {
+                    (Color32::from_rgb(0xf5, 0xec, 0xc0), Color32::from_rgb(0x8a, 0x6d, 0x0a))
+                } else {
+                    (Color32::from_rgb(0x33, 0x2f, 0x1a), Color32::from_rgb(0xd4, 0xc4, 0x5a))
+                }
+            } else if lt {
+                (Color32::from_rgb(0xdc, 0xef, 0xcf), Color32::from_rgb(0x3a, 0x7d, 0x2c))
             } else {
                 (Color32::from_rgb(0x21, 0x2b, 0x1d), GIT_ADD)
             };
@@ -1150,20 +1540,23 @@ impl App {
         }
 
         let text_x = rect.min.x + 28.0;
-        let name_color = if selected { Color32::from_rgb(0xde, 0xde, 0xde) } else { TXT };
-        painter.text(
-            Pos2::new(text_x, rect.center().y - 9.0),
-            Align2::LEFT_CENTER,
-            truncate_end(&s.display_name(), name_max),
-            FontId::proportional(13.0),
-            name_color,
-        );
+        let name_color = if selected { palette::text_strong() } else { palette::text() };
+        // The name is replaced by an inline editor while renaming (drawn below).
+        if !renaming {
+            painter.text(
+                Pos2::new(text_x, rect.center().y - 9.0),
+                Align2::LEFT_CENTER,
+                truncate_end(&s.display_name(), name_max),
+                FontId::proportional(13.0),
+                name_color,
+            );
+        }
         painter.text(
             Pos2::new(text_x, rect.center().y + 8.0),
             Align2::LEFT_CENTER,
             truncate_head(&tilde(&s.cwd), 34),
             FontId::proportional(10.5),
-            TXT_FAINT,
+            palette::text_faint(),
         );
 
         // Right side: close button on hover, otherwise unread / suspended marker.
@@ -1179,7 +1572,7 @@ impl App {
             let (bg, fg) = if close_resp.hovered() {
                 (Color32::from_rgb(0x45, 0x2c, 0x2c), Color32::from_rgb(0xe2, 0x9a, 0x9a))
             } else {
-                (Color32::from_rgb(0x30, 0x30, 0x30), Color32::from_rgb(0xc4, 0xc4, 0xc4))
+                (palette::ui_bg_hover(), palette::text())
             };
             ui.painter().circle_filled(mark, 9.0, bg);
             let d = 3.4;
@@ -1190,13 +1583,51 @@ impl App {
         } else if s.unread {
             ui.painter().circle_filled(mark, 3.0, UNREAD);
         } else if s.keep_awake {
-            ui.painter().text(mark, Align2::CENTER_CENTER, "!", FontId::proportional(11.0), TXT_FAINT);
+            ui.painter().text(mark, Align2::CENTER_CENTER, "!", FontId::proportional(11.0), palette::text_faint());
         }
 
         if resp.clicked() {
             acts.push(Act::Select(s.id));
         }
+        if resp.double_clicked() {
+            acts.push(Act::BeginRename(s.id));
+        }
+        let sid = s.id;
+        let cur_group = s.group.clone();
+        let mut all_groups: Vec<String> = Vec::new();
+        for x in &self.sessions {
+            if let Some(g) = &x.group {
+                if !all_groups.contains(g) {
+                    all_groups.push(g.clone());
+                }
+            }
+        }
         resp.context_menu(|ui| {
+            if ui.button(tr("Переименовать", "Rename")).clicked() {
+                acts.push(Act::BeginRename(sid));
+                ui.close();
+            }
+            ui.menu_button(tr("В группу", "Move to group"), |ui| {
+                for g in &all_groups {
+                    if cur_group.as_deref() != Some(g.as_str())
+                        && ui.button(truncate_end(g, 24)).clicked()
+                    {
+                        acts.push(Act::MoveSession { id: sid, group: Some(g.clone()), before: None });
+                        ui.close();
+                    }
+                }
+                if !all_groups.is_empty() {
+                    ui.separator();
+                }
+                if ui.button(tr("Новая группа…", "New group…")).clicked() {
+                    acts.push(Act::NewGroup(sid));
+                    ui.close();
+                }
+                if cur_group.is_some() && ui.button(tr("Без группы", "No group")).clicked() {
+                    acts.push(Act::MoveSession { id: sid, group: None, before: None });
+                    ui.close();
+                }
+            });
             match &s.phase {
                 Phase::Live(_) => {
                     if ui.button(tr("Усыпить", "Suspend")).clicked() {
@@ -1229,6 +1660,39 @@ impl App {
                 },
             }
         });
+
+        // Inline title editor: a text field laid over the name, committed on
+        // Enter or blur, cancelled on Escape. `s` is no longer borrowed here.
+        if renaming {
+            let cctx = ui.ctx().clone();
+            let width = rect.width() - 36.0;
+            let field = egui::Area::new(egui::Id::new(("rename", id)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(Pos2::new(text_x - 4.0, rect.center().y - 18.0))
+                .show(&cctx, |ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.rename_buf)
+                            .font(FontId::proportional(13.0))
+                            .desired_width(width),
+                    );
+                    if self.rename_focus {
+                        r.request_focus();
+                        self.rename_focus = false;
+                    }
+                    r
+                })
+                .inner;
+            let escaped = ui.input(|i| i.key_pressed(Key::Escape));
+            if escaped {
+                acts.push(Act::RenameCancel);
+            } else if field.lost_focus() {
+                acts.push(Act::RenameCommit(id));
+            }
+        }
+        if drag_started {
+            self.dragging = Some(id);
+        }
+        (rect, released)
     }
 
     fn bottom_bar(&mut self, ui: &mut egui::Ui) -> Vec<Act> {
@@ -1236,7 +1700,7 @@ impl App {
         let Some(idx) = self.active_idx() else {
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
-                ui.label(RichText::new(tr("Нет активной сессии", "No active session")).size(11.5).color(TXT_FAINT));
+                ui.label(RichText::new(tr("Нет активной сессии", "No active session")).size(11.5).color(palette::text_faint()));
             });
             return acts;
         };
@@ -1261,7 +1725,7 @@ impl App {
                     .add_enabled(
                         !(is_live && busy_now),
                         egui::Button::new(
-                            RichText::new(truncate_head(&path_full, 44)).monospace().size(11.5).color(TXT),
+                            RichText::new(truncate_head(&path_full, 44)).monospace().size(11.5).color(palette::text()),
                         ),
                     )
                     .on_hover_text(format!("{path_full}\n{}", tr("Сменить папку", "Change folder")))
@@ -1274,7 +1738,7 @@ impl App {
                 match &git {
                     Some(g) if g.is_repo => {
                         ui.add_space(6.0);
-                        ui.label(RichText::new(&g.branch).size(11.5).color(TXT_DIM));
+                        ui.label(RichText::new(&g.branch).size(11.5).color(palette::text_dim()));
                         if g.added > 0 || g.deleted > 0 {
                             ui.add_space(2.0);
                             ui.label(
@@ -1285,12 +1749,12 @@ impl App {
                             );
                         } else {
                             ui.add_space(2.0);
-                            ui.label(RichText::new(tr("чисто", "clean")).size(11.0).color(TXT_FAINT));
+                            ui.label(RichText::new(tr("чисто", "clean")).size(11.0).color(palette::text_faint()));
                         }
                     },
                     Some(_) => {
                         ui.add_space(6.0);
-                        ui.label(RichText::new(tr("не git", "not git")).size(11.0).color(TXT_FAINT));
+                        ui.label(RichText::new(tr("не git", "not git")).size(11.0).color(palette::text_faint()));
                     },
                     None => {},
                 }
@@ -1316,7 +1780,7 @@ impl App {
                             // so it lives on the restart card, not here.
                             if let Some(cid) = &s.claude_session_id {
                                 ui.label(
-                                    RichText::new(short_id(cid)).size(10.5).monospace().color(TXT_FAINT),
+                                    RichText::new(short_id(cid)).size(10.5).monospace().color(palette::text_faint()),
                                 )
                                 .on_hover_text(format!("{}: {cid}", tr("Сохранённая сессия Claude", "Saved Claude session")));
                             }
@@ -1329,9 +1793,9 @@ impl App {
                                     Some(c) => format!("{} {c}", tr("завершено, код", "exited, code")),
                                     None => tr("завершено", "done").into(),
                                 };
-                                ui.label(RichText::new(txt).size(11.0).color(TXT_FAINT));
+                                ui.label(RichText::new(txt).size(11.0).color(palette::text_faint()));
                             } else {
-                                ui.label(RichText::new(tr("усыплена", "suspended")).size(11.0).color(TXT_FAINT));
+                                ui.label(RichText::new(tr("усыплена", "suspended")).size(11.0).color(palette::text_faint()));
                             }
                         },
                     }
@@ -1367,7 +1831,11 @@ impl App {
             // program (claude, vim, ...) gets the keyboard directly.
             let submitted = if busy_now { None } else { self.cmd_panel(ui) };
             let settings = self.settings.clone();
-            let accept = busy_now && !self.settings_open && !self.dir_open;
+            let accept = busy_now
+                && !self.settings_open
+                && !self.dir_open
+                && self.renaming.is_none()
+                && self.renaming_group.is_none();
             let term_rect = ui.available_rect_before_wrap();
             let s = &mut self.sessions[idx];
             let info = term_view::show(ui, s, &settings, accept);
@@ -1388,21 +1856,26 @@ impl App {
                     .unwrap_or_default();
                 let head = Rect::from_min_size(term_rect.min, Vec2::new(term_rect.width(), 40.0));
                 let p = ui.painter();
-                p.rect_filled(head, 0.0, Color32::from_rgba_unmultiplied(0x15, 0x15, 0x15, 236));
-                p.hline(head.x_range(), head.bottom(), Stroke::new(1.0, Color32::from_rgb(0x28, 0x28, 0x28)));
+                let head_fill = if palette::light() {
+                    Color32::from_rgba_unmultiplied(0xf3, 0xf3, 0xf3, 236)
+                } else {
+                    Color32::from_rgba_unmultiplied(0x15, 0x15, 0x15, 236)
+                };
+                p.rect_filled(head, 0.0, head_fill);
+                p.hline(head.x_range(), head.bottom(), Stroke::new(1.0, palette::border_dim()));
                 p.text(
                     head.min + Vec2::new(10.0, 5.0),
                     Align2::LEFT_TOP,
                     format!("{} ({})", tilde(&s.cwd), fmt_dur(dur)),
                     FontId::monospace(10.5),
-                    TXT_DIM,
+                    palette::text_dim(),
                 );
                 p.text(
                     head.min + Vec2::new(10.0, 20.0),
                     Align2::LEFT_TOP,
                     truncate_end(&cmd_text, 110),
                     FontId::monospace(12.0),
-                    TXT,
+                    palette::text(),
                 );
                 ui.ctx().request_repaint_after(Duration::from_secs(1));
             }
@@ -1422,7 +1895,10 @@ impl App {
     fn cmd_panel(&mut self, ui: &mut egui::Ui) -> Option<String> {
         self.refresh_history();
         let ctx = ui.ctx().clone();
-        let interactive = !self.settings_open && !self.dir_open;
+        let interactive = !self.settings_open
+            && !self.dir_open
+            && self.renaming.is_none()
+            && self.renaming_group.is_none();
         let mut submit: Option<String> = None;
 
         // Multiline once the command has a newline (added with Shift+Enter, which
@@ -1536,11 +2012,11 @@ impl App {
                 ui.painter().hline(
                     ui.max_rect().x_range(),
                     top,
-                    Stroke::new(1.0, Color32::from_rgb(0x2a, 0x2a, 0x2a)),
+                    Stroke::new(1.0, palette::border_dim()),
                 );
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.add_space(10.0);
-                    ui.label(RichText::new(">").font(font.clone()).color(TXT_DIM));
+                    ui.label(RichText::new(">").font(font.clone()).color(palette::text_dim()));
                     // Multiline, but egui only inserts a newline on its return_key -
                     // point that at Shift+Enter. Plain Enter is consumed above and
                     // submits, so the editor never sees it.
@@ -1550,7 +2026,7 @@ impl App {
                             .font(font.clone())
                             .desired_rows(1)
                             .return_key(egui::KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter))
-                            .hint_text(RichText::new(tr("команда...", "command...")).font(font).color(TXT_FAINT))
+                            .hint_text(RichText::new(tr("команда...", "command...")).font(font).color(palette::text_faint()))
                             .desired_width(ui.available_width() - 8.0),
                     );
                     if interactive {
@@ -1595,13 +2071,13 @@ impl App {
                 .fixed_pos(field_rect.left_top() + Vec2::new(-6.0, -8.0))
                 .show(&ctx, |ui| {
                     Frame::new()
-                        .fill(POPUP_BG)
-                        .stroke(Stroke::new(1.0, POPUP_STROKE))
+                        .fill(palette::popup_bg())
+                        .stroke(Stroke::new(1.0, palette::border()))
                         .corner_radius(CornerRadius::same(8))
                         .inner_margin(Margin::symmetric(10, 8))
                         .show(ui, |ui| {
                             ui.set_width(field_rect.width().min(760.0));
-                            ui.label(RichText::new(tr("История", "History")).size(9.5).color(TXT_FAINT));
+                            ui.label(RichText::new(tr("История", "History")).size(9.5).color(palette::text_faint()));
                             ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                                 for (i, cmd) in display.iter().enumerate() {
                                     let selected = self.hist_sel == Some(i);
@@ -1620,7 +2096,7 @@ impl App {
                             ui.label(
                                 RichText::new(tr("стрелки - выбор   esc - закрыть   enter - выполнить", "arrows - select   esc - close   enter - run"))
                                     .size(9.0)
-                                    .color(TXT_FAINT),
+                                    .color(palette::text_faint()),
                             );
                         });
                 });
@@ -1645,15 +2121,15 @@ impl App {
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(30.0, 20.0), Sense::hover());
                 let active = resp.hovered() || self.stats_rect.is_some();
-                let bg = if active { Color32::from_rgb(0x2c, 0x2c, 0x2c) } else { Color32::from_rgb(0x20, 0x20, 0x20) };
+                let bg = if active { palette::surface_hi() } else { palette::surface() };
                 ui.painter().rect_filled(rect, CornerRadius::same(5), bg);
                 ui.painter().rect_stroke(
                     rect,
                     CornerRadius::same(5),
-                    Stroke::new(1.0, Color32::from_rgb(0x35, 0x35, 0x35)),
+                    Stroke::new(1.0, palette::border()),
                     egui::StrokeKind::Inside,
                 );
-                let fg = if active { TXT } else { TXT_DIM };
+                let fg = if active { palette::text() } else { palette::text_dim() };
                 let base = rect.center() + Vec2::new(0.0, 6.0);
                 for (i, h) in [5.0, 9.0, 7.0].iter().enumerate() {
                     let x = base.x - 5.0 + i as f32 * 5.0;
@@ -1702,8 +2178,8 @@ impl App {
             .anchor(Align2::RIGHT_TOP, Vec2::new(-10.0, 32.0))
             .show(ctx, |ui| {
                 Frame::new()
-                    .fill(POPUP_BG)
-                    .stroke(Stroke::new(1.0, POPUP_STROKE))
+                    .fill(palette::popup_bg())
+                    .stroke(Stroke::new(1.0, palette::border()))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(Margin::symmetric(14, 12))
                     .shadow(egui::Shadow {
@@ -1715,10 +2191,10 @@ impl App {
                     .show(ui, |ui| {
                         let w = 240.0;
                         ui.set_min_width(w);
-                        ui.label(RichText::new(tr("Ресурсы", "Resources")).size(10.0).strong().color(TXT_DIM));
+                        ui.label(RichText::new(tr("Ресурсы", "Resources")).size(10.0).strong().color(palette::text_dim()));
                         ui.add_space(6.0);
                         let Some(st) = &self.stats else {
-                            ui.label(RichText::new(tr("измеряю...", "measuring...")).size(11.0).color(TXT_FAINT));
+                            ui.label(RichText::new(tr("измеряю...", "measuring...")).size(11.0).color(palette::text_faint()));
                             return;
                         };
                         let max_rss = st.procs.iter().map(|p| p.2).max().unwrap_or(1).max(1);
@@ -1733,14 +2209,14 @@ impl App {
                                 Align2::LEFT_TOP,
                                 truncate_end(name, 22),
                                 FontId::proportional(12.0),
-                                if i == 0 { TXT_DIM } else { TXT },
+                                if i == 0 { palette::text_dim() } else { palette::text() },
                             );
                             p.text(
                                 rect.right_top() + Vec2::new(0.0, 1.0),
                                 Align2::RIGHT_TOP,
                                 fmt_mem(*rss),
                                 FontId::monospace(11.5),
-                                TXT,
+                                palette::text(),
                             );
                             // Line 2: memory bar + cpu.
                             let bar_w = w - 52.0;
@@ -1749,7 +2225,7 @@ impl App {
                                 Pos2::new(rect.left(), by),
                                 Vec2::new(bar_w, 3.5),
                             );
-                            p.rect_filled(track, CornerRadius::same(2), Color32::from_rgb(0x2a, 0x2a, 0x2a));
+                            p.rect_filled(track, CornerRadius::same(2), palette::border_dim());
                             let frac = (*rss as f32 / max_rss as f32).clamp(0.02, 1.0);
                             let fill = Rect::from_min_size(
                                 track.min,
@@ -1766,7 +2242,7 @@ impl App {
                                 Align2::RIGHT_TOP,
                                 format!("{cpu:.0}% cpu"),
                                 FontId::proportional(9.5),
-                                if *cpu >= 50.0 { ORANGE } else { TXT_FAINT },
+                                if *cpu >= 50.0 { ORANGE } else { palette::text_faint() },
                             );
                             if i == 0 && st.procs.len() > 1 {
                                 ui.add_space(3.0);
@@ -1774,7 +2250,7 @@ impl App {
                                 ui.painter().hline(
                                     sep.left()..=sep.left() + w,
                                     sep.top(),
-                                    Stroke::new(1.0, Color32::from_rgb(0x2c, 0x2c, 0x2c)),
+                                    Stroke::new(1.0, palette::border_dim()),
                                 );
                                 ui.add_space(5.0);
                             }
@@ -1784,7 +2260,7 @@ impl App {
                         ui.painter().hline(
                             sep.left()..=sep.left() + w,
                             sep.top(),
-                            Stroke::new(1.0, Color32::from_rgb(0x2c, 0x2c, 0x2c)),
+                            Stroke::new(1.0, palette::border_dim()),
                         );
                         ui.add_space(5.0);
                         let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 14.0), Sense::hover());
@@ -1794,14 +2270,14 @@ impl App {
                             Align2::LEFT_TOP,
                             tr("всего", "total"),
                             FontId::proportional(10.5),
-                            TXT_FAINT,
+                            palette::text_faint(),
                         );
                         p.text(
                             rect.right_top(),
                             Align2::RIGHT_TOP,
                             fmt_mem(total),
                             FontId::monospace(11.5),
-                            TXT,
+                            palette::text(),
                         );
                     });
             });
@@ -1860,8 +2336,8 @@ impl App {
             .fixed_pos(chip.left_top() + Vec2::new(0.0, -8.0))
             .show(ctx, |ui| {
                 Frame::new()
-                    .fill(POPUP_BG)
-                    .stroke(Stroke::new(1.0, POPUP_STROKE))
+                    .fill(palette::popup_bg())
+                    .stroke(Stroke::new(1.0, palette::border()))
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::symmetric(10, 8))
                     .show(ui, |ui| {
@@ -1878,7 +2354,7 @@ impl App {
                         ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                             if self.dir_path.parent().is_some()
                                 && ui
-                                    .selectable_label(false, RichText::new(tr("..  (наверх)", "..  (up)")).size(12.0).color(TXT_DIM))
+                                    .selectable_label(false, RichText::new(tr("..  (наверх)", "..  (up)")).size(12.0).color(palette::text_dim()))
                                     .clicked()
                             {
                                 nav = Some(None);
@@ -1892,14 +2368,14 @@ impl App {
                                 }
                             }
                             if dirs.is_empty() {
-                                ui.label(RichText::new(tr("нет подпапок", "no subfolders")).size(11.0).color(TXT_FAINT));
+                                ui.label(RichText::new(tr("нет подпапок", "no subfolders")).size(11.0).color(palette::text_faint()));
                             }
                         });
                         ui.label(
                             RichText::new(truncate_head(&tilde(&self.dir_path), 52))
                                 .monospace()
                                 .size(9.5)
-                                .color(TXT_FAINT),
+                                .color(palette::text_faint()),
                         );
                     });
             });
@@ -1971,7 +2447,7 @@ impl App {
                         ui.label(
                             RichText::new(snap)
                                 .font(FontId::monospace(font_size - 1.0))
-                                .color(Color32::from_rgb(0x6a, 0x6a, 0x6a)),
+                                .color(palette::text_dim()),
                         );
                     });
                     ui.add_space(70.0);
@@ -1994,24 +2470,24 @@ impl App {
             .fixed_pos(card_pos)
             .show(ui.ctx(), |ui| {
                 Frame::new()
-                    .fill(Color32::from_rgb(0x1f, 0x1f, 0x1f))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(0x35, 0x35, 0x35)))
+                    .fill(palette::popup_bg())
+                    .stroke(Stroke::new(1.0, palette::border()))
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::symmetric(18, 14))
                     .show(ui, |ui| {
                         ui.set_min_width(300.0);
                         ui.vertical_centered(|ui| {
-                            ui.label(RichText::new(title).size(14.0).strong().color(TXT));
+                            ui.label(RichText::new(title).size(14.0).strong().color(palette::text()));
                             if !hint.is_empty() {
-                                ui.label(RichText::new(hint).size(11.0).color(TXT_DIM));
+                                ui.label(RichText::new(hint).size(11.0).color(palette::text_dim()));
                             }
-                            ui.label(RichText::new(tilde(&s.cwd)).size(11.0).color(TXT_DIM));
+                            ui.label(RichText::new(tilde(&s.cwd)).size(11.0).color(palette::text_dim()));
                             if let Some(cid) = &s.claude_session_id {
                                 ui.label(
                                     RichText::new(format!("claude: {}", short_id(cid)))
                                         .size(10.5)
                                         .monospace()
-                                        .color(TXT_FAINT),
+                                        .color(palette::text_faint()),
                                 );
                             }
                             if s.claude_session_id.is_some()
@@ -2038,7 +2514,7 @@ impl App {
                                 if ui.button(RichText::new(tr("Открыть терминал", "Open terminal")).size(12.5)).clicked() {
                                     acts.push(Act::OpenTerminal(s.id));
                                 }
-                                if ui.button(RichText::new(tr("Удалить", "Delete")).size(12.5).color(TXT_DIM)).clicked() {
+                                if ui.button(RichText::new(tr("Удалить", "Delete")).size(12.5).color(palette::text_dim())).clicked() {
                                     acts.push(Act::Remove(s.id));
                                 }
                             });
@@ -2055,8 +2531,8 @@ impl App {
         ui.painter().rect_filled(rect, 0.0, palette::term_bg());
         ui.vertical_centered(|ui| {
             ui.add_space(rect.height() * 0.35);
-            ui.label(RichText::new("kip").size(22.0).color(TXT_DIM));
-            ui.label(RichText::new(tr("Нет открытых сессий", "No open sessions")).size(12.5).color(TXT_FAINT));
+            ui.label(RichText::new("kip").size(22.0).color(palette::text_dim()));
+            ui.label(RichText::new(tr("Нет открытых сессий", "No open sessions")).size(12.5).color(palette::text_faint()));
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 ui.add_space(rect.width() / 2.0 - 130.0);
@@ -2253,7 +2729,7 @@ impl App {
                     ui.label(
                         RichText::new(format!("{} {}", tr("Версия", "Version"), update::current_label()))
                             .size(11.5)
-                            .color(TXT_DIM),
+                            .color(palette::text_dim()),
                     );
                     if ui
                         .add_enabled(
@@ -2267,11 +2743,11 @@ impl App {
                 });
                 match &self.update_state {
                     UpdateState::Checking => {
-                        ui.label(RichText::new(tr("проверяю...", "checking...")).size(10.5).color(TXT_FAINT));
+                        ui.label(RichText::new(tr("проверяю...", "checking...")).size(10.5).color(palette::text_faint()));
                     },
                     UpdateState::UpToDate => {
                         ui.label(
-                            RichText::new(tr("установлена последняя версия", "you're on the latest version")).size(10.5).color(TXT_FAINT),
+                            RichText::new(tr("установлена последняя версия", "you're on the latest version")).size(10.5).color(palette::text_faint()),
                         );
                     },
                     UpdateState::Working => {
@@ -2396,7 +2872,7 @@ impl eframe::App for App {
                 Align2::CENTER_CENTER,
                 tr("Отпусти - вставлю путь к файлу", "Drop to insert the file path"),
                 FontId::proportional(15.0),
-                TXT,
+                palette::text(),
             );
         }
         self.housekeeping(&ctx);
@@ -2493,22 +2969,24 @@ fn rgb32([r, g, b]: [u8; 3]) -> Color32 {
 }
 
 fn apply_style(ctx: &egui::Context) {
-    let mut v = Visuals::dark();
+    // Start from egui's matching base so its many internal defaults (widget
+    // text, combobox, sliders) are sane for the mode, then override chrome.
+    let mut v = if palette::light() { Visuals::light() } else { Visuals::dark() };
     v.panel_fill = palette::chrome_sidebar();
-    v.window_fill = Color32::from_rgb(0x20, 0x20, 0x20);
-    v.extreme_bg_color = Color32::from_rgb(0x14, 0x14, 0x14);
+    v.window_fill = palette::surface();
+    v.extreme_bg_color = palette::field_bg();
     v.override_text_color = None;
     v.selection.bg_fill = palette::selection();
-    v.widgets.noninteractive.fg_stroke.color = TXT;
-    v.widgets.inactive.bg_fill = Color32::from_rgb(0x26, 0x26, 0x26);
-    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0x26, 0x26, 0x26);
-    v.widgets.inactive.fg_stroke.color = TXT;
-    v.widgets.hovered.bg_fill = Color32::from_rgb(0x30, 0x30, 0x30);
-    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x30, 0x30, 0x30);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x45, 0x45, 0x45));
-    v.widgets.active.bg_fill = Color32::from_rgb(0x3a, 0x3a, 0x3a);
-    v.widgets.active.weak_bg_fill = Color32::from_rgb(0x3a, 0x3a, 0x3a);
-    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(0x38, 0x38, 0x38));
+    v.widgets.noninteractive.fg_stroke.color = palette::text();
+    v.widgets.inactive.bg_fill = palette::ui_bg();
+    v.widgets.inactive.weak_bg_fill = palette::ui_bg();
+    v.widgets.inactive.fg_stroke.color = palette::text();
+    v.widgets.hovered.bg_fill = palette::ui_bg_hover();
+    v.widgets.hovered.weak_bg_fill = palette::ui_bg_hover();
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, palette::ui_stroke_hover());
+    v.widgets.active.bg_fill = palette::ui_bg_active();
+    v.widgets.active.weak_bg_fill = palette::ui_bg_active();
+    v.window_stroke = Stroke::new(1.0, palette::border());
     for w in [
         &mut v.widgets.noninteractive,
         &mut v.widgets.inactive,
@@ -2588,6 +3066,25 @@ fn load_shell_history() -> Vec<String> {
     out
 }
 
+
+/// Group collapse caret: points right when collapsed, down when open.
+fn draw_caret(p: &egui::Painter, c: Pos2, collapsed: bool, color: Color32) {
+    let r = 3.2;
+    let pts = if collapsed {
+        vec![
+            Pos2::new(c.x - r * 0.5, c.y - r),
+            Pos2::new(c.x + r * 0.7, c.y),
+            Pos2::new(c.x - r * 0.5, c.y + r),
+        ]
+    } else {
+        vec![
+            Pos2::new(c.x - r, c.y - r * 0.5),
+            Pos2::new(c.x + r, c.y - r * 0.5),
+            Pos2::new(c.x, c.y + r * 0.7),
+        ]
+    };
+    p.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+}
 
 /// Claude marker: an 8-ray star drawn with four crossing lines.
 fn draw_star(p: &egui::Painter, c: Pos2, r: f32, color: Color32) {

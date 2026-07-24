@@ -42,6 +42,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     let mut info =
         GridInfo { cols, rows, cell_w, cell_h, had_input: false, interacted: false, grown: false };
 
+    let fg_is_claude = session.fg_is_claude;
     let crate::session::Phase::Live(live) = &mut session.phase else {
         return info;
     };
@@ -113,7 +114,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                     } else {
                         key
                     };
-                    if let Some(bytes) = encode_key(key, modifiers, mode) {
+                    if let Some(bytes) = encode_key(key, modifiers, mode, fg_is_claude) {
                         out.extend_from_slice(&bytes);
                     }
                 },
@@ -390,13 +391,19 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     // instead of an arrow glyph - not every font ships one and it showed as a
     // tofu box. Keep UI text ASCII-only for the same reason.
     if display_offset > 0 {
+        // Contrast against the terminal bg, which is light for light themes.
+        let (ink, edge) = if palette::light() {
+            (Color32::from_gray(110), Color32::from_gray(150))
+        } else {
+            (Color32::from_gray(160), Color32::from_gray(70))
+        };
         let label = format!("{display_offset}");
         let gr = painter.text(
             Pos2::new(rect.right() - 12.0, rect.top() + 46.0),
             Align2::RIGHT_TOP,
             &label,
             FontId::proportional(11.0),
-            Color32::from_gray(160),
+            ink,
         );
         let cy = gr.center().y;
         let tx = gr.left() - 7.0;
@@ -406,7 +413,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                 Pos2::new(tx - 4.0, cy + 3.0),
                 Pos2::new(tx + 4.0, cy + 3.0),
             ],
-            Color32::from_gray(160),
+            ink,
             Stroke::NONE,
         ));
         let mut box_ = gr;
@@ -414,7 +421,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         painter.rect_stroke(
             box_.expand(4.0),
             CornerRadius::same(4),
-            Stroke::new(1.0, Color32::from_gray(70)),
+            Stroke::new(1.0, edge),
             StrokeKind::Outside,
         );
     }
@@ -506,7 +513,7 @@ fn key_letter(key: Key) -> Option<u8> {
     })
 }
 
-fn encode_key(key: Key, mods: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
+fn encode_key(key: Key, mods: Modifiers, mode: TermMode, claude: bool) -> Option<Vec<u8>> {
     if mods.command {
         return None; // App-level shortcuts.
     }
@@ -543,9 +550,14 @@ fn encode_key(key: Key, mods: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
 
     let seq = match key {
         Key::Enter => {
+            // Shift+Enter must reach claude as ESC+CR (Meta+Enter) so it inserts a
+            // newline instead of submitting - claude does not push kitty flags and
+            // ignores the CSI-u form, so plain \r is indistinguishable from Enter.
+            // This is exactly what claude's own /terminal-setup writes for the
+            // Alacritty backend this terminal is built on (chars = ESC CR).
             if kitty && has_mods {
                 format!("\x1b[13;{m}u").into_bytes()
-            } else if mods.alt {
+            } else if mods.alt || (claude && mods.shift) {
                 b"\x1b\r".to_vec()
             } else {
                 b"\r".to_vec()

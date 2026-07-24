@@ -80,6 +80,10 @@ pub struct Session {
     pub title: String,
     /// Session name from Claude Code (~/.claude/sessions metadata).
     pub claude_title: Option<String>,
+    /// User-set name (double-click rename). Overrides claude_title and dir name.
+    pub custom_name: Option<String>,
+    /// Manual group (None = ungrouped). Reorder/move-between via drag & drop.
+    pub group: Option<String>,
     pub last_activity: Instant,
     pub spawned_at: SystemTime,
     pub claude_session_id: Option<String>,
@@ -123,9 +127,12 @@ impl Session {
             .unwrap_or_else(|| self.cwd.to_string_lossy().into_owned())
     }
 
-    /// Claude's session name when known, directory name otherwise.
+    /// User name if set, else Claude's session name, else the directory name.
     pub fn display_name(&self) -> String {
-        self.claude_title.clone().unwrap_or_else(|| self.name())
+        self.custom_name
+            .clone()
+            .or_else(|| self.claude_title.clone())
+            .unwrap_or_else(|| self.name())
     }
 
     pub fn live(&self) -> Option<&LiveTerm> {
@@ -196,6 +203,8 @@ impl Session {
             cwd: self.cwd.clone(),
             claude_session_id: self.claude_session_id.clone(),
             claude_title: self.claude_title.clone(),
+            custom_name: self.custom_name.clone(),
+            group: self.group.clone(),
             skip_permissions: self.skip_permissions,
             keep_awake: self.keep_awake,
             snapshot: snapshot.map(|mut s| {
@@ -216,6 +225,8 @@ impl Session {
             phase: Phase::Suspended,
             title: String::new(),
             claude_title: saved.claude_title,
+            custom_name: saved.custom_name,
+            group: saved.group,
             last_activity: Instant::now(),
             spawned_at: SystemTime::now(),
             claude_session_id: saved.claude_session_id,

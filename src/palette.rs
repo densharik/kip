@@ -50,7 +50,7 @@ const TOMORROW: Theme = Theme {
     ],
 };
 
-pub const PRESETS: [Preset; 6] = [
+pub const PRESETS: [Preset; 9] = [
     Preset { key: "tomorrow", label: "Tomorrow Night", theme: TOMORROW },
     Preset {
         key: "gruvbox",
@@ -132,6 +132,57 @@ pub const PRESETS: [Preset; 6] = [
             ],
         },
     },
+    // Two balanced light themes. luma(bg) > 140 flips the whole window (chrome,
+    // text, popups) to a light shell - see light()/adjust_bg below.
+    Preset {
+        key: "solarized-light",
+        label: "Solarized Light",
+        theme: Theme {
+            bg: c(0xfd, 0xf6, 0xe3),
+            fg: c(0x65, 0x7b, 0x83),
+            cursor: c(0x58, 0x6e, 0x75),
+            selection: c(0xe4, 0xdc, 0xc0),
+            ansi: [
+                c(0x07, 0x36, 0x42), c(0xdc, 0x32, 0x2f), c(0x85, 0x99, 0x00), c(0xb5, 0x89, 0x00),
+                c(0x26, 0x8b, 0xd2), c(0xd3, 0x36, 0x82), c(0x2a, 0xa1, 0x98), c(0xee, 0xe8, 0xd5),
+                c(0x00, 0x2b, 0x36), c(0xcb, 0x4b, 0x16), c(0x58, 0x6e, 0x75), c(0x65, 0x7b, 0x83),
+                c(0x83, 0x94, 0x96), c(0x6c, 0x71, 0xc4), c(0x93, 0xa1, 0xa1), c(0xfd, 0xf6, 0xe3),
+            ],
+        },
+    },
+    Preset {
+        key: "github-light",
+        label: "GitHub Light",
+        theme: Theme {
+            bg: c(0xff, 0xff, 0xff),
+            fg: c(0x24, 0x29, 0x2e),
+            cursor: c(0x24, 0x29, 0x2e),
+            selection: c(0xc8, 0xe1, 0xff),
+            ansi: [
+                c(0x24, 0x29, 0x2e), c(0xd7, 0x3a, 0x49), c(0x22, 0x86, 0x3a), c(0xb0, 0x88, 0x00),
+                c(0x03, 0x66, 0xd6), c(0x6f, 0x42, 0xc1), c(0x1b, 0x7c, 0x83), c(0x6a, 0x73, 0x7d),
+                c(0x95, 0x9d, 0xa5), c(0xcb, 0x24, 0x31), c(0x28, 0xa7, 0x45), c(0xda, 0xb0, 0x09),
+                c(0x21, 0x88, 0xff), c(0x8a, 0x63, 0xd2), c(0x31, 0x92, 0xaa), c(0xd1, 0xd5, 0xda),
+            ],
+        },
+    },
+    // Ultra-contrast dark: pure black, bright saturated ANSI.
+    Preset {
+        key: "highcontrast",
+        label: "High Contrast",
+        theme: Theme {
+            bg: c(0x00, 0x00, 0x00),
+            fg: c(0xff, 0xff, 0xff),
+            cursor: c(0xff, 0xff, 0xff),
+            selection: c(0x00, 0x5f, 0xc0),
+            ansi: [
+                c(0x00, 0x00, 0x00), c(0xff, 0x2b, 0x2b), c(0x00, 0xd7, 0x00), c(0xff, 0xd7, 0x00),
+                c(0x1e, 0x90, 0xff), c(0xff, 0x2b, 0xff), c(0x00, 0xd7, 0xd7), c(0xff, 0xff, 0xff),
+                c(0x55, 0x55, 0x55), c(0xff, 0x55, 0x55), c(0x55, 0xff, 0x55), c(0xff, 0xff, 0x55),
+                c(0x55, 0xaa, 0xff), c(0xff, 0x55, 0xff), c(0x55, 0xff, 0xff), c(0xff, 0xff, 0xff),
+            ],
+        },
+    },
 ];
 
 static ACTIVE: RwLock<Theme> = RwLock::new(TOMORROW);
@@ -174,14 +225,104 @@ fn lighten(col: Color32, d: u8) -> Color32 {
     )
 }
 
+fn darken(col: Color32, d: u8) -> Color32 {
+    Color32::from_rgb(
+        col.r().saturating_sub(d),
+        col.g().saturating_sub(d),
+        col.b().saturating_sub(d),
+    )
+}
+
+fn is_light(col: Color32) -> bool {
+    (col.r() as u32 * 299 + col.g() as u32 * 587 + col.b() as u32 * 114) / 1000 > 140
+}
+
+/// Whether the active theme is a light one - the whole chrome flips on this.
+pub fn light() -> bool {
+    is_light(term_bg())
+}
+
+// Chrome tokens. Every one returns the exact original dark literal when the
+// theme is dark (so dark themes are byte-identical to before) and a light
+// counterpart when the background is light.
+fn tok(dark: Color32, light_c: Color32) -> Color32 {
+    if light() { light_c } else { dark }
+}
+
+pub fn text() -> Color32 {
+    tok(c(0xc4, 0xc4, 0xc4), c(0x2b, 0x2b, 0x2b))
+}
+pub fn text_dim() -> Color32 {
+    tok(c(0x7a, 0x7a, 0x7a), c(0x5f, 0x5f, 0x5f))
+}
+pub fn text_faint() -> Color32 {
+    tok(c(0x5a, 0x5a, 0x5a), c(0x90, 0x90, 0x90))
+}
+pub fn text_strong() -> Color32 {
+    tok(c(0xde, 0xde, 0xde), c(0x14, 0x14, 0x14))
+}
+
 /// App chrome derived from the terminal background so the whole window follows
-/// the theme. The offsets reproduce the original 0x19 / 0x1c on the 0x14 base.
+/// the theme. Dark: lighten by 5/8 (original 0x19 / 0x1c on the 0x14 base).
+/// Light: darken instead, so the shell is a touch below the terminal bg.
 pub fn chrome_sidebar() -> Color32 {
-    lighten(term_bg(), 5)
+    let b = term_bg();
+    if is_light(b) { darken(b, 10) } else { lighten(b, 5) }
 }
 
 pub fn chrome_bar() -> Color32 {
-    lighten(term_bg(), 8)
+    let b = term_bg();
+    if is_light(b) { darken(b, 18) } else { lighten(b, 8) }
+}
+
+/// Window/base fill (settings window, chip inactive bg).
+pub fn surface() -> Color32 {
+    tok(c(0x20, 0x20, 0x20), c(0xf1, 0xf1, 0xf1))
+}
+/// Raised chip / active-control fill.
+pub fn surface_hi() -> Color32 {
+    tok(c(0x2c, 0x2c, 0x2c), c(0xe1, 0xe1, 0xe1))
+}
+/// Floating popups and cards (history, dir, stats, frozen card).
+pub fn popup_bg() -> Color32 {
+    tok(c(0x1f, 0x1f, 0x1f), c(0xff, 0xff, 0xff))
+}
+/// Text-edit / extreme background.
+pub fn field_bg() -> Color32 {
+    tok(c(0x14, 0x14, 0x14), c(0xff, 0xff, 0xff))
+}
+/// Selected session row.
+pub fn row_sel_bg() -> Color32 {
+    tok(c(0x24, 0x24, 0x24), c(0xdf, 0xe3, 0xea))
+}
+/// Hovered session row.
+pub fn row_hover_bg() -> Color32 {
+    tok(c(0x1f, 0x1f, 0x1f), c(0xec, 0xec, 0xec))
+}
+/// Left accent strip on the selected row.
+pub fn accent_bar() -> Color32 {
+    tok(c(0x9a, 0x9a, 0x9a), c(0x70, 0x70, 0x70))
+}
+/// Standard border/stroke.
+pub fn border() -> Color32 {
+    tok(c(0x35, 0x35, 0x35), c(0xd2, 0xd2, 0xd2))
+}
+/// Dim separators / tracks (scrollbar track, hairline separators).
+pub fn border_dim() -> Color32 {
+    tok(c(0x2a, 0x2a, 0x2a), c(0xe4, 0xe4, 0xe4))
+}
+// Interactive widget fills for apply_style.
+pub fn ui_bg() -> Color32 {
+    tok(c(0x26, 0x26, 0x26), c(0xe8, 0xe8, 0xe8))
+}
+pub fn ui_bg_hover() -> Color32 {
+    tok(c(0x30, 0x30, 0x30), c(0xdc, 0xdc, 0xdc))
+}
+pub fn ui_bg_active() -> Color32 {
+    tok(c(0x3a, 0x3a, 0x3a), c(0xd0, 0xd0, 0xd0))
+}
+pub fn ui_stroke_hover() -> Color32 {
+    tok(c(0x45, 0x45, 0x45), c(0xbc, 0xbc, 0xbc))
 }
 
 fn indexed(idx: u8, th: &Theme) -> Color32 {

@@ -58,6 +58,10 @@ pub struct SavedSession {
     pub cwd: PathBuf,
     pub claude_session_id: Option<String>,
     pub claude_title: Option<String>,
+    /// User-set name (double-click on the session title). Wins over claude_title.
+    pub custom_name: Option<String>,
+    /// Manual group this session belongs to (None = ungrouped, shown at the top).
+    pub group: Option<String>,
     pub skip_permissions: bool,
     pub keep_awake: bool,
     pub snapshot: Option<String>,
@@ -69,6 +73,8 @@ impl Default for SavedSession {
             cwd: dirs::home_dir().unwrap_or_else(|| "/".into()),
             claude_session_id: None,
             claude_title: None,
+            custom_name: None,
+            group: None,
             skip_permissions: true,
             keep_awake: false,
             snapshot: None,
@@ -81,6 +87,8 @@ impl Default for SavedSession {
 pub struct AppState {
     pub settings: Settings,
     pub sessions: Vec<SavedSession>,
+    /// Names of collapsed session groups (persisted across restarts).
+    pub collapsed_groups: Vec<String>,
 }
 
 fn state_path() -> PathBuf {
