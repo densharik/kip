@@ -42,6 +42,15 @@ fn from_locale(s: &str) -> Lang {
 }
 
 fn detect() -> Lang {
+    // Detection shells out to `defaults` on macOS, which blocks the caller.
+    // Cache it so re-resolving "auto" (e.g. picking Auto in the language combo,
+    // which runs in the UI event loop) never blocks again.
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Lang> = OnceLock::new();
+    *CACHED.get_or_init(detect_uncached)
+}
+
+fn detect_uncached() -> Lang {
     // macOS GUI apps often have no LANG set, so ask the system locale directly.
     #[cfg(target_os = "macos")]
     if let Ok(out) = std::process::Command::new("defaults")
