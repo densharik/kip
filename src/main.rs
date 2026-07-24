@@ -92,11 +92,9 @@ enum Act {
     NewSame,
     NewPick,
     Suspend(u64),
-    /// bool = resume the saved Claude session (vs plain shell).
+    /// bool = resume the saved Claude session (vs plain shell). Either way the
+    /// same session is revived in place - no new tab.
     Resume(u64, bool),
-    /// Open a fresh plain terminal in this session's directory, leaving the
-    /// session (and its snapshot history) untouched.
-    OpenTerminal(u64),
     /// Cmd+W: suspend a live session, remove a frozen one.
     Close(u64),
     /// X button / "Удалить": always removes, killing a live session.
@@ -110,6 +108,9 @@ enum Act {
     /// Move a session: set its group and drop it before `before` (None = end of
     /// that group's run). Backs both drag & drop and the context-menu group menu.
     MoveSession { id: u64, group: Option<String>, before: Option<u64> },
+    /// Reorder a whole group before `before` group (None = last), by moving its
+    /// contiguous block of sessions.
+    MoveGroup { name: String, before: Option<String> },
     /// Put a session into a fresh group and immediately rename that group.
     NewGroup(u64),
     ToggleGroup(String),
@@ -179,6 +180,8 @@ struct App {
     rename_focus: bool,
     /// Session id being dragged in the sidebar (reorder / move between groups).
     dragging: Option<u64>,
+    /// Group whose header is being dragged (reorder groups among themselves).
+    dragging_group: Option<String>,
     /// Collapsed group names.
     collapsed_groups: HashSet<String>,
     /// Command editor pinned under the terminal.
@@ -268,6 +271,7 @@ impl App {
             rename_buf: String::new(),
             rename_focus: false,
             dragging: None,
+            dragging_group: None,
             collapsed_groups: state.collapsed_groups.into_iter().collect(),
             cmd_input: String::new(),
             hist_query: String::new(),
@@ -515,6 +519,81 @@ impl App {
         self.persist();
     }
 
+    /// Move a whole group's contiguous block of sessions before `before`'s block
+    /// (None = after all groups).
+    fn move_group(&mut self, name: String, before: Option<String>) {
+        if before.as_deref() == Some(name.as_str()) {
+            return;
+        }
+        let mut block = Vec::new();
+        let mut rest = Vec::new();
+        for s in self.sessions.drain(..) {
+            if s.group.as_deref() == Some(name.as_str()) {
+                block.push(s);
+            } else {
+                rest.push(s);
+            }
+        }
+        self.sessions = rest;
+        if block.is_empty() {
+            return;
+        }
+        let at = match before {
+            Some(h) => self
+                .sessions
+                .iter()
+                .position(|s| s.group.as_deref() == Some(h.as_str()))
+                .unwrap_or(self.sessions.len()),
+            None => self.sessions.len(),
+        };
+        for (k, s) in block.into_iter().enumerate() {
+            self.sessions.insert(at + k, s);
+        }
+        self.persist();
+    }
+
+    /// Where a dragged group would land: the group to insert before (None = end).
+    /// Groups are treated as blocks spanning from their header to the last member.
+    fn resolve_group_drop(&self, items: &[DropItem], py: f32) -> Option<(Option<String>, f32)> {
+        let mut blocks: Vec<(String, f32, f32)> = Vec::new();
+        let mut i = 0;
+        while i < items.len() {
+            if items[i].is_header {
+                let name = items[i].group.clone()?;
+                let top = items[i].rect.top();
+                let mut bottom = items[i].rect.bottom();
+                let mut j = i + 1;
+                while j < items.len() && !items[j].is_header {
+                    bottom = items[j].rect.bottom();
+                    j += 1;
+                }
+                blocks.push((name, top, bottom));
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        let first = blocks.first()?;
+        if py < first.1 {
+            return Some((Some(first.0.clone()), first.1));
+        }
+        let last = blocks.last()?;
+        if py > last.2 {
+            return Some((None, last.2));
+        }
+        for (k, (_, top, bottom)) in blocks.iter().enumerate() {
+            if py >= *top && py <= *bottom {
+                return if py < (top + bottom) / 2.0 {
+                    Some((Some(blocks[k].0.clone()), *top))
+                } else {
+                    let next = blocks.get(k + 1).map(|b| b.0.clone());
+                    Some((next, *bottom))
+                };
+            }
+        }
+        Some((None, last.2))
+    }
+
     fn unique_group_name(&self) -> String {
         let base = tr("Группа", "Group");
         let taken: HashSet<&str> = self.sessions.iter().filter_map(|s| s.group.as_deref()).collect();
@@ -704,15 +783,6 @@ impl App {
                     self.resume(id, with_claude, ctx);
                     self.persist();
                 },
-                Act::OpenTerminal(id) => {
-                    // Keep the session suspended so its Claude history is not lost;
-                    // just open a new plain terminal in the same directory.
-                    if let Some(idx) = self.idx_of(id) {
-                        let cwd = self.sessions[idx].cwd.clone();
-                        self.spawn(cwd, None, ctx);
-                        self.persist();
-                    }
-                },
                 Act::Close(id) => {
                     if let Some(idx) = self.idx_of(id) {
                         // Guards against reflexive Cmd+W killing a working agent.
@@ -760,6 +830,7 @@ impl App {
                     self.renaming_group = None;
                 },
                 Act::MoveSession { id, group, before } => self.move_session(id, group, before),
+                Act::MoveGroup { name, before } => self.move_group(name, before),
                 Act::NewGroup(id) => {
                     let name = self.unique_group_name();
                     self.move_session(id, Some(name.clone()), None);
@@ -1279,12 +1350,14 @@ impl App {
 
         let mut items: Vec<DropItem> = Vec::new();
         let mut released = false;
+        let mut group_released = false;
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for slot in self.sidebar_order() {
                 match slot {
                     Slot::Header(name) => {
                         let collapsed = self.collapsed_groups.contains(&name);
-                        let rect = self.group_header(ui, &name, collapsed, &mut acts);
+                        let (rect, rel) = self.group_header(ui, &name, collapsed, &mut acts);
+                        group_released |= rel;
                         items.push(DropItem { rect, id: None, group: Some(name), is_header: true });
                     },
                     Slot::Row(id) => {
@@ -1294,7 +1367,9 @@ impl App {
                         if group.as_ref().is_some_and(|g| self.collapsed_groups.contains(g)) {
                             continue;
                         }
-                        let (rect, rel) = self.session_row(ui, idx, &mut acts);
+                        // Members sit indented under their header.
+                        let indent = if group.is_some() { 14.0 } else { 0.0 };
+                        let (rect, rel) = self.session_row(ui, idx, indent, &mut acts);
                         released |= rel;
                         items.push(DropItem { rect, id: Some(id), group, is_header: false });
                     },
@@ -1304,8 +1379,8 @@ impl App {
         });
 
         // Drag overlay: insertion marker every frame, the move on release.
+        let py = ui.input(|i| i.pointer.interact_pos()).map(|p| p.y);
         if let Some(drag) = self.dragging {
-            let py = ui.input(|i| i.pointer.interact_pos()).map(|p| p.y);
             if let Some(tgt) = py.and_then(|py| self.resolve_drop(&items, py)) {
                 let x = ui.max_rect().x_range();
                 ui.painter().hline(x, tgt.line_y, Stroke::new(2.0, palette::accent_bar()));
@@ -1314,9 +1389,21 @@ impl App {
                 }
             }
             ui.ctx().request_repaint();
+        } else if let Some(name) = self.dragging_group.clone() {
+            if let Some((before, line_y)) = py.and_then(|py| self.resolve_group_drop(&items, py)) {
+                let x = ui.max_rect().x_range();
+                ui.painter().hline(x, line_y, Stroke::new(2.0, palette::group_accent()));
+                if group_released {
+                    acts.push(Act::MoveGroup { name, before });
+                }
+            }
+            ui.ctx().request_repaint();
         }
         if released {
             self.dragging = None;
+        }
+        if group_released {
+            self.dragging_group = None;
         }
         acts
     }
@@ -1347,32 +1434,51 @@ impl App {
         out
     }
 
-    /// A group header: collapse triangle, name, member count. Returns its rect
-    /// (a drop target). Click toggles collapse, double-click renames.
-    fn group_header(&mut self, ui: &mut egui::Ui, name: &str, collapsed: bool, acts: &mut Vec<Act>) -> Rect {
+    /// A group header: colored band, collapse triangle, name, member count.
+    /// Returns its rect (a drop target) and whether a group drag ended on it.
+    /// Click toggles collapse, double-click renames, drag reorders groups.
+    fn group_header(&mut self, ui: &mut egui::Ui, name: &str, collapsed: bool, acts: &mut Vec<Act>) -> (Rect, bool) {
         let editing = self.renaming_group.as_deref() == Some(name);
+        let is_dragging = self.dragging_group.as_deref() == Some(name);
         let count = self.sessions.iter().filter(|s| s.group.as_deref() == Some(name)).count();
+        // A touch of top space so each group reads as a new section.
+        ui.add_space(4.0);
         let (rect, resp) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::click());
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::click_and_drag());
         if !ui.is_rect_visible(rect) {
-            return rect;
+            return (rect, false);
         }
+        let drag_started = !editing && resp.drag_started();
+        let released = is_dragging && resp.drag_stopped();
         let hovered = ui.rect_contains_pointer(rect);
         let painter = ui.painter();
-        let tri_c = Pos2::new(rect.min.x + 14.0, rect.center().y);
-        let tri_col = if hovered { palette::text() } else { palette::text_dim() };
-        draw_caret(painter, tri_c, collapsed, tri_col);
+
+        // Tinted band + a colored left edge so the header stands out and does
+        // not merge into the sidebar on either theme.
+        let band = Rect::from_min_max(
+            Pos2::new(rect.min.x + 4.0, rect.min.y + 1.0),
+            Pos2::new(rect.max.x - 6.0, rect.max.y - 1.0),
+        );
+        painter.rect_filled(band, CornerRadius::same(5), palette::group_header_bg());
+        painter.rect_filled(
+            Rect::from_min_size(band.min + Vec2::new(0.0, 2.0), Vec2::new(2.5, band.height() - 4.0)),
+            CornerRadius::same(2),
+            palette::group_accent(),
+        );
+
+        let tri_c = Pos2::new(rect.min.x + 16.0, rect.center().y);
+        draw_caret(painter, tri_c, collapsed, palette::group_accent());
         if !editing {
             painter.text(
-                Pos2::new(rect.min.x + 26.0, rect.center().y),
+                Pos2::new(rect.min.x + 27.0, rect.center().y),
                 Align2::LEFT_CENTER,
-                truncate_end(name, 22),
-                FontId::proportional(11.0),
-                palette::text_dim(),
+                truncate_end(name, 20),
+                FontId::proportional(11.5),
+                if hovered { palette::text_strong() } else { palette::text() },
             );
         }
         painter.text(
-            Pos2::new(rect.max.x - 12.0, rect.center().y),
+            Pos2::new(rect.max.x - 14.0, rect.center().y),
             Align2::RIGHT_CENTER,
             format!("{count}"),
             FontId::proportional(10.0),
@@ -1421,11 +1527,15 @@ impl App {
                 acts.push(Act::RenameGroupCommit(name.to_string()));
             }
         }
-        rect
+        if drag_started {
+            self.dragging_group = Some(name.to_string());
+        }
+        (rect, released)
     }
 
-    /// Returns the row rect (a drag drop target) and whether a drag ended on it.
-    fn session_row(&mut self, ui: &mut egui::Ui, idx: usize, acts: &mut Vec<Act>) -> (Rect, bool) {
+    /// Draws one session row indented by `indent`. Returns the row rect (a drop
+    /// target) and whether a drag ended on it.
+    fn session_row(&mut self, ui: &mut egui::Ui, idx: usize, indent: f32, acts: &mut Vec<Act>) -> (Rect, bool) {
         let id = self.sessions[idx].id;
         let renaming = self.renaming == Some(id);
         let is_dragging = self.dragging == Some(id);
@@ -1437,6 +1547,8 @@ impl App {
         if !ui.is_rect_visible(rect) {
             return (rect, false);
         }
+        // Left origin for indented content (dot, name, path).
+        let x0 = rect.min.x + indent;
         let drag_started = !renaming && resp.drag_started();
         let released = is_dragging && resp.drag_stopped();
         // Geometric hover: overlapping child widgets (close button, ctx corner)
@@ -1447,7 +1559,7 @@ impl App {
         if selected {
             painter.rect_filled(rect, 0.0, palette::row_sel_bg());
             painter.rect_filled(
-                Rect::from_min_size(rect.min, Vec2::new(2.0, row_h)),
+                Rect::from_min_size(Pos2::new(x0, rect.min.y), Vec2::new(2.0, row_h)),
                 0.0,
                 palette::accent_bar(),
             );
@@ -1465,7 +1577,7 @@ impl App {
 
         // Status: green = working (recent output), orange = waiting for input,
         // red = exited with error. A star instead of a dot means claude is running.
-        let dot = Pos2::new(rect.min.x + 16.0, rect.center().y);
+        let dot = Pos2::new(x0 + 16.0, rect.center().y);
         let is_claude = s.fg_is_claude;
         match &s.phase {
             Phase::Live(_) if s.busy => {
@@ -1492,7 +1604,7 @@ impl App {
         // Context badge: pill with the session's context %, top-right.
         // No index entry = no badge (never a fake 0%).
         let ctx_entry = s.claude_session_id.as_deref().and_then(|sid| self.ctx_index.get(sid));
-        let mut name_max = 26;
+        let mut name_max: usize = 26;
         if let Some(e) = ctx_entry {
             let pct = e.pct.clamp(1.0, 100.0);
             let lt = palette::light();
@@ -1539,7 +1651,12 @@ impl App {
             name_max = 21;
         }
 
-        let text_x = rect.min.x + 28.0;
+        let text_x = x0 + 28.0;
+        // Indented rows have less room before the badge/close button.
+        if indent > 0.0 {
+            name_max = name_max.saturating_sub(2);
+        }
+        let path_len = if indent > 0.0 { 30 } else { 34 };
         let name_color = if selected { palette::text_strong() } else { palette::text() };
         // The name is replaced by an inline editor while renaming (drawn below).
         if !renaming {
@@ -1554,7 +1671,7 @@ impl App {
         painter.text(
             Pos2::new(text_x, rect.center().y + 8.0),
             Align2::LEFT_CENTER,
-            truncate_head(&tilde(&s.cwd), 34),
+            truncate_head(&tilde(&s.cwd), path_len),
             FontId::proportional(10.5),
             palette::text_faint(),
         );
@@ -1649,8 +1766,8 @@ impl App {
                         acts.push(Act::Resume(s.id, true));
                         ui.close();
                     }
-                    if ui.button(tr("Открыть терминал", "Open terminal")).clicked() {
-                        acts.push(Act::OpenTerminal(s.id));
+                    if ui.button(tr("Продолжить в терминале", "Continue in terminal")).clicked() {
+                        acts.push(Act::Resume(s.id, false));
                         ui.close();
                     }
                     if ui.button(tr("Удалить", "Delete")).clicked() {
@@ -2511,8 +2628,8 @@ impl App {
                                         acts.push(Act::Resume(s.id, true));
                                     }
                                 }
-                                if ui.button(RichText::new(tr("Открыть терминал", "Open terminal")).size(12.5)).clicked() {
-                                    acts.push(Act::OpenTerminal(s.id));
+                                if ui.button(RichText::new(tr("Продолжить в терминале", "Continue in terminal")).size(12.5)).clicked() {
+                                    acts.push(Act::Resume(s.id, false));
                                 }
                                 if ui.button(RichText::new(tr("Удалить", "Delete")).size(12.5).color(palette::text_dim())).clicked() {
                                     acts.push(Act::Remove(s.id));

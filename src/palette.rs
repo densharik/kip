@@ -303,6 +303,15 @@ pub fn row_hover_bg() -> Color32 {
 pub fn accent_bar() -> Color32 {
     tok(c(0x9a, 0x9a, 0x9a), c(0x70, 0x70, 0x70))
 }
+/// Group header band: subtly raised and faintly tinted so it does not merge
+/// into the sidebar on either theme.
+pub fn group_header_bg() -> Color32 {
+    tok(c(0x26, 0x28, 0x2f), c(0xe3, 0xe7, 0xef))
+}
+/// A hint of color on the group header (caret + edge), any theme.
+pub fn group_accent() -> Color32 {
+    tok(c(0x82, 0x9f, 0xc6), c(0x4a, 0x6d, 0xa6))
+}
 /// Standard border/stroke.
 pub fn border() -> Color32 {
     tok(c(0x35, 0x35, 0x35), c(0xd2, 0xd2, 0xd2))
