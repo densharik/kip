@@ -33,7 +33,10 @@ pub fn current_label() -> String {
 /// Parse "v0.1.17" / "0.1.17" into a comparable tuple.
 fn parse_ver(s: &str) -> (u32, u32, u32) {
     let mut p = s.trim().trim_start_matches('v').split('.').map(|x| {
-        x.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u32>().unwrap_or(0)
+        // Parse as u64 then saturate: an oversized component clamps to u32::MAX
+        // instead of wrapping to 0, which would read as an update to an older tag.
+        let n: u64 = x.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0);
+        n.min(u32::MAX as u64) as u32
     });
     (p.next().unwrap_or(0), p.next().unwrap_or(0), p.next().unwrap_or(0))
 }

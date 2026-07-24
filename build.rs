@@ -5,7 +5,7 @@ use std::process::Command;
 fn main() {
     let patch = std::env::var("KIP_PATCH")
         .ok()
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
         .or_else(|| {
             Command::new("git")
                 .args(["rev-list", "--count", "HEAD"])
@@ -20,4 +20,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=KIP_PATCH");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads/main");
+    // Covers repos whose refs are packed (loose refs/heads/main then absent).
+    println!("cargo:rerun-if-changed=.git/packed-refs");
 }
