@@ -9,7 +9,9 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
-use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows_sys::Win32::System::ProcessStatus::{
+    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
@@ -143,24 +145,30 @@ pub fn clipboard_paths() -> Option<String> {
 /// deferred to a later version; the sidebar unread markers still work.
 pub fn notify(_title: &str, _body: &str, _sound: bool) {}
 
-fn working_set_kb(pid: i32) -> u64 {
+/// Private commit (bytes -> KB) of one process. `WorkingSetSize` counts every
+/// shared DLL once per process, so summing it over a tree multiplies shared
+/// code by the process count; `PrivateUsage` excludes shared pages and sums
+/// honestly. It is commit rather than resident, so it can sit slightly above
+/// the resident private working set Task Manager shows, but it never
+/// double-counts shared libraries.
+fn private_kb(pid: i32) -> u64 {
     let h = open_query(pid);
     if h.is_null() {
         return 0;
     }
-    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
     let ok = unsafe {
         GetProcessMemoryInfo(
             h,
-            &mut counters,
-            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            &mut counters as *mut _ as *mut PROCESS_MEMORY_COUNTERS,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
         )
     };
     unsafe { CloseHandle(h) };
-    if ok == 0 { 0 } else { counters.WorkingSetSize as u64 / 1024 }
+    if ok == 0 { 0 } else { counters.PrivateUsage as u64 / 1024 }
 }
 
-/// Memory per process tree (rss in KB). CPU sampling needs two time snapshots
+/// Memory per process tree (private commit in KB). CPU sampling needs two time snapshots
 /// with an interval and is left at 0 for v1; the memory bars stay meaningful.
 pub fn sample_stats(targets: &[(String, i32)]) -> SysStats {
     let kids = children_map();
@@ -174,7 +182,7 @@ pub fn sample_stats(targets: &[(String, i32)]) -> SysStats {
                 if !seen.insert(p) {
                     continue;
                 }
-                rss += working_set_kb(p);
+                rss += private_kb(p);
                 if let Some(cs) = kids.get(&p) {
                     stack.extend(cs);
                 }

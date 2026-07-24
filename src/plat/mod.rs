@@ -12,8 +12,10 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
-/// Per-process resource sample: (label, cpu percent, rss kilobytes), one row
-/// per process tree passed to `sample_stats`.
+/// Per-process resource sample: (label, cpu percent, memory kilobytes), one row
+/// per process tree passed to `sample_stats`. Memory is macOS phys_footprint,
+/// Windows private commit, and `ps` rss on other unix - each summed over the
+/// tree without counting shared pages once per process.
 pub struct SysStats {
     pub procs: Vec<(String, f32, u64)>,
 }

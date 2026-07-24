@@ -4,6 +4,46 @@ use std::process::{Command, Stdio};
 
 use super::SysStats;
 
+/// macOS: physical footprint (bytes -> KB) of one process - the memory the
+/// kernel charges it, matching Activity Monitor's "Memory" column. Unlike
+/// `ps rss` it excludes shared clean pages (dyld cache, shared dylibs), so
+/// summing it over a process tree does not multiply shared libraries by the
+/// number of processes that map them.
+#[cfg(target_os = "macos")]
+fn phys_footprint_kb(pid: i32) -> u64 {
+    // struct rusage_info_v0 from <libproc.h>; ri_phys_footprint is the 8th u64
+    // after the 16-byte uuid. Present since 10.9, layout stable.
+    #[repr(C)]
+    struct RUsageInfoV0 {
+        ri_uuid: [u8; 16],
+        ri_user_time: u64,
+        ri_system_time: u64,
+        ri_pkg_idle_wkups: u64,
+        ri_interrupt_wkups: u64,
+        ri_pageins: u64,
+        ri_wired_size: u64,
+        ri_resident_size: u64,
+        ri_phys_footprint: u64,
+        ri_proc_start_abstime: u64,
+        ri_proc_exit_abstime: u64,
+    }
+    unsafe extern "C" {
+        fn proc_pid_rusage(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            buffer: *mut libc::c_void,
+        ) -> libc::c_int;
+    }
+    const RUSAGE_INFO_V0: libc::c_int = 0;
+    let mut info: RUsageInfoV0 = unsafe { std::mem::zeroed() };
+    let ret =
+        unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V0, &mut info as *mut _ as *mut libc::c_void) };
+    if ret != 0 {
+        return 0;
+    }
+    info.ri_phys_footprint / 1024
+}
+
 /// One `ps` pass; each target's cpu/rss is summed over its whole process tree.
 pub fn sample_stats(targets: &[(String, i32)]) -> SysStats {
     let mut rows: Vec<(i32, i32, u64, f32)> = Vec::new();
@@ -41,7 +81,16 @@ pub fn sample_stats(targets: &[(String, i32)]) -> SysStats {
                     continue;
                 }
                 if let Some(&i) = by_pid.get(&pid) {
-                    rss += rows[i].2;
+                    // macOS charges phys_footprint (no shared-page double count);
+                    // fall back to ps rss on other unix where it is unavailable.
+                    #[cfg(target_os = "macos")]
+                    {
+                        rss += phys_footprint_kb(pid);
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        rss += rows[i].2;
+                    }
                     cpu += rows[i].3;
                 }
                 if let Some(kids) = children.get(&pid) {
