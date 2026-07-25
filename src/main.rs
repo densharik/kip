@@ -2988,6 +2988,24 @@ impl App {
                             let is_pinned = self.settings.usage_pin.as_deref() == Some(&l.key);
                             let (rect, resp) =
                                 ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::click());
+                            // The pin button owns the right edge; the bar, the
+                            // percent and the countdown stop short of it.
+                            let cw = w - 22.0;
+                            let pin_rect = Rect::from_center_size(
+                                Pos2::new(rect.right() - 8.0, rect.top() + 13.0),
+                                Vec2::splat(18.0),
+                            );
+                            let pin = ui
+                                .interact(
+                                    pin_rect,
+                                    egui::Id::new(("usage-pin", &l.key)),
+                                    Sense::click(),
+                                )
+                                .on_hover_text(if is_pinned {
+                                    tr("Открепить", "Unpin")
+                                } else {
+                                    tr("Закрепить в углу", "Pin to the corner")
+                                });
                             let p = ui.painter();
                             if resp.hovered() {
                                 p.rect_filled(
@@ -3014,7 +3032,7 @@ impl App {
                                 if is_pinned { palette::text_strong() } else { palette::text() },
                             );
                             p.text(
-                                rect.right_top(),
+                                Pos2::new(rect.left() + cw, rect.top()),
                                 Align2::RIGHT_TOP,
                                 format!("{:.0}%", l.percent),
                                 FontId::monospace(11.5),
@@ -3022,33 +3040,52 @@ impl App {
                             );
                             let track = Rect::from_min_size(
                                 Pos2::new(rect.left(), rect.top() + 19.0),
-                                Vec2::new(w, 4.0),
+                                Vec2::new(cw, 4.0),
                             );
                             p.rect_filled(track, CornerRadius::same(2), palette::border_dim());
                             p.rect_filled(
                                 Rect::from_min_size(
                                     track.min,
-                                    Vec2::new(w * (l.percent / 100.0).clamp(0.0, 1.0), 4.0),
+                                    Vec2::new(cw * (l.percent / 100.0).clamp(0.0, 1.0), 4.0),
                                 ),
                                 CornerRadius::same(2),
                                 usage_color(l.percent),
                             );
                             if let Some(ts) = l.resets_at {
                                 p.text(
-                                    Pos2::new(rect.right(), rect.top() + 26.0),
+                                    Pos2::new(rect.left() + cw, rect.top() + 26.0),
                                     Align2::RIGHT_TOP,
                                     fmt_until(ts),
                                     FontId::proportional(9.5),
                                     palette::text_faint(),
                                 );
                             }
-                            if resp.clicked() {
+                            if pin.hovered() {
+                                p.rect_filled(
+                                    pin_rect,
+                                    CornerRadius::same(4),
+                                    palette::surface_hi(),
+                                );
+                            }
+                            paint_pin(
+                                p,
+                                pin_rect.center(),
+                                is_pinned,
+                                if is_pinned {
+                                    palette::accent_bar()
+                                } else if pin.hovered() {
+                                    palette::text()
+                                } else {
+                                    palette::text_faint()
+                                },
+                            );
+                            if resp.clicked() || pin.clicked() {
                                 toggle = Some(l.key.clone());
                             }
                         }
                         ui.add_space(2.0);
                         ui.label(
-                            RichText::new(tr("клик - закрепить в углу", "click to pin to the corner"))
+                            RichText::new(tr("закрепи - полоска останется в углу", "pin one - its bar stays in the corner"))
                                 .size(9.0)
                                 .color(palette::text_faint()),
                         );
@@ -4307,6 +4344,21 @@ fn fmt_mem(rss_kb: u64) -> String {
     } else {
         format!("{:.1} GB", rss_kb as f64 / 1024.0 / 1024.0)
     }
+}
+
+/// Pushpin: a head and a needle, filled once the limit is pinned. Drawn rather
+/// than typed - the UI font has no pin glyph to rely on.
+fn paint_pin(p: &egui::Painter, c: Pos2, filled: bool, col: Color32) {
+    let head = Pos2::new(c.x, c.y - 2.0);
+    if filled {
+        p.circle_filled(head, 3.4, col);
+    } else {
+        p.circle_stroke(head, 3.0, Stroke::new(1.3, col));
+    }
+    p.line_segment(
+        [Pos2::new(c.x, c.y + 1.4), Pos2::new(c.x, c.y + 5.5)],
+        Stroke::new(1.4, col),
+    );
 }
 
 /// Usage bar color: green under 60%, amber under 90%, red above.
