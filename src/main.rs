@@ -2900,10 +2900,7 @@ impl App {
                         );
                         p.rect_filled(track, CornerRadius::same(2), palette::border_dim());
                         p.rect_filled(
-                            Rect::from_min_size(
-                                track.min,
-                                Vec2::new(BAR_W * (l.percent / 100.0).clamp(0.0, 1.0), 4.0),
-                            ),
+                            Rect::from_min_size(track.min, Vec2::new(bar_fill(BAR_W, l.percent), 4.0)),
                             CornerRadius::same(2),
                             usage_color(l.percent),
                         );
@@ -2939,8 +2936,12 @@ impl App {
         let open = chip.inner.hovered() || over_popup;
 
         // A pinned bar has to stay current with the popup closed; an unpinned one
-        // only matters while the panel is open.
-        if open || pinned.is_some() {
+        // only matters while the panel is open. The pin is read from settings, not
+        // from the resolved row: right after a start, and whenever the API drops a
+        // window from the array (a session limit that just reset comes back as
+        // inactive), there is nothing to resolve - keying the refresh off that
+        // would freeze the chip empty until the mouse happens to pass over it.
+        if open || self.settings.usage_pin.is_some() || self.usage_at.is_none() {
             let stale = self.usage_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
             if stale && !self.usage_inflight {
                 self.usage_inflight = true;
@@ -3044,10 +3045,7 @@ impl App {
                             );
                             p.rect_filled(track, CornerRadius::same(2), palette::border_dim());
                             p.rect_filled(
-                                Rect::from_min_size(
-                                    track.min,
-                                    Vec2::new(cw * (l.percent / 100.0).clamp(0.0, 1.0), 4.0),
-                                ),
+                                Rect::from_min_size(track.min, Vec2::new(bar_fill(cw, l.percent), 4.0)),
                                 CornerRadius::same(2),
                                 usage_color(l.percent),
                             );
@@ -4362,6 +4360,14 @@ fn paint_pin(p: &egui::Painter, c: Pos2, filled: bool, col: Color32) {
 }
 
 /// Usage bar color: green under 60%, amber under 90%, red above.
+/// Filled width of a limit bar. A freshly reset window sits at 1-2%, which is a
+/// third of a pixel on the corner chip - too little to tell "just reset" from
+/// "not loaded", so anything above zero keeps a visible stub.
+fn bar_fill(track_w: f32, pct: f32) -> f32 {
+    let w = track_w * (pct / 100.0).clamp(0.0, 1.0);
+    if pct > 0.0 { w.max(3.0) } else { 0.0 }
+}
+
 fn usage_color(pct: f32) -> Color32 {
     if pct < 60.0 {
         GIT_ADD
