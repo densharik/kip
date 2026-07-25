@@ -3202,37 +3202,19 @@ impl App {
                         .find(|(k, _)| *k == self.settings.font)
                         .map(|(_, l)| *l)
                         .unwrap_or("JetBrains Mono");
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("term-font")
-                            .selected_text(cur_font)
-                            .width(160.0)
-                            .show_ui(ui, |ui| {
-                                for (k, label) in choices {
-                                    if ui.selectable_label(self.settings.font == k, label).clicked()
-                                        && self.settings.font != k
-                                    {
-                                        self.settings.font = k.to_string();
-                                        self.font_applied = install_fonts(ctx, k);
-                                    }
+                    egui::ComboBox::from_id_salt("term-font")
+                        .selected_text(cur_font)
+                        .width(160.0)
+                        .show_ui(ui, |ui| {
+                            for (k, label) in choices {
+                                if ui.selectable_label(self.settings.font == k, label).clicked()
+                                    && self.settings.font != k
+                                {
+                                    self.settings.font = k.to_string();
+                                    self.font_applied = install_fonts(ctx, k);
                                 }
-                            });
-                        // Warp draws Hack at 13pt with zoom 110%, i.e. 14.3 physical
-                        // pixels. Matching it by hand means knowing both numbers and
-                        // dividing by the UI scale, so make it one button.
-                        if ui
-                            .button(RichText::new(tr("как в Warp", "match Warp")).size(11.5))
-                            .on_hover_text(tr(
-                                "Hack и тот же итоговый размер, что у Warp по умолчанию",
-                                "Hack at the same on-screen size Warp uses by default",
-                            ))
-                            .clicked()
-                        {
-                            self.settings.font = "hack".into();
-                            let size = 14.3 / self.settings.ui_scale.max(0.5);
-                            self.settings.font_size = ((size * 2.0).round() / 2.0).clamp(9.0, 20.0);
-                            self.font_applied = install_fonts(ctx, "hack");
-                        }
-                    });
+                            }
+                        });
                     ui.end_row();
 
                     // What is really on screen: the pick can fall back silently,

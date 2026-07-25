@@ -30,13 +30,22 @@ pub struct Settings {
     pub accent: Option<[u8; 3]>,
     /// UI language: "auto" | "ru" | "en".
     pub lang: String,
+    /// Settings schema version, so a changed default can reach existing installs
+    /// (see `migrate`). The field-level `default` is what makes that work: the
+    /// struct-level one would hand an old file the current version and skip the
+    /// migration entirely.
+    #[serde(default)]
+    pub version: u32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            font_size: 13.0,
-            font: "menlo".into(),
+            // Bundled Hack at a size that lands on ~14.4 physical pixels with the
+            // default UI scale - the same on-screen size other terminals use, and
+            // identical on every machine since the font ships in the binary.
+            font_size: 12.0,
+            font: "hack".into(),
             ui_scale: 1.2,
             scrollback: 5000,
             idle_suspend_min: 10,
@@ -51,8 +60,26 @@ impl Default for Settings {
             theme: "tomorrow".into(),
             accent: None,
             lang: "auto".into(),
+            version: SETTINGS_VERSION,
         }
     }
+}
+
+/// Bump when a default changes in a way that existing installs should pick up.
+const SETTINGS_VERSION: u32 = 1;
+
+/// v1: terminal text is the bundled Hack at 12pt. Before this the font came from
+/// the system (Menlo, or whatever was picked while chasing the "text looks
+/// wrong" reports) at a size that rendered noticeably larger than other
+/// terminals. Those picks were troubleshooting, not preference, so they are
+/// replaced once instead of carried forward.
+fn migrate(s: &mut Settings) {
+    if s.version < 1 {
+        let d = Settings::default();
+        s.font = d.font;
+        s.font_size = d.font_size;
+    }
+    s.version = SETTINGS_VERSION;
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -104,13 +131,41 @@ pub fn load_state() -> AppState {
         return AppState::default();
     }
     let Ok(bytes) = std::fs::read(&path) else { return AppState::default() };
-    match serde_json::from_slice(&bytes) {
-        Ok(state) => state,
+    match serde_json::from_slice::<AppState>(&bytes) {
+        Ok(mut state) => {
+            migrate(&mut state.settings);
+            state
+        },
         Err(_) => {
             // Keep the unparseable file around instead of silently overwriting it.
             let _ = std::fs::copy(&path, path.with_extension("json.bad"));
             AppState::default()
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_font_default_reaches_existing_installs_once() {
+        let json = r#"{"font":"sfmono","font_size":13.5,"ui_scale":1.2,"theme":"tomorrow"}"#;
+        let mut s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.version, 0, "a file written before versioning must read as v0");
+
+        migrate(&mut s);
+        assert_eq!(s.font, "hack");
+        assert_eq!(s.font_size, 12.0);
+        assert_eq!(s.ui_scale, 1.2, "migration only touches the font");
+        assert_eq!(s.version, SETTINGS_VERSION);
+
+        // A later pick survives: the reset happens once, not on every launch.
+        s.font = "menlo".into();
+        s.font_size = 15.0;
+        migrate(&mut s);
+        assert_eq!(s.font, "menlo");
+        assert_eq!(s.font_size, 15.0);
     }
 }
 
