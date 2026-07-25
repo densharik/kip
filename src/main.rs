@@ -12,13 +12,14 @@ mod palette;
 mod session;
 mod term_view;
 mod update;
+mod usage;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alacritty_terminal::event::{Event as TermEvent, Notify, WindowSize};
 use alacritty_terminal::term::TermMode;
@@ -273,6 +274,15 @@ struct App {
     stats_inflight: bool,
     /// Popup rect from the previous frame, to keep it open while hovered.
     stats_rect: Option<Rect>,
+    usage_tx: Sender<usage::UsageMsg>,
+    usage_rx: Receiver<usage::UsageMsg>,
+    /// Claude.ai subscription limits, whatever the account has (session, week,
+    /// per-model week). Empty until the first fetch lands.
+    usage: Vec<usage::Limit>,
+    usage_err: Option<String>,
+    usage_at: Option<Instant>,
+    usage_inflight: bool,
+    usage_rect: Option<Rect>,
     /// Last measured terminal cell size in px, used for PTY pixel hints.
     cell: (u16, u16),
     /// Last measured grid size, used as the initial size for new PTYs.
@@ -295,6 +305,7 @@ impl App {
         let (ctx_tx, ctx_rx) = mpsc::channel();
         let (ctxi_tx, ctxi_rx) = mpsc::channel();
         let (stats_tx, stats_rx) = mpsc::channel();
+        let (usage_tx, usage_rx) = mpsc::channel();
         let (upd_tx, upd_rx) = mpsc::channel();
         let (hist_tx, hist_rx) = mpsc::channel();
         let jsonl_map: ctx_index::SharedMap = Default::default();
@@ -365,6 +376,13 @@ impl App {
             stats_at: None,
             stats_inflight: false,
             stats_rect: None,
+            usage_tx,
+            usage_rx,
+            usage: Vec::new(),
+            usage_err: None,
+            usage_at: None,
+            usage_inflight: false,
+            usage_rect: None,
             cell: (8, 17),
             grid: (100, 28),
             explorer: Explorer::default(),
@@ -2828,6 +2846,223 @@ impl App {
         self.stats_rect = Some(area.response.rect);
     }
 
+    /// Subscription-limit chip in the bottom-right corner. Hovering opens every
+    /// window the account has (5h session, week, per-model week); clicking a row
+    /// pins its bar into the chip, so it stays readable with the mouse away.
+    fn usage_ui(&mut self, ctx: &egui::Context) {
+        let pinned = self
+            .settings
+            .usage_pin
+            .as_ref()
+            .and_then(|k| self.usage.iter().find(|l| &l.key == k))
+            .cloned();
+
+        let chip = egui::Area::new(egui::Id::new("usage-chip"))
+            .order(egui::Order::Foreground)
+            .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-10.0, -42.0))
+            .show(ctx, |ui| {
+                const BAR_W: f32 = 34.0;
+                // The pinned label is a model name on some plans ("Fable"), so the
+                // pill is measured, not a fixed width.
+                let label = pinned.as_ref().map(|l| {
+                    ui.painter().layout_no_wrap(
+                        l.short.clone(),
+                        FontId::proportional(10.0),
+                        palette::text_dim(),
+                    )
+                });
+                let w = match &label {
+                    Some(g) => 8.0 + g.size().x + 6.0 + BAR_W + 6.0 + 24.0 + 8.0,
+                    None => 30.0,
+                };
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 20.0), Sense::hover());
+                let active = resp.hovered() || self.usage_rect.is_some();
+                let bg = if active { palette::surface_hi() } else { palette::surface() };
+                let p = ui.painter();
+                p.rect_filled(rect, CornerRadius::same(5), bg);
+                p.rect_stroke(
+                    rect,
+                    CornerRadius::same(5),
+                    Stroke::new(1.0, palette::border()),
+                    egui::StrokeKind::Inside,
+                );
+                match (label, &pinned) {
+                    (Some(g), Some(l)) => {
+                        let gw = g.size().x;
+                        p.galley(
+                            Pos2::new(rect.left() + 8.0, rect.center().y - g.size().y / 2.0),
+                            g,
+                            palette::text_dim(),
+                        );
+                        let track = Rect::from_min_size(
+                            Pos2::new(rect.left() + 14.0 + gw, rect.center().y - 2.0),
+                            Vec2::new(BAR_W, 4.0),
+                        );
+                        p.rect_filled(track, CornerRadius::same(2), palette::border_dim());
+                        p.rect_filled(
+                            Rect::from_min_size(
+                                track.min,
+                                Vec2::new(BAR_W * (l.percent / 100.0).clamp(0.0, 1.0), 4.0),
+                            ),
+                            CornerRadius::same(2),
+                            usage_color(l.percent),
+                        );
+                        p.text(
+                            Pos2::new(rect.right() - 8.0, rect.center().y),
+                            Align2::RIGHT_CENTER,
+                            format!("{:.0}%", l.percent),
+                            FontId::monospace(10.0),
+                            usage_color(l.percent),
+                        );
+                    },
+                    _ => {
+                        // Stacked horizontal bars, so it reads apart from the
+                        // vertical cpu glyph in the opposite corner.
+                        let fg = if active { palette::text() } else { palette::text_dim() };
+                        let left = rect.center().x - 6.0;
+                        for (i, len) in [9.0, 5.0, 11.0].iter().enumerate() {
+                            let y = rect.center().y - 4.0 + i as f32 * 4.0;
+                            p.line_segment(
+                                [Pos2::new(left, y), Pos2::new(left + len, y)],
+                                Stroke::new(2.0, fg),
+                            );
+                        }
+                    },
+                }
+                resp
+            });
+
+        let pointer = ctx.input(|i| i.pointer.interact_pos());
+        let over_popup = self
+            .usage_rect
+            .is_some_and(|r| pointer.is_some_and(|p| r.expand(6.0).contains(p)));
+        let open = chip.inner.hovered() || over_popup;
+
+        // A pinned bar has to stay current with the popup closed; an unpinned one
+        // only matters while the panel is open.
+        if open || pinned.is_some() {
+            let stale = self.usage_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
+            if stale && !self.usage_inflight {
+                self.usage_inflight = true;
+                usage::fetch(self.usage_tx.clone(), ctx.clone());
+            }
+            ctx.request_repaint_after(Duration::from_secs(30));
+        }
+        if !open {
+            self.usage_rect = None;
+            return;
+        }
+
+        let mut toggle = None;
+        let area = egui::Area::new(egui::Id::new("usage-popup"))
+            .order(egui::Order::Foreground)
+            .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-10.0, -66.0))
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(palette::popup_bg())
+                    .stroke(Stroke::new(1.0, palette::border()))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::symmetric(14, 12))
+                    .shadow(egui::Shadow {
+                        offset: [0, 4],
+                        blur: 18,
+                        spread: 0,
+                        color: Color32::from_black_alpha(120),
+                    })
+                    .show(ui, |ui| {
+                        let w = 220.0;
+                        ui.set_min_width(w);
+                        ui.label(
+                            RichText::new(tr("Лимиты Claude", "Claude limits")).size(10.0).strong().color(palette::text_dim()),
+                        );
+                        ui.add_space(6.0);
+                        if self.usage.is_empty() {
+                            let txt = self
+                                .usage_err
+                                .clone()
+                                .unwrap_or_else(|| tr("загружаю...", "loading...").into());
+                            ui.label(RichText::new(txt).size(11.0).color(palette::text_faint()));
+                            return;
+                        }
+                        for l in &self.usage {
+                            let is_pinned = self.settings.usage_pin.as_deref() == Some(&l.key);
+                            let (rect, resp) =
+                                ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::click());
+                            let p = ui.painter();
+                            if resp.hovered() {
+                                p.rect_filled(
+                                    rect.expand2(Vec2::new(6.0, 2.0)),
+                                    CornerRadius::same(5),
+                                    palette::row_hover_bg(),
+                                );
+                            }
+                            if is_pinned {
+                                p.rect_filled(
+                                    Rect::from_min_size(
+                                        Pos2::new(rect.left() - 6.0, rect.top()),
+                                        Vec2::new(2.0, 16.0),
+                                    ),
+                                    CornerRadius::same(1),
+                                    palette::accent_bar(),
+                                );
+                            }
+                            p.text(
+                                rect.left_top(),
+                                Align2::LEFT_TOP,
+                                &l.label,
+                                FontId::proportional(12.0),
+                                if is_pinned { palette::text_strong() } else { palette::text() },
+                            );
+                            p.text(
+                                rect.right_top(),
+                                Align2::RIGHT_TOP,
+                                format!("{:.0}%", l.percent),
+                                FontId::monospace(11.5),
+                                usage_color(l.percent),
+                            );
+                            let track = Rect::from_min_size(
+                                Pos2::new(rect.left(), rect.top() + 19.0),
+                                Vec2::new(w, 4.0),
+                            );
+                            p.rect_filled(track, CornerRadius::same(2), palette::border_dim());
+                            p.rect_filled(
+                                Rect::from_min_size(
+                                    track.min,
+                                    Vec2::new(w * (l.percent / 100.0).clamp(0.0, 1.0), 4.0),
+                                ),
+                                CornerRadius::same(2),
+                                usage_color(l.percent),
+                            );
+                            if let Some(ts) = l.resets_at {
+                                p.text(
+                                    Pos2::new(rect.right(), rect.top() + 26.0),
+                                    Align2::RIGHT_TOP,
+                                    fmt_until(ts),
+                                    FontId::proportional(9.5),
+                                    palette::text_faint(),
+                                );
+                            }
+                            if resp.clicked() {
+                                toggle = Some(l.key.clone());
+                            }
+                        }
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(tr("клик - закрепить в углу", "click to pin to the corner"))
+                                .size(9.0)
+                                .color(palette::text_faint()),
+                        );
+                    });
+            });
+
+        if let Some(key) = toggle {
+            self.settings.usage_pin =
+                if self.settings.usage_pin.as_deref() == Some(&key) { None } else { Some(key) };
+            self.persist();
+        }
+        self.usage_rect = Some(area.response.rect);
+    }
+
     /// Directory switcher over the path chip: navigating runs `cd` in the shell.
     fn dir_popup(&mut self, ctx: &egui::Context) {
         if !self.dir_open {
@@ -3495,6 +3730,18 @@ impl eframe::App for App {
             self.stats_at = Some(Instant::now());
             self.stats_inflight = false;
         }
+        while let Ok(msg) = self.usage_rx.try_recv() {
+            match msg {
+                usage::UsageMsg::Ok(v) => {
+                    self.usage = v;
+                    self.usage_err = None;
+                },
+                // Keep the last good numbers on screen; the panel shows the error.
+                usage::UsageMsg::Err(e) => self.usage_err = Some(e),
+            }
+            self.usage_at = Some(Instant::now());
+            self.usage_inflight = false;
+        }
 
         // Paste without text (Finder file, screenshot image) -> insert as a path.
         let mut file_paste = false;
@@ -3599,6 +3846,7 @@ impl eframe::App for App {
         }
         self.dir_popup(&ctx);
         self.stats_ui(&ctx);
+        self.usage_ui(&ctx);
     }
 
     fn on_exit(&mut self) {
@@ -4059,6 +4307,31 @@ fn fmt_mem(rss_kb: u64) -> String {
     } else {
         format!("{:.1} GB", rss_kb as f64 / 1024.0 / 1024.0)
     }
+}
+
+/// Usage bar color: green under 60%, amber under 90%, red above.
+fn usage_color(pct: f32) -> Color32 {
+    if pct < 60.0 {
+        GIT_ADD
+    } else if pct < 90.0 {
+        ORANGE
+    } else {
+        GIT_DEL
+    }
+}
+
+/// Countdown to a limit reset, given as unix seconds.
+fn fmt_until(target: u64) -> String {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let left = target.saturating_sub(now);
+    let body = if left >= 86400 {
+        format!("{}{} {}{}", left / 86400, tr("д", "d"), left % 86400 / 3600, tr("ч", "h"))
+    } else if left >= 3600 {
+        format!("{}{} {}{}", left / 3600, tr("ч", "h"), left % 3600 / 60, tr("м", "m"))
+    } else {
+        format!("{}{}", left / 60 + 1, tr("м", "m"))
+    };
+    format!("{} {body}", tr("сброс через", "resets in"))
 }
 
 fn fmt_dur(d: Duration) -> String {

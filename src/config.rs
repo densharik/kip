@@ -30,6 +30,8 @@ pub struct Settings {
     pub accent: Option<[u8; 3]>,
     /// UI language: "auto" | "ru" | "en".
     pub lang: String,
+    /// Key of the usage limit pinned to the corner chip (see usage::Limit::key).
+    pub usage_pin: Option<String>,
     /// Settings schema version, so a changed default can reach existing installs
     /// (see `migrate`). The field-level `default` is what makes that work: the
     /// struct-level one would hand an old file the current version and skip the
@@ -60,6 +62,7 @@ impl Default for Settings {
             theme: "tomorrow".into(),
             accent: None,
             lang: "auto".into(),
+            usage_pin: None,
             version: SETTINGS_VERSION,
         }
     }
