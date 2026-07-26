@@ -30,6 +30,8 @@ pub struct Settings {
     pub accent: Option<[u8; 3]>,
     /// UI language: "auto" | "ru" | "en".
     pub lang: String,
+    /// Width of the session panel, dragged by its right edge.
+    pub sidebar_w: f32,
     /// Key of the usage limit pinned to the corner chip (see usage::Limit::key).
     pub usage_pin: Option<String>,
     /// Settings schema version, so a changed default can reach existing installs
@@ -62,6 +64,7 @@ impl Default for Settings {
             theme: "tomorrow".into(),
             accent: None,
             lang: "auto".into(),
+            sidebar_w: 236.0,
             usage_pin: None,
             version: SETTINGS_VERSION,
         }
