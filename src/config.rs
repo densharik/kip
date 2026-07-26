@@ -97,6 +97,8 @@ pub struct SavedSession {
     pub group: Option<String>,
     pub skip_permissions: bool,
     pub keep_awake: bool,
+    /// Protected session: no drag, no close, never auto-suspended.
+    pub pinned: bool,
     pub snapshot: Option<String>,
 }
 
@@ -110,6 +112,7 @@ impl Default for SavedSession {
             group: None,
             skip_permissions: true,
             keep_awake: false,
+            pinned: false,
             snapshot: None,
         }
     }

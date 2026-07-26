@@ -39,6 +39,8 @@ use session::{poll_git, spawn_live, EventProxy, GitStats, Phase, Session};
 const TICK: Duration = Duration::from_secs(2);
 const GIT_INTERVAL: Duration = Duration::from_secs(7);
 const BUSY_NOTIFY_MIN: Duration = Duration::from_secs(5);
+/// How long a pinned row's refusal wobble lasts.
+const SHAKE_SECS: f32 = 0.45;
 
 // Theme-adaptive text/surface colors live in palette:: (text(), popup_bg(),
 // border(), ...). These mid-tone status accents read on both light and dark.
@@ -113,6 +115,8 @@ enum Act {
     /// X button / "Удалить": always removes, killing a live session.
     Remove(u64),
     ToggleAwake(u64),
+    /// Protect a session: pinned rows refuse to close, drag or auto-suspend.
+    TogglePin(u64),
     /// Start inline editing of a session's title.
     BeginRename(u64),
     /// Commit the rename buffer as the session's custom name (empty = reset to auto).
@@ -227,6 +231,9 @@ struct App {
     rename_focus: bool,
     /// Session id being dragged in the sidebar (reorder / move between groups).
     dragging: Option<u64>,
+    /// A blocked action (close, drag, move) on a pinned session: its pin shakes
+    /// instead, so the refusal is visible where the reason lives.
+    pin_shake: Option<(u64, Instant)>,
     /// Group whose header is being dragged (reorder groups among themselves).
     dragging_group: Option<String>,
     /// Collapsed group names.
@@ -345,6 +352,7 @@ impl App {
             rename_buf: String::new(),
             rename_focus: false,
             dragging: None,
+            pin_shake: None,
             dragging_group: None,
             collapsed_groups: state.collapsed_groups.into_iter().collect(),
             cmd_input: String::new(),
@@ -597,6 +605,16 @@ impl App {
         }
     }
 
+    /// A pinned session refuses close/drag/move: true means "handled - do
+    /// nothing", with the pin shaking so the refusal is not silent.
+    fn refuse_pinned(&mut self, idx: usize) -> bool {
+        if !self.sessions[idx].pinned {
+            return false;
+        }
+        self.pin_shake = Some((self.sessions[idx].id, Instant::now()));
+        true
+    }
+
     fn remove_session(&mut self, idx: usize) {
         let id = self.sessions[idx].id;
         self.sessions.remove(idx);
@@ -622,7 +640,7 @@ impl App {
         }
         let Some(pos) = self.idx_of(id) else { return };
         let mut s = self.sessions.remove(pos);
-        s.group = group.clone();
+        let old_group = std::mem::replace(&mut s.group, group.clone());
         let insert = match before.and_then(|b| self.idx_of(b)) {
             Some(p) => p,
             None => match self.sessions.iter().rposition(|x| x.group == group) {
@@ -638,6 +656,16 @@ impl App {
                 },
             },
         };
+        // Pinned rows are barriers: jumping over one is what would shove it out
+        // of its place, so that move is refused (its pin shakes) and the dragged
+        // session goes back where it was.
+        let span = if insert > pos { pos..insert } else { insert..pos };
+        if let Some(blocker) = self.sessions[span].iter().find(|x| x.pinned).map(|x| x.id) {
+            s.group = old_group;
+            self.sessions.insert(pos, s);
+            self.pin_shake = Some((blocker, Instant::now()));
+            return;
+        }
         self.sessions.insert(insert, s);
         self.normalize_order();
         self.persist();
@@ -825,6 +853,7 @@ impl App {
                 group: group.clone(),
                 skip_permissions: self.settings.skip_permissions_default,
                 keep_awake: false,
+                pinned: false,
                 snapshot: None,
             },
             id,
@@ -954,6 +983,9 @@ impl App {
                 },
                 Act::Close(id) => {
                     if let Some(idx) = self.idx_of(id) {
+                        if self.refuse_pinned(idx) {
+                            continue;
+                        }
                         // Guards against reflexive Cmd+W killing a working agent.
                         if matches!(self.sessions[idx].phase, Phase::Live(_)) {
                             self.sessions[idx].suspend();
@@ -965,12 +997,20 @@ impl App {
                 },
                 Act::Remove(id) => {
                     if let Some(idx) = self.idx_of(id) {
-                        self.remove_session(idx);
+                        if !self.refuse_pinned(idx) {
+                            self.remove_session(idx);
+                        }
                     }
                 },
                 Act::ToggleAwake(id) => {
                     if let Some(idx) = self.idx_of(id) {
                         self.sessions[idx].keep_awake = !self.sessions[idx].keep_awake;
+                        self.persist();
+                    }
+                },
+                Act::TogglePin(id) => {
+                    if let Some(idx) = self.idx_of(id) {
+                        self.sessions[idx].pinned = !self.sessions[idx].pinned;
                         self.persist();
                     }
                 },
@@ -999,7 +1039,13 @@ impl App {
                     self.renaming = None;
                     self.renaming_group = None;
                 },
-                Act::MoveSession { id, group, before } => self.move_session(id, group, before),
+                Act::MoveSession { id, group, before } => {
+                    if let Some(idx) = self.idx_of(id) {
+                        if !self.refuse_pinned(idx) {
+                            self.move_session(id, group, before);
+                        }
+                    }
+                },
                 Act::MoveGroup { name, before } => self.move_group(name, before),
                 Act::NewGroup(id) => {
                     let name = self.unique_group_name();
@@ -1320,6 +1366,7 @@ impl App {
                 // not activity - but a silent non-claude job (make, rsync) must survive.
                 if idle_limit > 0
                     && !s.keep_awake
+                    && !s.pinned
                     && (!busy_now || is_claude)
                     && s.last_activity.elapsed().as_secs() >= idle_limit
                 {
@@ -1949,6 +1996,13 @@ impl App {
         let id = self.sessions[idx].id;
         let renaming = self.renaming == Some(id);
         let is_dragging = self.dragging == Some(id);
+        let pinned = self.sessions[idx].pinned;
+        // Seconds since this row's pin refused something (close, drag, move).
+        let shake = self
+            .pin_shake
+            .filter(|(sid, _)| *sid == id)
+            .map(|(_, t)| t.elapsed().as_secs_f32())
+            .filter(|t| *t < SHAKE_SECS);
         let s = &self.sessions[idx];
         let selected = self.active == Some(s.id);
         let row_h = 48.0;
@@ -2010,6 +2064,40 @@ impl App {
                 painter.circle_filled(dot, 3.0, color);
             },
         }
+
+        // Pin, right above the status dot. A pinned session cannot be dragged,
+        // closed by a stray click, or put to sleep by the idle timer. Unpinned
+        // rows only show it under the pointer, so the list stays quiet.
+        let pin_c = Pos2::new(x0 + 16.0, rect.min.y + 11.0);
+        let pin_resp =
+            ui.interact(Rect::from_center_size(pin_c, Vec2::splat(18.0)), ui.id().with(("pin", id)), Sense::click());
+        if pin_resp.clicked() {
+            acts.push(Act::TogglePin(id));
+        }
+        if pinned || hovered || pin_resp.hovered() {
+            // Refusals wobble the pin instead of popping a dialog: a decaying
+            // sway that dies out within SHAKE_SECS.
+            let dx = match shake {
+                Some(t) => {
+                    ui.ctx().request_repaint();
+                    (t * 55.0).sin() * 4.0 * (1.0 - t / SHAKE_SECS)
+                },
+                None => 0.0,
+            };
+            let col = if pinned {
+                palette::accent_bar()
+            } else if pin_resp.hovered() {
+                palette::text()
+            } else {
+                palette::text_faint()
+            };
+            paint_pin(ui.painter(), pin_c + Vec2::new(dx, 0.0), pinned, col);
+        }
+        pin_resp.on_hover_text(if pinned {
+            tr("Открепить сессию", "Unpin session")
+        } else {
+            tr("Закрепить: не закроется, не сдвинется, не уснёт", "Pin: no close, no drag, no auto-suspend")
+        });
 
         // Context badge: pill with the session's context %, top-right.
         // No index entry = no badge (never a fake 0%).
@@ -2134,6 +2222,15 @@ impl App {
                 acts.push(Act::BeginRename(sid));
                 ui.close();
             }
+            let pin_label = if pinned {
+                tr("Открепить", "Unpin")
+            } else {
+                tr("Закрепить (защита)", "Pin (protect)")
+            };
+            if ui.button(pin_label).clicked() {
+                acts.push(Act::TogglePin(sid));
+                ui.close();
+            }
             ui.menu_button(tr("В группу", "Move to group"), |ui| {
                 for g in &all_groups {
                     if cur_group.as_deref() != Some(g.as_str())
@@ -2218,7 +2315,11 @@ impl App {
             }
         }
         if drag_started {
-            self.dragging = Some(id);
+            if pinned {
+                self.pin_shake = Some((id, Instant::now()));
+            } else {
+                self.dragging = Some(id);
+            }
         }
         (rect, released)
     }
@@ -4359,7 +4460,6 @@ fn paint_pin(p: &egui::Painter, c: Pos2, filled: bool, col: Color32) {
     );
 }
 
-/// Usage bar color: green under 60%, amber under 90%, red above.
 /// Filled width of a limit bar. A freshly reset window sits at 1-2%, which is a
 /// third of a pixel on the corner chip - too little to tell "just reset" from
 /// "not loaded", so anything above zero keeps a visible stub.
@@ -4368,6 +4468,7 @@ fn bar_fill(track_w: f32, pct: f32) -> f32 {
     if pct > 0.0 { w.max(3.0) } else { 0.0 }
 }
 
+/// Usage bar color: green under 60%, amber under 90%, red above.
 fn usage_color(pct: f32) -> Color32 {
     if pct < 60.0 {
         GIT_ADD

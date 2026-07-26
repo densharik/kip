@@ -103,6 +103,8 @@ pub struct Session {
     pub claude_session_id: Option<String>,
     pub skip_permissions: bool,
     pub keep_awake: bool,
+    /// Pinned = protected: cannot be dragged, closed by mistake, or auto-suspended.
+    pub pinned: bool,
     pub snapshot: Option<String>,
     pub unread: bool,
     pub busy: bool,
@@ -234,6 +236,7 @@ impl Session {
             group: self.group.clone(),
             skip_permissions: self.skip_permissions,
             keep_awake: self.keep_awake,
+            pinned: self.pinned,
             snapshot: snapshot.map(|mut s| {
                 if s.len() > 32 * 1024 {
                     let cut = s.len() - 32 * 1024;
@@ -259,6 +262,7 @@ impl Session {
             claude_session_id: saved.claude_session_id,
             skip_permissions: saved.skip_permissions,
             keep_awake: saved.keep_awake,
+            pinned: saved.pinned,
             snapshot: saved.snapshot,
             unread: false,
             busy: false,
@@ -734,6 +738,16 @@ mod tests {
         assert!(valid_uuid(SID) && valid_sid(SID));
         assert!(!valid_uuid("not-a-uuid") && !valid_sid("../etc/passwd"));
         assert!(valid_sid("shortid") && !valid_uuid("shortid"));
+    }
+
+    #[test]
+    fn pin_survives_a_restart() {
+        // A state file written before pinning existed loads as unpinned...
+        let old: SavedSession = serde_json::from_str(r#"{"cwd":"/tmp"}"#).unwrap();
+        assert!(!old.pinned);
+        // ...and a pin set in this run is still there after save/load.
+        let s = Session::from_saved(SavedSession { pinned: true, ..old }, 1);
+        assert!(s.pinned && s.to_saved().pinned);
     }
 }
 
