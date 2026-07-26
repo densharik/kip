@@ -41,6 +41,8 @@ const GIT_INTERVAL: Duration = Duration::from_secs(7);
 const BUSY_NOTIFY_MIN: Duration = Duration::from_secs(5);
 /// How long a pinned row's refusal wobble lasts.
 const SHAKE_SECS: f32 = 0.45;
+/// Narrowest usable session panel: below this a row's name loses its path.
+const SIDEBAR_MIN: f32 = 170.0;
 
 // Theme-adaptive text/surface colors live in palette:: (text(), popup_bg(),
 // border(), ...). These mid-tone status accents read on both light and dark.
@@ -638,9 +640,10 @@ impl App {
             }
             return;
         }
+        let anchors = self.pin_anchors();
         let Some(pos) = self.idx_of(id) else { return };
         let mut s = self.sessions.remove(pos);
-        let old_group = std::mem::replace(&mut s.group, group.clone());
+        s.group = group.clone();
         let insert = match before.and_then(|b| self.idx_of(b)) {
             Some(p) => p,
             None => match self.sessions.iter().rposition(|x| x.group == group) {
@@ -656,19 +659,49 @@ impl App {
                 },
             },
         };
-        // Pinned rows are barriers: jumping over one is what would shove it out
-        // of its place, so that move is refused (its pin shakes) and the dragged
-        // session goes back where it was.
-        let span = if insert > pos { pos..insert } else { insert..pos };
-        if let Some(blocker) = self.sessions[span].iter().find(|x| x.pinned).map(|x| x.id) {
-            s.group = old_group;
-            self.sessions.insert(pos, s);
-            self.pin_shake = Some((blocker, Instant::now()));
-            return;
-        }
         self.sessions.insert(insert, s);
         self.normalize_order();
+        // Everything moves freely past a pinned row - the pinned row itself just
+        // never leaves its slot number, so whoever lands on it is pushed one
+        // place further down.
+        self.reseat_pinned(&anchors);
         self.persist();
+    }
+
+    /// Slot each pinned session occupies right now, counted inside its own group
+    /// (or the ungrouped block). Captured before a move, replayed after it.
+    fn pin_anchors(&self) -> Vec<(u64, usize)> {
+        self.sessions
+            .iter()
+            .filter(|s| s.pinned)
+            .map(|s| {
+                let slot = self
+                    .sessions
+                    .iter()
+                    .filter(|x| x.group == s.group)
+                    .position(|x| x.id == s.id)
+                    .unwrap_or(0);
+                (s.id, slot)
+            })
+            .collect()
+    }
+
+    fn reseat_pinned(&mut self, anchors: &[(u64, usize)]) {
+        if anchors.is_empty() {
+            return;
+        }
+        let mut order: Vec<u64> = Vec::with_capacity(self.sessions.len());
+        let mut done: Vec<Option<String>> = Vec::new();
+        for g in self.sessions.iter().map(|s| s.group.clone()) {
+            if done.contains(&g) {
+                continue;
+            }
+            let members: Vec<u64> =
+                self.sessions.iter().filter(|x| x.group == g).map(|x| x.id).collect();
+            order.extend(seat_pinned(&members, anchors));
+            done.push(g);
+        }
+        self.sessions.sort_by_key(|s| order.iter().position(|&id| id == s.id).unwrap_or(usize::MAX));
     }
 
     /// Move a whole group's contiguous block of sessions before `before`'s block
@@ -2102,7 +2135,11 @@ impl App {
         // Context badge: pill with the session's context %, top-right.
         // No index entry = no badge (never a fake 0%).
         let ctx_entry = s.claude_session_id.as_deref().and_then(|sid| self.ctx_index.get(sid));
-        let mut name_max: usize = 26;
+        // Text budgets follow the panel width - widening it is what shows more
+        // of a long name. The divisors are the average glyph advance at each
+        // size, calibrated so the default 236px panel keeps its old cutoffs.
+        let text_w = rect.width() - indent - 28.0;
+        let mut name_max = ((text_w - 34.0) / 6.6).max(4.0) as usize;
         if let Some(e) = ctx_entry {
             let pct = e.pct.clamp(1.0, 100.0);
             let lt = palette::light();
@@ -2146,15 +2183,12 @@ impl App {
             if pct >= 70.0 {
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
             }
-            name_max = 21;
+            // The badge eats into the name's line.
+            name_max = name_max.saturating_sub(5);
         }
 
         let text_x = x0 + 28.0;
-        // Indented rows have less room before the badge/close button.
-        if indent > 0.0 {
-            name_max = name_max.saturating_sub(2);
-        }
-        let path_len = if indent > 0.0 { 30 } else { 34 };
+        let path_len = ((text_w - 10.0) / 5.6).max(6.0) as usize;
         let name_color = if selected { palette::text_strong() } else { palette::text() };
         // The name is replaced by an inline editor while renaming (drawn below).
         if !renaming {
@@ -3946,13 +3980,24 @@ impl eframe::App for App {
             }
         }
 
-        let acts = egui::Panel::left("sidebar")
-            .exact_size(236.0)
-            .resizable(false)
+        // Session panel: drag its right edge. Never past half the window (the
+        // terminal has to stay the main thing) and never below a width where a
+        // row still reads - name, path and the close button.
+        let max_w = (ui.max_rect().width() * 0.5).max(SIDEBAR_MIN);
+        let panel = egui::Panel::left("sidebar")
+            .default_size(self.settings.sidebar_w.clamp(SIDEBAR_MIN, max_w))
+            .size_range(SIDEBAR_MIN..=max_w)
+            .resizable(true)
             .frame(Frame::new().fill(palette::chrome_sidebar()))
-            .show(ui, |ui| self.sidebar(ui))
-            .inner;
-        self.apply(acts, &ctx);
+            .show(ui, |ui| self.sidebar(ui));
+        // Remember the dragged width; it rides along with the next persist
+        // (any session change, and the one on exit) rather than writing state
+        // on every pixel of the drag.
+        let w = panel.response.rect.width();
+        if (w - self.settings.sidebar_w).abs() > 0.5 {
+            self.settings.sidebar_w = w;
+        }
+        self.apply(panel.inner, &ctx);
 
         if self.explorer.open {
             let acts = egui::Panel::left("explorer")
@@ -4460,6 +4505,37 @@ fn paint_pin(p: &egui::Painter, c: Pos2, filled: bool, col: Color32) {
     );
 }
 
+/// Put the pinned ids back on the slot numbers they held before a move, and let
+/// the rest keep their new order in whatever slots are left. A pinned row that
+/// someone else was dropped onto stays put; the newcomer takes the next slot.
+fn seat_pinned(members: &[u64], anchors: &[(u64, usize)]) -> Vec<u64> {
+    let len = members.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut slots: Vec<Option<u64>> = vec![None; len];
+    let mut want: Vec<(u64, usize)> =
+        anchors.iter().filter(|(id, _)| members.contains(id)).copied().collect();
+    want.sort_by_key(|&(_, slot)| slot);
+    for (id, slot) in want {
+        // Two pins claiming one slot (the list got shorter): the later one takes
+        // the next free place, wrapping rather than dropping anybody.
+        let mut at = slot.min(len - 1);
+        while slots[at].is_some() {
+            at = (at + 1) % len;
+        }
+        slots[at] = Some(id);
+    }
+    let seated: Vec<u64> = slots.iter().flatten().copied().collect();
+    let mut rest = members.iter().filter(|id| !seated.contains(id));
+    for slot in slots.iter_mut() {
+        if slot.is_none() {
+            *slot = rest.next().copied();
+        }
+    }
+    slots.into_iter().flatten().collect()
+}
+
 /// Filled width of a limit bar. A freshly reset window sits at 1-2%, which is a
 /// third of a pixel on the corner chip - too little to tell "just reset" from
 /// "not loaded", so anything above zero keeps a visible stub.
@@ -4518,6 +4594,30 @@ mod font_tests {
                 assert!(w > 0.0, "{key}: no glyph width");
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::seat_pinned;
+
+    #[test]
+    fn pinned_row_keeps_its_slot_number() {
+        // 1 2 3 4 5 with 3 pinned to slot 2; 4 is dropped above 2. The plain
+        // move gives 1 4 2 3 5 - 3 must come back to slot 2, pushing 2 down.
+        assert_eq!(seat_pinned(&[1, 4, 2, 3, 5], &[(3, 2)]), vec![1, 4, 3, 2, 5]);
+        // 2 pinned to slot 1; 5 dropped on top. Plain move: 5 1 2 3 4.
+        assert_eq!(seat_pinned(&[5, 1, 2, 3, 4], &[(2, 1)]), vec![5, 2, 1, 3, 4]);
+        // Dropping something straight onto the pinned slot leaves it alone.
+        assert_eq!(seat_pinned(&[1, 2, 4, 3, 5], &[(3, 2)]), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn two_pins_and_a_shrunken_list() {
+        assert_eq!(seat_pinned(&[4, 1, 2, 3], &[(1, 0), (3, 2)]), vec![1, 4, 3, 2]);
+        // The anchor outlives the row count it was taken at: clamp, never drop.
+        assert_eq!(seat_pinned(&[1, 2], &[(2, 7)]), vec![1, 2]);
+        assert!(seat_pinned(&[], &[(1, 0)]).is_empty());
     }
 }
 
