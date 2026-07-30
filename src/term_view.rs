@@ -654,7 +654,100 @@ fn probe_path(
     }
     let cwd = crate::plat::pid_cwd(shell_pid).unwrap_or_else(|| fallback_cwd.to_path_buf());
     let p = resolve_link(token, &cwd)?;
-    p.exists().then_some(p)
+    if p.exists() {
+        return Some(p);
+    }
+    let rel = std::path::Path::new(token);
+    if rel.is_absolute() || token.starts_with('~') {
+        // Nothing left to guess about a rooted path except how it is spelled.
+        return join_ci(std::path::Path::new("/"), p.strip_prefix("/").ok()?);
+    }
+    // A multi-component relative token is worth hunting for; a bare name is not
+    // (too many files share one, and prose like "e.g." would start a walk).
+    if !token.contains('/') {
+        return None;
+    }
+    find_near(rel, &cwd)
+}
+
+/// `base/rel` with each component matched case-insensitively when the exact name
+/// is missing. macOS volumes ignore case by default, so this is for the ones
+/// that do not (case-sensitive APFS, linux).
+fn join_ci(base: &std::path::Path, rel: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    let mut cur = base.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(name) => {
+                let exact = cur.join(name);
+                if exact.exists() {
+                    cur = exact;
+                    continue;
+                }
+                let want = name.to_string_lossy().to_lowercase();
+                let hit = std::fs::read_dir(&cur)
+                    .ok()?
+                    .flatten()
+                    .find(|e| e.file_name().to_string_lossy().to_lowercase() == want)?;
+                cur = hit.path();
+            },
+            Component::CurDir => {},
+            Component::ParentDir => {
+                cur.pop();
+            },
+            _ => return None,
+        }
+    }
+    Some(cur)
+}
+
+/// Where else a relative path printed in the terminal can live. Two cases, both
+/// common: an agent prints paths from its project root while the shell sits
+/// deeper (look up), and the first folder of the path sits below the cwd -
+/// `reels/01/cover.json` inside `content-factory/` (look down, bounded).
+fn find_near(rel: &std::path::Path, cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    const MAX_UP: usize = 6;
+    const MAX_DEPTH: usize = 3;
+    const MAX_DIRS: usize = 250;
+    const SKIP: &[&str] = &["node_modules", "target", "dist", "build", ".next", ".venv"];
+
+    for base in cwd.ancestors().skip(1).take(MAX_UP) {
+        if let Some(p) = join_ci(base, rel) {
+            return Some(p);
+        }
+    }
+    // Downward: one stat per directory (the whole `rel` at once), never a listing
+    // of the files inside, and capped so a deep tree cannot stall the hover. Exact
+    // spelling only - fixing case here would cost a listing per path component
+    // per directory visited.
+    let mut queue = std::collections::VecDeque::from([(cwd.to_path_buf(), 0usize)]);
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = queue.pop_front() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || SKIP.contains(&name.as_ref()) {
+                continue;
+            }
+            visited += 1;
+            if visited > MAX_DIRS {
+                return None;
+            }
+            let sub = e.path();
+            let hit = sub.join(rel);
+            if hit.exists() {
+                return Some(hit);
+            }
+            if depth + 1 < MAX_DEPTH {
+                queue.push_back((sub, depth + 1));
+            }
+        }
+    }
+    None
 }
 
 /// Resolve a path token to an absolute path: `~` expands to home, relative
@@ -867,7 +960,7 @@ fn encode_key(key: Key, mods: Modifiers, mode: TermMode, claude: bool) -> Option
 
 #[cfg(test)]
 mod tests {
-    use super::link_span;
+    use super::{find_near, join_ci, link_span};
 
     fn span(s: &str, col: usize) -> Option<(std::ops::Range<usize>, String)> {
         link_span(&s.chars().collect::<Vec<_>>(), col)
@@ -903,5 +996,31 @@ mod tests {
     fn none_over_line_number() {
         // Hovering the "42" (past the stripped path) yields no link.
         assert_eq!(span("main.rs:42", 8), None);
+    }
+
+    #[test]
+    fn finds_path_below_and_above_the_cwd() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("kip_link_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let deep = base.join("content-factory/reels/01-ferritin/inst/en");
+        fs::create_dir_all(&deep).unwrap();
+        fs::create_dir_all(base.join("node_modules/reels/01-ferritin/inst/en")).unwrap();
+        fs::write(deep.join("cover.json"), "").unwrap();
+        fs::write(base.join("node_modules/reels/01-ferritin/inst/en/cover.json"), "").unwrap();
+        let rel = std::path::Path::new("reels/01-ferritin/inst/en/cover.json");
+
+        // A folder deep: cwd is the session's, the path starts one level below it.
+        assert_eq!(find_near(rel, &base), Some(deep.join("cover.json")));
+        // The same path printed from a cwd deeper than the folder it starts at.
+        assert_eq!(find_near(rel, &deep), Some(deep.join("cover.json")));
+        // Nothing to find: no hit, and node_modules was never even entered.
+        assert_eq!(find_near(std::path::Path::new("reels/nope.json"), &base), None);
+
+        // Case only. A case-insensitive volume (the macOS default) resolves it by
+        // the literal spelling, so compare what it points at, not how it reads.
+        let ci = join_ci(&base, std::path::Path::new("Content-Factory/REELS")).unwrap();
+        assert_eq!(ci.canonicalize().ok(), base.join("content-factory/reels").canonicalize().ok());
+        let _ = fs::remove_dir_all(&base);
     }
 }
