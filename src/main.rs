@@ -420,7 +420,10 @@ impl App {
         update::check(app.upd_tx.clone(), cc.egui_ctx.clone());
         // Finder "New kip Window Here" -> a new session at the picked folder.
         #[cfg(target_os = "macos")]
-        mac_service::register(cc.egui_ctx.clone());
+        {
+            mac_service::register(cc.egui_ctx.clone());
+            mac_service::hook_paste();
+        }
         app
     }
 
@@ -3914,18 +3917,10 @@ impl eframe::App for App {
         }
 
         // Paste without text (Finder file, screenshot image) -> insert as a path.
-        let mut file_paste = false;
-        ctx.input_mut(|i| {
-            i.events.retain(|e| {
-                if matches!(e, egui::Event::Paste(t) if t.trim().is_empty()) {
-                    file_paste = true;
-                    false
-                } else {
-                    true
-                }
-            })
-        });
-        if file_paste {
+        // Such a pasteboard has no string type, so egui emits no paste event at
+        // all; the Cmd+V hook is what tells us it happened. When egui did produce
+        // a paste event the text is the paste and the terminal handles it.
+        if paste_shortcut() && ctx.input(|i| !i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))) {
             if let Some(p) = plat::clipboard_paths() {
                 self.insert_paths(shell_escape(&p));
             }
@@ -4459,6 +4454,16 @@ fn select_all_text(ctx: &egui::Context, id: egui::Id, char_len: usize) {
             .set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(char_len))));
         state.store(ctx, id);
     }
+}
+
+/// Cmd+V pressed since the last frame. Only macOS hooks the shortcut (that is
+/// where the file/image pasteboard is read), elsewhere egui's paste event is all
+/// there is.
+fn paste_shortcut() -> bool {
+    #[cfg(target_os = "macos")]
+    return mac_service::take_paste();
+    #[cfg(not(target_os = "macos"))]
+    false
 }
 
 /// Backslash-escape a path for the shell; claude also understands this form.

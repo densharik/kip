@@ -1,18 +1,26 @@
-//! macOS Finder Services integration: "New kip Window Here". An `NSServices`
-//! entry in Info.plist adds the item to Finder's Services submenu for files and
-//! folders; macOS routes the pick to the provider registered here, which queues
-//! the chosen folder (a file's containing folder) for the egui loop to open as
-//! a new session - the same way Warp/iTerm expose "New Window Here".
+//! macOS AppKit glue.
+//!
+//! Finder Services integration: "New kip Window Here". An `NSServices` entry in
+//! Info.plist adds the item to Finder's Services submenu for files and folders;
+//! macOS routes the pick to the provider registered here, which queues the
+//! chosen folder (a file's containing folder) for the egui loop to open as a new
+//! session - the same way Warp/iTerm expose "New Window Here".
+//!
+//! Plus the Cmd+V monitor, see `hook_paste`.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{define_class, msg_send, AnyThread, MainThreadMarker};
 use objc2_app_kit::{
-    NSApplication, NSPasteboard, NSPasteboardType, NSPasteboardTypeString, NSUpdateDynamicServices,
+    NSApplication, NSEvent, NSEventMask, NSEventModifierFlags, NSPasteboard, NSPasteboardType,
+    NSPasteboardTypeString, NSUpdateDynamicServices,
 };
 use objc2_foundation::NSString;
 
@@ -113,6 +121,41 @@ pub fn register(ctx: egui::Context) {
     std::mem::forget(provider);
     // Pick up the Info.plist NSServices entry now instead of after a relogin.
     NSUpdateDynamicServices();
+}
+
+/// Cmd+V seen since the last `take_paste`.
+static PASTE: AtomicBool = AtomicBool::new(false);
+
+/// Watch Cmd+V ourselves. egui answers the shortcut by reading the clipboard as
+/// text and pushes no event at all when there is none - which is exactly the
+/// case for a copied Finder file or a screenshot (those pasteboards carry no
+/// string type), so the app never learned the user pasted. The monitor sees the
+/// keystroke regardless of what the clipboard holds; the UI loop then goes to
+/// the pasteboard for a path (`plat::clipboard_paths`). Main thread, once.
+pub fn hook_paste() {
+    // kVK_ANSI_V. The code is the physical key, so this also fires in non-latin
+    // layouts - matching how egui resolves the paste shortcut for text.
+    const KEY_V: u16 = 9;
+    let block = RcBlock::new(|ev: NonNull<NSEvent>| -> *mut NSEvent {
+        let e = unsafe { ev.as_ref() };
+        if e.keyCode() == KEY_V && e.modifierFlags().contains(NSEventModifierFlags::Command) {
+            PASTE.store(true, Ordering::Relaxed);
+            if let Some(ctx) = CTX.get() {
+                ctx.request_repaint();
+            }
+        }
+        // Hand the event back untouched: a text paste is still egui's job.
+        ev.as_ptr()
+    });
+    // SAFETY: the block returns the event it was given, which is a valid pointer.
+    unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block) };
+    // The monitor is never removed, so the block has to outlive this call.
+    std::mem::forget(block);
+}
+
+/// Cmd+V arrived since the last call.
+pub fn take_paste() -> bool {
+    PASTE.swap(false, Ordering::Relaxed)
 }
 
 /// Folders queued by the Service since the last call, for the UI loop to open.
