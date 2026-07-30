@@ -133,12 +133,24 @@ static PASTE: AtomicBool = AtomicBool::new(false);
 /// keystroke regardless of what the clipboard holds; the UI loop then goes to
 /// the pasteboard for a path (`plat::clipboard_paths`). Main thread, once.
 pub fn hook_paste() {
-    // kVK_ANSI_V. The code is the physical key, so this also fires in non-latin
-    // layouts - matching how egui resolves the paste shortcut for text.
+    // kVK_ANSI_V, the physical key.
     const KEY_V: u16 = 9;
     let block = RcBlock::new(|ev: NonNull<NSEvent>| -> *mut NSEvent {
         let e = unsafe { ev.as_ref() };
-        if e.keyCode() == KEY_V && e.modifierFlags().contains(NSEventModifierFlags::Command) {
+        // Which key counts as V has to match egui exactly, or the two disagree
+        // about what a paste is: egui takes the character the layout produces and
+        // only falls back to the physical key when that character is not one it
+        // knows. So does this - a latin layout is read by its letter (V sits
+        // elsewhere on Dvorak), a cyrillic one by the key position.
+        let ch = e
+            .charactersIgnoringModifiers()
+            .map(|s| s.to_string().to_lowercase())
+            .unwrap_or_default();
+        let is_v = match ch.chars().next() {
+            Some(c) if c.is_ascii_alphabetic() => ch == "v",
+            _ => e.keyCode() == KEY_V,
+        };
+        if is_v && e.modifierFlags().contains(NSEventModifierFlags::Command) {
             PASTE.store(true, Ordering::Relaxed);
             if let Some(ctx) = CTX.get() {
                 ctx.request_repaint();
@@ -148,8 +160,11 @@ pub fn hook_paste() {
         ev.as_ptr()
     });
     // SAFETY: the block returns the event it was given, which is a valid pointer.
-    unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block) };
-    // The monitor is never removed, so the block has to outlive this call.
+    let monitor =
+        unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block) };
+    // The monitor is never removed, so both it and its block have to outlive this
+    // call - AppKit's own reference to either is not documented.
+    std::mem::forget(monitor);
     std::mem::forget(block);
 }
 

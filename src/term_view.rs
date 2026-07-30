@@ -717,7 +717,9 @@ fn find_near(rel: &std::path::Path, cwd: &std::path::Path) -> Option<std::path::
         }
     }
     // Downward: one stat per directory (the whole `rel` at once), never a listing
-    // of the files inside, and capped so a deep tree cannot stall the hover.
+    // of the files inside, and capped so a deep tree cannot stall the hover. Exact
+    // spelling only - fixing case here would cost a listing per path component
+    // per directory visited.
     let mut queue = std::collections::VecDeque::from([(cwd.to_path_buf(), 0usize)]);
     let mut visited = 0usize;
     while let Some((dir, depth)) = queue.pop_front() {
