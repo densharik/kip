@@ -32,6 +32,10 @@ pub struct Settings {
     pub lang: String,
     /// Width of the session panel, dragged by its right edge.
     pub sidebar_w: f32,
+    /// Show how long ago Claude last replied, in the session row's corner.
+    pub show_last_msg: bool,
+    /// Draw a hairline between sidebar rows.
+    pub row_separators: bool,
     /// Key of the usage limit pinned to the corner chip (see usage::Limit::key).
     pub usage_pin: Option<String>,
     /// Settings schema version, so a changed default can reach existing installs
@@ -65,6 +69,8 @@ impl Default for Settings {
             accent: None,
             lang: "auto".into(),
             sidebar_w: 236.0,
+            show_last_msg: true,
+            row_separators: false,
             usage_pin: None,
             version: SETTINGS_VERSION,
         }

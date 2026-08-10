@@ -38,6 +38,9 @@ pub struct CtxUpdate {
     pub pct: f32,
     pub exact: bool,
     pub source_ts: SystemTime,
+    /// When Claude last answered in this session, straight from the transcript.
+    /// Only a transcript read can know it - a hook snapshot carries None.
+    pub last_msg: Option<SystemTime>,
 }
 
 pub enum CtxMsg {
@@ -51,6 +54,10 @@ pub enum CtxMsg {
 #[derive(Default)]
 pub struct CtxIndex {
     map: HashMap<String, CtxEntry>,
+    /// Last Claude reply per session. Kept apart from `map` because the two
+    /// merge differently: the % is whatever the freshest source says, while a
+    /// reply that already happened can only move forward.
+    last: HashMap<String, SystemTime>,
 }
 
 impl CtxIndex {
@@ -58,9 +65,25 @@ impl CtxIndex {
         self.map.get(sid).copied()
     }
 
+    pub fn last_msg(&self, sid: &str) -> Option<SystemTime> {
+        self.last.get(sid).copied()
+    }
+
     /// Merge by SOURCE time, never read time: a late background scan must not
     /// overwrite fresher data. Tie (±2s) prefers exact. pct<=0 = no data.
     pub fn apply(&mut self, u: CtxUpdate) {
+        if let Some(t) = u.last_msg {
+            match self.last.get_mut(&u.sid) {
+                Some(cur) => {
+                    if t > *cur {
+                        *cur = t;
+                    }
+                },
+                None => {
+                    self.last.insert(u.sid.clone(), t);
+                },
+            }
+        }
         if u.pct <= 0.0 || !u.pct.is_finite() {
             return;
         }
@@ -232,6 +255,7 @@ fn parse_snapshot(text: &str) -> Option<CtxUpdate> {
         pct: pct.min(100.0),
         exact: true,
         source_ts: SystemTime::UNIX_EPOCH + Duration::from_secs(ts),
+        last_msg: None,
     })
 }
 
@@ -344,6 +368,11 @@ pub fn estimate_from_jsonl(path: &Path, sid: &str) -> Option<CtxUpdate> {
                 pct,
                 exact: false,
                 source_ts: ts.or(mtime).unwrap_or_else(SystemTime::now),
+                // That usage entry IS Claude's last main-chain answer, so its
+                // own timestamp is the last-reply time. mtime is NOT a fallback
+                // here: the transcript is also touched by user messages and
+                // tool results, which would read as Claude having answered.
+                last_msg: ts,
             });
         }
         if start == 0 {
@@ -602,7 +631,7 @@ mod tests {
     }
 
     fn upd(sid: &str, pct: f32, exact: bool, t: u64) -> CtxUpdate {
-        CtxUpdate { sid: sid.into(), pct, exact, source_ts: ts(t) }
+        CtxUpdate { sid: sid.into(), pct, exact, source_ts: ts(t), last_msg: None }
     }
 
     fn tdir(name: &str) -> PathBuf {
@@ -669,6 +698,37 @@ mod tests {
         idx.apply(upd(SID, 90.0, false, 4000));
         let e = idx.get(SID).unwrap();
         assert!(e.exact && e.pct == 40.0);
+    }
+
+    // -- last reply --
+
+    #[test]
+    fn last_msg_only_moves_forward_and_survives_snapshots() {
+        let mut idx = CtxIndex::default();
+        assert!(idx.last_msg(SID).is_none());
+        let mut u = upd(SID, 50.0, false, 4000);
+        u.last_msg = Some(ts(4000));
+        idx.apply(u);
+        assert_eq!(idx.last_msg(SID), Some(ts(4000)));
+        // A newer hook snapshot wins the % but knows nothing about replies.
+        idx.apply(upd(SID, 55.0, true, 5000));
+        assert_eq!(idx.last_msg(SID), Some(ts(4000)));
+        // A late scan of an older tail must not rewind it.
+        let mut old = upd(SID, 50.0, false, 1000);
+        old.last_msg = Some(ts(1000));
+        idx.apply(old);
+        assert_eq!(idx.last_msg(SID), Some(ts(4000)));
+    }
+
+    #[test]
+    fn estimate_reports_the_assistant_timestamp() {
+        let dir = tdir("lastmsg");
+        let path = dir.join(format!("{SID}.jsonl"));
+        // A user line after Claude's answer: the reply time must stay Claude's.
+        let good = usage_line(1000, 150_000, "claude-fable-5", "2026-07-23T12:38:25.388Z");
+        std::fs::write(&path, format!("{good}\n{{\"type\":\"user\"}}\n")).unwrap();
+        let u = estimate_from_jsonl(&path, SID).unwrap();
+        assert_eq!(u.last_msg, Some(ts(1_784_810_305)));
     }
 
     // -- window heuristic --

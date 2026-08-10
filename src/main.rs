@@ -38,6 +38,8 @@ use session::{poll_git, spawn_live, EventProxy, GitStats, Phase, Session};
 
 const TICK: Duration = Duration::from_secs(2);
 const GIT_INTERVAL: Duration = Duration::from_secs(7);
+/// Transcript re-check for sessions claude is not currently running in.
+const IDLE_SCAN: Duration = Duration::from_secs(10);
 const BUSY_NOTIFY_MIN: Duration = Duration::from_secs(5);
 /// How long a pinned row's refusal wobble lasts.
 const SHAKE_SECS: f32 = 0.45;
@@ -215,6 +217,8 @@ struct App {
     jsonl_map: ctx_index::SharedMap,
     /// Own 500ms cadence of the context poller, independent of TICK.
     last_ctx_stat: Option<Instant>,
+    /// Slow cadence of the transcript pass for sessions without a live claude.
+    last_idle_scan: Option<Instant>,
     hook_error: Option<String>,
     update_state: UpdateState,
     upd_tx: Sender<update::UpdateMsg>,
@@ -341,6 +345,7 @@ impl App {
             ctxi_rx,
             jsonl_map,
             last_ctx_stat: None,
+            last_idle_scan: None,
             hook_error: None,
             update_state: UpdateState::Idle,
             upd_tx,
@@ -1530,6 +1535,24 @@ impl App {
                     ctx_index::spawn_sid_read(sid.clone(), tx.clone(), ctx.clone());
                 }
             }
+        }
+
+        // Transcript pass, deliberately outside the loop above: that one only
+        // follows the tab claude is running in, but the last-reply time has to
+        // be right for a suspended, exited or just-restored tab too - and the
+        // transcript is the only source that survives a restart. Live claude
+        // keeps the 500ms cadence, everything else is re-checked every
+        // IDLE_SCAN, and a file whose (mtime, len) has not moved is never read.
+        let slow = self.last_idle_scan.is_none_or(|t| now.duration_since(t) >= IDLE_SCAN);
+        if slow {
+            self.last_idle_scan = Some(now);
+        }
+        for s in &mut self.sessions {
+            let fast = s.fg_is_claude || s.burst_until.is_some_and(|t| now < t);
+            if !fast && !slow {
+                continue;
+            }
+            let Some(sid) = s.claude_session_id.clone() else { continue };
             // Transcript jump: the estimate lands before the next hook tick.
             if s.ctx_stat.path_sid.as_deref() != Some(sid.as_str()) {
                 let hit = map.try_lock().ok().and_then(|m| m.map.get(&sid).cloned());
@@ -1546,7 +1569,7 @@ impl App {
                         .and_then(|m| Some((m.modified().ok()?, m.len())));
                     if st.is_some() && st != s.ctx_stat.jsonl_state {
                         s.ctx_stat.jsonl_state = st;
-                        ctx_index::spawn_estimate(sid.clone(), p, tx.clone(), ctx.clone());
+                        ctx_index::spawn_estimate(sid, p, tx.clone(), ctx.clone());
                     }
                 },
                 _ => {
@@ -1557,13 +1580,7 @@ impl App {
                         .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(5))
                     {
                         s.ctx_stat.last_resolve = Some(now);
-                        ctx_index::lookup(
-                            sid.clone(),
-                            s.cwd.clone(),
-                            map.clone(),
-                            tx.clone(),
-                            ctx.clone(),
-                        );
+                        ctx_index::lookup(sid, s.cwd.clone(), map.clone(), tx.clone(), ctx.clone());
                     }
                 },
             }
@@ -1658,12 +1675,29 @@ impl App {
         let mut items: Vec<DropItem> = Vec::new();
         let mut released = false;
         let mut group_released = false;
+        // Optional hairline in the gap above each row. Drawn here rather than
+        // inside the rows because only this loop knows what came before: the
+        // first line drawn would be a stray rule under the toolbar.
+        let sep = self.settings.row_separators;
+        let mut first = true;
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let rule = |ui: &egui::Ui, rect: Rect, first: &mut bool| {
+                if sep && !*first {
+                    let x = ui.max_rect().x_range();
+                    ui.painter().hline(
+                        egui::Rangef::new(x.min + 10.0, x.max - 10.0),
+                        rect.min.y - 3.0,
+                        Stroke::new(1.0, palette::border_dim()),
+                    );
+                }
+                *first = false;
+            };
             for slot in self.sidebar_order() {
                 match slot {
                     Slot::Header(name) => {
                         let collapsed = self.collapsed_groups.contains(&name);
                         let (rect, rel) = self.group_header(ui, &name, collapsed, &mut acts);
+                        rule(ui, rect, &mut first);
                         group_released |= rel;
                         items.push(DropItem { rect, id: None, group: Some(name), is_header: true });
                     },
@@ -1677,6 +1711,7 @@ impl App {
                         // Members sit indented under their header.
                         let indent = if group.is_some() { 14.0 } else { 0.0 };
                         let (rect, rel) = self.session_row(ui, idx, indent, &mut acts);
+                        rule(ui, rect, &mut first);
                         released |= rel;
                         items.push(DropItem { rect, id: Some(id), group, is_header: false });
                     },
@@ -2190,8 +2225,24 @@ impl App {
             name_max = name_max.saturating_sub(5);
         }
 
+        // How long since Claude last answered here. It lives in the bottom-right
+        // corner, under the % badge, so a long name keeps its whole line - and
+        // it comes from the transcript, so a tab restored from yesterday says
+        // yesterday instead of restarting the clock.
+        let ago = self
+            .settings
+            .show_last_msg
+            .then(|| s.claude_session_id.as_deref())
+            .flatten()
+            .and_then(|sid| self.ctx_index.last_msg(sid))
+            .map(|t| {
+                painter.layout_no_wrap(fmt_ago(t), FontId::proportional(9.0), palette::text_faint())
+            });
+
         let text_x = x0 + 28.0;
-        let path_len = ((text_w - 10.0) / 5.6).max(6.0) as usize;
+        // The corner label takes its width off the path, never off the name.
+        let path_w = text_w - 10.0 - ago.as_ref().map_or(0.0, |g| g.size().x + 8.0);
+        let path_len = (path_w / 5.6).max(6.0) as usize;
         let name_color = if selected { palette::text_strong() } else { palette::text() };
         // The name is replaced by an inline editor while renaming (drawn below).
         if !renaming {
@@ -2210,6 +2261,17 @@ impl App {
             FontId::proportional(10.5),
             palette::text_faint(),
         );
+        if let Some(g) = ago {
+            let size = g.size();
+            painter.galley(
+                Pos2::new(rect.max.x - 8.0 - size.x, rect.max.y - 8.0 - size.y / 2.0),
+                g,
+                palette::text_faint(),
+            );
+            // Minute granularity: on an idle app nothing else asks for a frame,
+            // and the label would sit frozen at whatever it said last.
+            ui.ctx().request_repaint_after(Duration::from_secs(20));
+        }
 
         // Right side: close button on hover, otherwise unread / suspended marker.
         // The interact widget exists every frame; only the drawing is conditional,
@@ -3745,6 +3807,20 @@ impl App {
                 ui.checkbox(&mut self.settings.notify_sound, tr("Звук уведомлений", "Notification sound"));
                 ui.checkbox(&mut self.settings.copy_on_select, tr("Копировать выделенное сразу в буфер", "Copy selection to clipboard immediately"));
                 ui.checkbox(
+                    &mut self.settings.show_last_msg,
+                    tr("Время последнего ответа Claude в списке сессий", "Time since Claude's last reply in the session list"),
+                )
+                .on_hover_text(tr(
+                    "В углу строки, под процентом контекста: сколько прошло с последнего ответа Claude \
+                     в этой сессии. Берётся из транскрипта, поэтому у вчерашней сессии там и будет вчера.",
+                    "In the row's corner, under the context %: how long since Claude last answered in \
+                     that session. Read from the transcript, so yesterday's session says yesterday.",
+                ));
+                ui.checkbox(
+                    &mut self.settings.row_separators,
+                    tr("Разделять сессии линией", "Separator line between sessions"),
+                );
+                ui.checkbox(
                     &mut self.settings.skip_permissions_default,
                     tr(
                         "skip-permissions по умолчанию для новых сессий",
@@ -4572,6 +4648,21 @@ fn fmt_until(target: u64) -> String {
         format!("{}{}", left / 60 + 1, tr("м", "m"))
     };
     format!("{} {body}", tr("сброс через", "resets in"))
+}
+
+/// Age of Claude's last reply, in the narrowest form that still reads: the row
+/// corner has room for a few glyphs, not for "2 hours 14 minutes ago".
+fn fmt_ago(t: SystemTime) -> String {
+    let s = SystemTime::now().duration_since(t).map(|d| d.as_secs()).unwrap_or(0);
+    if s < 60 {
+        tr("сейчас", "now").to_string()
+    } else if s < 3600 {
+        format!("{}{}", s / 60, tr("м", "m"))
+    } else if s < 86400 {
+        format!("{}{}", s / 3600, tr("ч", "h"))
+    } else {
+        format!("{}{}", s / 86400, tr("д", "d"))
+    }
 }
 
 fn fmt_dur(d: Duration) -> String {
