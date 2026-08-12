@@ -2661,13 +2661,23 @@ impl App {
         // the singleline consume below lets through to the editor). Plain Enter
         // still submits. While multiline, arrows move the caret, not history.
         let multiline = self.cmd_input.contains('\n');
+        // Down on the last line has nowhere to go, so make it mean "end of the
+        // text" the way every editor does.
+        let editor_id = egui::Id::new("cmdline-editor");
+        let caret = egui::text_edit::TextEditState::load(&ctx, editor_id)
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| r.primary.index.0);
+        let last_line = on_last_line(&self.cmd_input, caret);
         let (mut enter, mut up, mut down, mut esc) = (false, false, false, false);
+        let mut to_end = false;
         if interactive {
             ctx.input_mut(|i| {
                 enter = consume_plain(i, Key::Enter);
                 if !multiline {
                     up = consume_plain(i, Key::ArrowUp);
                     down = consume_plain(i, Key::ArrowDown);
+                } else if last_line {
+                    to_end = consume_plain(i, Key::ArrowDown);
                 }
                 esc = consume_plain(i, Key::Escape);
                 // Tab would move egui focus away from the editor.
@@ -2700,7 +2710,7 @@ impl App {
 
         // Any programmatic fill (history nav) or a plain ArrowDown puts the caret
         // at the end of the line - Down means "end of line" by habit.
-        let mut caret_end = false;
+        let mut caret_end = to_end;
         if up {
             if hist_visible {
                 // A background history reload can shrink the filtered list under
@@ -2780,6 +2790,7 @@ impl App {
                     // submits, so the editor never sees it.
                     let resp = ui.add(
                         egui::TextEdit::multiline(&mut self.cmd_input)
+                            .id(editor_id)
                             .frame(Frame::new())
                             .font(font.clone())
                             .desired_rows(1)
@@ -4519,6 +4530,15 @@ fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
+/// Caret sits on the last line when no newline follows it. An editor that has
+/// not stored a caret yet (first frame) counts as being on it.
+fn on_last_line(text: &str, caret: Option<usize>) -> bool {
+    match caret {
+        Some(i) => !text.chars().skip(i).any(|c| c == '\n'),
+        None => true,
+    }
+}
+
 /// Select the whole rename buffer so the first keystroke replaces the old
 /// name instead of appending. Runs the frame focus is requested; the TextEdit
 /// has already stored its state by then, so load-modify-store wins.
@@ -4690,6 +4710,24 @@ mod font_tests {
                 assert!(w > 0.0, "{key}: no glyph width");
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod cmdline_tests {
+    use super::on_last_line;
+
+    #[test]
+    fn down_only_jumps_to_the_end_from_the_last_line() {
+        let text = "one\ntwo";
+        assert!(!on_last_line(text, Some(1))); // inside "one"
+        assert!(!on_last_line(text, Some(3))); // at the newline
+        assert!(on_last_line(text, Some(4))); // start of "two"
+        assert!(on_last_line(text, Some(7))); // end of the text
+        assert!(on_last_line("one line", Some(0)));
+        assert!(on_last_line(text, None));
+        // Char indexing, not bytes: the caret is on the second line here.
+        assert!(on_last_line("привет\nмир", Some(8)));
     }
 }
 
