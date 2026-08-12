@@ -113,6 +113,8 @@ pub struct Session {
     pub last_git_poll: Option<Instant>,
     pub git_inflight: bool,
     pub scroll_accum: f32,
+    /// Auto-repeat streak of a held Backspace (drives word-wise erase).
+    pub bs_repeat: u8,
     /// Name of the PTY foreground process while busy (e.g. "claude").
     pub fg_name: Option<String>,
     /// The foreground process is claude (checked by name and executable path).
@@ -271,6 +273,7 @@ impl Session {
             last_git_poll: None,
             git_inflight: false,
             scroll_accum: 0.0,
+            bs_repeat: 0,
             fg_name: None,
             fg_is_claude: false,
             claude_pid: None,

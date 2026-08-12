@@ -161,6 +161,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                     if repeat && dup {
                         continue;
                     }
+                    let modifiers = backspace_accel(&mut session.bs_repeat, key, repeat, modifiers);
                     if let Some(bytes) = encode_key(key, modifiers, mode, fg_is_claude) {
                         out.extend_from_slice(&bytes);
                     }
@@ -843,6 +844,22 @@ fn key_letter(key: Key) -> Option<u8> {
     })
 }
 
+/// Auto-repeats a held Backspace spends erasing single characters before it
+/// starts erasing whole words.
+const BS_WORD_AFTER: u8 = 6;
+
+/// A held Backspace switches to word-wise erase once it has repeated a few
+/// times, so clearing a long prompt does not take one repeat per character.
+/// `count` is the streak; any other key or a fresh press ends it.
+fn backspace_accel(count: &mut u8, key: Key, repeat: bool, mods: Modifiers) -> Modifiers {
+    if key != Key::Backspace || mods.alt || mods.ctrl || mods.command {
+        *count = 0;
+        return mods;
+    }
+    *count = if repeat { count.saturating_add(1) } else { 0 };
+    if *count >= BS_WORD_AFTER { Modifiers { alt: true, ..mods } } else { mods }
+}
+
 fn encode_key(key: Key, mods: Modifiers, mode: TermMode, claude: bool) -> Option<Vec<u8>> {
     if mods.command {
         return None; // App-level shortcuts.
@@ -903,10 +920,11 @@ fn encode_key(key: Key, mods: Modifiers, mode: TermMode, claude: bool) -> Option
         Key::Backspace => {
             if kitty && has_mods {
                 format!("\x1b[127;{m}u").into_bytes()
-            } else if mods.alt {
+            } else if mods.alt || mods.ctrl {
+                // Meta+Backspace: readline, zsh and claude all read it as
+                // "erase the word before the cursor". Ctrl+Backspace used to
+                // send ^H, which those three treat as a plain backspace.
                 b"\x1b\x7f".to_vec()
-            } else if mods.ctrl {
-                b"\x08".to_vec()
             } else {
                 b"\x7f".to_vec()
             }
@@ -960,10 +978,42 @@ fn encode_key(key: Key, mods: Modifiers, mode: TermMode, claude: bool) -> Option
 
 #[cfg(test)]
 mod tests {
-    use super::{find_near, join_ci, link_span};
+    use super::{backspace_accel, encode_key, find_near, join_ci, link_span, BS_WORD_AFTER};
+    use super::{Key, Modifiers, TermMode};
 
     fn span(s: &str, col: usize) -> Option<(std::ops::Range<usize>, String)> {
         link_span(&s.chars().collect::<Vec<_>>(), col)
+    }
+
+    #[test]
+    fn backspace_erases_a_word_with_ctrl_or_alt() {
+        let plain = TermMode::empty();
+        let bs = |mods| encode_key(Key::Backspace, mods, plain, false);
+        assert_eq!(bs(Modifiers::NONE), Some(b"\x7f".to_vec()));
+        assert_eq!(bs(Modifiers::CTRL), Some(b"\x1b\x7f".to_vec()));
+        assert_eq!(bs(Modifiers::ALT), Some(b"\x1b\x7f".to_vec()));
+        // Apps that pushed kitty flags get the report instead.
+        let kitty = TermMode::DISAMBIGUATE_ESC_CODES;
+        assert_eq!(
+            encode_key(Key::Backspace, Modifiers::CTRL, kitty, false),
+            Some(b"\x1b[127;5u".to_vec())
+        );
+    }
+
+    #[test]
+    fn held_backspace_switches_to_words() {
+        let word = |mods: Modifiers| mods.alt;
+        let mut n = 0;
+        assert!(!word(backspace_accel(&mut n, Key::Backspace, false, Modifiers::NONE)));
+        for _ in 1..BS_WORD_AFTER {
+            assert!(!word(backspace_accel(&mut n, Key::Backspace, true, Modifiers::NONE)));
+        }
+        assert!(word(backspace_accel(&mut n, Key::Backspace, true, Modifiers::NONE)));
+        assert!(word(backspace_accel(&mut n, Key::Backspace, true, Modifiers::NONE)));
+
+        // Another key ends the streak, and the next hold starts over.
+        backspace_accel(&mut n, Key::A, false, Modifiers::NONE);
+        assert!(!word(backspace_accel(&mut n, Key::Backspace, true, Modifiers::NONE)));
     }
 
     #[test]
