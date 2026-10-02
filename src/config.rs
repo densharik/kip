@@ -109,6 +109,8 @@ pub struct SavedSession {
     /// Protected session: no drag, no close, never auto-suspended.
     pub pinned: bool,
     pub snapshot: Option<String>,
+    /// Window the session lives in (see `SavedWindow::id`, 0 = the main one).
+    pub window: u64,
 }
 
 impl Default for SavedSession {
@@ -123,6 +125,7 @@ impl Default for SavedSession {
             keep_awake: false,
             pinned: false,
             snapshot: None,
+            window: 0,
         }
     }
 }
@@ -134,6 +137,17 @@ pub struct AppState {
     pub sessions: Vec<SavedSession>,
     /// Names of collapsed session groups (persisted across restarts).
     pub collapsed_groups: Vec<String>,
+    /// Open windows and where they were; the main window has id 0.
+    pub windows: Vec<SavedWindow>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedWindow {
+    pub id: u64,
+    /// Outer top-left and inner size, in points.
+    pub pos: Option<[f32; 2]>,
+    pub size: Option<[f32; 2]>,
 }
 
 fn state_path() -> PathBuf {

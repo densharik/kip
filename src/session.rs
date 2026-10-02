@@ -2,8 +2,7 @@ use std::collections::HashMap;
 #[cfg(not(windows))]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -23,14 +22,14 @@ pub struct EventProxy {
     pub id: u64,
     pub tx: Sender<(u64, Event)>,
     pub ctx: egui::Context,
-    /// Id of the currently active session; output of background sessions coalesces repaints.
-    pub active: Arc<AtomicU64>,
+    /// Sessions on screen (one per window); output of the others coalesces repaints.
+    pub active: Arc<Mutex<Vec<u64>>>,
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         let _ = self.tx.send((self.id, event));
-        if self.active.load(Ordering::Relaxed) == self.id {
+        if self.active.lock().is_ok_and(|a| a.contains(&self.id)) {
             self.ctx.request_repaint();
         } else {
             self.ctx.request_repaint_after(Duration::from_millis(250));
@@ -89,6 +88,8 @@ pub struct GitStats {
 
 pub struct Session {
     pub id: u64,
+    /// Window this session is shown in (`SavedWindow::id`).
+    pub window: u64,
     pub cwd: PathBuf,
     pub phase: Phase,
     pub title: String,
@@ -239,6 +240,7 @@ impl Session {
             skip_permissions: self.skip_permissions,
             keep_awake: self.keep_awake,
             pinned: self.pinned,
+            window: self.window,
             snapshot: snapshot.map(|mut s| {
                 if s.len() > 32 * 1024 {
                     let cut = s.len() - 32 * 1024;
@@ -253,6 +255,7 @@ impl Session {
     pub fn from_saved(saved: SavedSession, id: u64) -> Self {
         Session {
             id,
+            window: saved.window,
             cwd: saved.cwd,
             phase: Phase::Suspended,
             title: String::new(),

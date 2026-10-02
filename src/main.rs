@@ -16,7 +16,6 @@ mod usage;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -78,20 +77,24 @@ fn main() -> eframe::Result {
 
     // 256x256 raw RGBA, matching resources/icon_1024.png. Sets the taskbar/dock
     // icon at runtime (Windows has no embedded exe icon; macOS .app uses the icns).
-    let icon = egui::IconData {
+    let icon = Arc::new(egui::IconData {
         rgba: include_bytes!("../resources/icon_256.rgba").to_vec(),
         width: 256,
         height: 256,
-    };
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("kip")
-            .with_icon(std::sync::Arc::new(icon))
-            .with_inner_size([1160.0, 740.0])
-            .with_min_inner_size([680.0, 420.0]),
-        ..Default::default()
-    };
-    eframe::run_native("kip", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    });
+    let state = load_state();
+    // The main window comes back where it was; extra windows reopen themselves.
+    let main_win = state.windows.iter().find(|w| w.id == 0);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("kip")
+        .with_icon(icon.clone())
+        .with_inner_size(main_win.and_then(|w| w.size).unwrap_or([1160.0, 740.0]))
+        .with_min_inner_size([680.0, 420.0]);
+    if let Some(p) = main_win.and_then(|w| w.pos) {
+        viewport = viewport.with_position(p);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    eframe::run_native("kip", options, Box::new(|cc| Ok(Box::new(App::new(cc, state, icon)))))
 }
 
 enum UpdateState {
@@ -142,6 +145,11 @@ enum Act {
     Settings,
     /// Show/hide the file explorer panel.
     ToggleExplorer,
+    /// A new window with a terminal in the active session's directory.
+    NewWindow,
+    /// Hand a session to another window (None = a new one). A live session
+    /// keeps running: windows share one process.
+    MoveToWindow { id: u64, win: Option<u64> },
 }
 
 /// Lightweight file explorer panel (between the session list and the terminal).
@@ -197,17 +205,130 @@ enum Slot {
     Row(u64),
 }
 
+/// UI state that belongs to one window. Outside a window's pass it sits in
+/// `Win::ui`; during the pass it is swapped into `App::w`, so the drawing code
+/// reads `self.w.*` no matter which window it is drawing.
+#[derive(Default)]
+struct WinUi {
+    active: Option<u64>,
+    /// Id of the session whose title is being edited inline (double-click rename).
+    renaming: Option<u64>,
+    /// Name of the group whose header is being renamed inline (mutually exclusive
+    /// with `renaming`; both feed `rename_buf`).
+    renaming_group: Option<String>,
+    rename_buf: String,
+    /// Grab keyboard focus for the rename field on its first frame only.
+    rename_focus: bool,
+    /// Session id being dragged in the sidebar (reorder / move between groups).
+    dragging: Option<u64>,
+    /// A blocked action (close, drag, move) on a pinned session: its pin shakes
+    /// instead, so the refusal is visible where the reason lives.
+    pin_shake: Option<(u64, Instant)>,
+    /// Group whose header is being dragged (reorder groups among themselves).
+    dragging_group: Option<String>,
+    /// Command editor pinned under the terminal.
+    cmd_input: String,
+    /// The typed text used as the history filter (nav-fill does not change it).
+    hist_query: String,
+    hist_sel: Option<usize>,
+    hist_dismissed: bool,
+    hist_forced: bool,
+    /// Directory switcher popup over the path chip.
+    dir_open: bool,
+    dir_query: String,
+    dir_path: PathBuf,
+    /// Unfiltered subdirs of dir_path, refreshed at most every 2s while the popup is open.
+    dir_cache: Vec<String>,
+    dir_cache_at: Option<(PathBuf, Instant)>,
+    /// Inline "new folder" editor inside the switcher: Some = its name is being
+    /// typed. `new_dir_focus` selects the placeholder on the first frame so that
+    /// typing replaces it.
+    new_dir: Option<String>,
+    new_dir_focus: bool,
+    new_dir_err: Option<String>,
+    chip_rect: Option<Rect>,
+    /// Popup rect from the previous frame, to keep it open while hovered.
+    stats_rect: Option<Rect>,
+    usage_rect: Option<Rect>,
+    explorer: Explorer,
+}
+
+/// One native window. Id 0 is the main (root) window: closing it quits kip.
+/// Any other window is an extra one; closing it hands its sessions to the main.
+struct Win {
+    id: u64,
+    ui: WinUi,
+    /// Last seen outer position and inner size, persisted for the next launch.
+    /// In OS points: egui's own window units are divided by the UI zoom, and
+    /// the main window is created before the zoom is applied.
+    pos: Option<Pos2>,
+    size: Option<Vec2>,
+    /// Where an extra window opens and its first size, in OS points. Its
+    /// builder has to stay the same every frame, or egui would keep moving it
+    /// back - so the zoom is applied once, when the window is first shown.
+    open_at: Option<Pos2>,
+    open_size: Option<Vec2>,
+    /// The two above in egui units, fixed on the first pass.
+    builder: Option<egui::ViewportBuilder>,
+    /// Sessions were handed over from another window: restore display order.
+    renorm: bool,
+    /// Folder to open a terminal in on the window's next pass (a new window).
+    pending_spawn: Option<PathBuf>,
+    closing: bool,
+    /// The native window exists and has drawn once.
+    drawn: bool,
+}
+
+impl Win {
+    fn new(id: u64) -> Self {
+        Win {
+            id,
+            ui: WinUi::default(),
+            pos: None,
+            size: None,
+            open_at: None,
+            open_size: None,
+            builder: None,
+            renorm: false,
+            pending_spawn: None,
+            closing: false,
+            drawn: false,
+        }
+    }
+
+    fn viewport(&self) -> egui::ViewportId {
+        if self.id == 0 {
+            egui::ViewportId::ROOT
+        } else {
+            egui::ViewportId::from_hash_of(("kip-win", self.id))
+        }
+    }
+}
+
 struct App {
     settings: Settings,
+    /// During a window's pass: that window's sessions only (the rest wait in
+    /// `parked`). Everywhere else: every session of every window.
     sessions: Vec<Session>,
-    active: Option<u64>,
+    parked: Vec<Session>,
+    wins: Vec<Win>,
+    next_win: u64,
+    /// The window being drawn, and its UI state (see `WinUi`).
+    cur_win: u64,
+    w: WinUi,
+    /// State changed; written once at the end of the frame, when the sessions
+    /// of all windows are back together.
+    dirty: std::cell::Cell<bool>,
+    /// A window moved or resized; saved once it has been still for a second.
+    geom_at: Option<Instant>,
+    icon: Arc<egui::IconData>,
     next_id: u64,
     ev_tx: Sender<(u64, TermEvent)>,
     ev_rx: Receiver<(u64, TermEvent)>,
     git_tx: Sender<(u64, PathBuf, GitStats)>,
     git_rx: Receiver<(u64, PathBuf, GitStats)>,
-    /// Mirrors `active` for PTY reader threads (repaint coalescing).
-    active_shared: Arc<AtomicU64>,
+    /// Sessions on screen in some window, for PTY reader threads (repaint coalescing).
+    active_shared: Arc<std::sync::Mutex<Vec<u64>>>,
     ctx_tx: Sender<(u64, session::ClaudeInfo)>,
     ctx_rx: Receiver<(u64, session::ClaudeInfo)>,
     /// Context-% index (single source of truth for badges) and its channel.
@@ -227,30 +348,8 @@ struct App {
     last_tick: Instant,
     /// When the last background update check ran.
     last_update_check: Instant,
-    /// Id of the session whose title is being edited inline (double-click rename).
-    renaming: Option<u64>,
-    /// Name of the group whose header is being renamed inline (mutually exclusive
-    /// with `renaming`; both feed `rename_buf`).
-    renaming_group: Option<String>,
-    rename_buf: String,
-    /// Grab keyboard focus for the rename field on its first frame only.
-    rename_focus: bool,
-    /// Session id being dragged in the sidebar (reorder / move between groups).
-    dragging: Option<u64>,
-    /// A blocked action (close, drag, move) on a pinned session: its pin shakes
-    /// instead, so the refusal is visible where the reason lives.
-    pin_shake: Option<(u64, Instant)>,
-    /// Group whose header is being dragged (reorder groups among themselves).
-    dragging_group: Option<String>,
     /// Collapsed group names.
     collapsed_groups: HashSet<String>,
-    /// Command editor pinned under the terminal.
-    cmd_input: String,
-    /// The typed text used as the history filter (nav-fill does not change it).
-    hist_query: String,
-    hist_sel: Option<usize>,
-    hist_dismissed: bool,
-    hist_forced: bool,
     /// Shell history (from $HISTFILE) merged with commands sent this run, oldest first.
     history: Vec<String>,
     /// Lowercased mirror of `history`, so per-frame filtering does not allocate.
@@ -266,27 +365,11 @@ struct App {
     /// A read has landed at least once (an absent histfile stays empty forever,
     /// and must not re-spawn a reader every 5s).
     hist_loaded: bool,
-    /// Directory switcher popup over the path chip.
-    dir_open: bool,
-    dir_query: String,
-    dir_path: PathBuf,
-    /// Unfiltered subdirs of dir_path, refreshed at most every 2s while the popup is open.
-    dir_cache: Vec<String>,
-    dir_cache_at: Option<(PathBuf, Instant)>,
-    /// Inline "new folder" editor inside the switcher: Some = its name is being
-    /// typed. `new_dir_focus` selects the placeholder on the first frame so that
-    /// typing replaces it.
-    new_dir: Option<String>,
-    new_dir_focus: bool,
-    new_dir_err: Option<String>,
-    chip_rect: Option<Rect>,
     stats_tx: Sender<plat::SysStats>,
     stats_rx: Receiver<plat::SysStats>,
     stats: Option<plat::SysStats>,
     stats_at: Option<Instant>,
     stats_inflight: bool,
-    /// Popup rect from the previous frame, to keep it open while hovered.
-    stats_rect: Option<Rect>,
     usage_tx: Sender<usage::UsageMsg>,
     usage_rx: Receiver<usage::UsageMsg>,
     /// Claude.ai subscription limits, whatever the account has (session, week,
@@ -295,19 +378,16 @@ struct App {
     usage_err: Option<String>,
     usage_at: Option<Instant>,
     usage_inflight: bool,
-    usage_rect: Option<Rect>,
     /// Last measured terminal cell size in px, used for PTY pixel hints.
     cell: (u16, u16),
     /// Last measured grid size, used as the initial size for new PTYs.
     grid: (u16, u16),
-    explorer: Explorer,
     /// Font actually in use - the pick can silently fall back (settings show it).
     font_applied: &'static str,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let state = load_state();
+    fn new(cc: &eframe::CreationContext<'_>, state: AppState, icon: Arc<egui::IconData>) -> Self {
         let font_applied = install_fonts(&cc.egui_ctx, &state.settings.font);
         i18n::set(i18n::resolve(&state.settings.lang));
         palette::apply(&state.settings.theme, state.settings.accent.map(rgb32));
@@ -329,10 +409,36 @@ impl App {
             // Keep the installed hook script current across kip updates.
             let _ = ctx_index::write_hook_script();
         }
+        // Windows from the last run (the main one always), each keeping its
+        // place on screen. A session pointing at a window that is gone lands in
+        // the main one.
+        let mut wins = vec![Win::new(0)];
+        for sw in &state.windows {
+            if sw.id != 0 && !wins.iter().any(|w| w.id == sw.id) {
+                let mut w = Win::new(sw.id);
+                w.open_at = sw.pos.map(Pos2::from);
+                w.open_size = sw.size.map(Vec2::from);
+                wins.push(w);
+            }
+        }
+        for w in &mut wins {
+            if let Some(sw) = state.windows.iter().find(|s| s.id == w.id) {
+                w.pos = sw.pos.map(Pos2::from);
+                w.size = sw.size.map(Vec2::from);
+            }
+        }
+        let next_win = wins.iter().map(|w| w.id).max().unwrap_or(0) + 1;
         let mut app = App {
             settings: state.settings,
             sessions: Vec::new(),
-            active: None,
+            parked: Vec::new(),
+            wins,
+            next_win,
+            cur_win: 0,
+            w: WinUi::default(),
+            dirty: std::cell::Cell::new(false),
+            geom_at: None,
+            icon,
             next_id: 1,
             ev_tx,
             ev_rx,
@@ -350,23 +456,11 @@ impl App {
             update_state: UpdateState::Idle,
             upd_tx,
             upd_rx,
-            active_shared: Arc::new(AtomicU64::new(0)),
+            active_shared: Default::default(),
             settings_open: false,
             last_tick: Instant::now(),
             last_update_check: Instant::now(),
-            renaming: None,
-            renaming_group: None,
-            rename_buf: String::new(),
-            rename_focus: false,
-            dragging: None,
-            pin_shake: None,
-            dragging_group: None,
             collapsed_groups: state.collapsed_groups.into_iter().collect(),
-            cmd_input: String::new(),
-            hist_query: String::new(),
-            hist_sel: None,
-            hist_dismissed: false,
-            hist_forced: false,
             history: Vec::new(),
             history_lc: Vec::new(),
             session_cmds: Vec::new(),
@@ -376,45 +470,49 @@ impl App {
             hist_rx,
             hist_inflight: false,
             hist_loaded: false,
-            dir_open: false,
-            dir_query: String::new(),
-            dir_path: dirs::home_dir().unwrap_or_else(|| "/".into()),
-            dir_cache: Vec::new(),
-            dir_cache_at: None,
-            new_dir: None,
-            new_dir_focus: false,
-            new_dir_err: None,
-            chip_rect: None,
             stats_tx,
             stats_rx,
             stats: None,
             stats_at: None,
             stats_inflight: false,
-            stats_rect: None,
             usage_tx,
             usage_rx,
             usage: Vec::new(),
             usage_err: None,
             usage_at: None,
             usage_inflight: false,
-            usage_rect: None,
             cell: (8, 17),
             grid: (100, 28),
-            explorer: Explorer::default(),
             font_applied,
         };
-        for saved in state.sessions {
+        for mut saved in state.sessions {
+            if !app.wins.iter().any(|w| w.id == saved.window) {
+                saved.window = 0;
+            }
             let id = app.next_id;
             app.next_id += 1;
             app.sessions.push(Session::from_saved(saved, id));
         }
-        // Saved state from older builds may not be in display order; make the vec
-        // contiguous so drag/drop math is correct from the first interaction.
-        app.normalize_order();
-        if app.sessions.is_empty() {
-            app.spawn(dirs::home_dir().unwrap_or_else(|| "/".into()), None, &cc.egui_ctx);
+        // An extra window with nothing in it is not worth reopening.
+        let used: HashSet<u64> = app.sessions.iter().map(|s| s.window).collect();
+        app.wins.retain(|w| w.id == 0 || used.contains(&w.id));
+        // Saved state from older builds may not be in display order; make each
+        // window's run contiguous so drag/drop math is correct from the first
+        // interaction. Each window starts on its first session.
+        let mut all = std::mem::take(&mut app.sessions);
+        for k in 0..app.wins.len() {
+            let wid = app.wins[k].id;
+            let (mine, rest): (Vec<_>, Vec<_>) = all.into_iter().partition(|s| s.window == wid);
+            all = rest;
+            app.sessions = mine;
+            app.normalize_order();
+            app.wins[k].ui.active = app.sessions.first().map(|s| s.id);
+            app.parked.append(&mut app.sessions);
         }
-        app.active = app.sessions.first().map(|s| s.id);
+        app.sessions = std::mem::take(&mut app.parked);
+        if app.sessions.is_empty() {
+            app.wins[0].pending_spawn = Some(dirs::home_dir().unwrap_or_else(|| "/".into()));
+        }
         // Show saved sessions' context load right away, before claude ever runs.
         for s in &app.sessions {
             app.poll_ctx_now(s, &cc.egui_ctx);
@@ -430,6 +528,179 @@ impl App {
             mac_service::hook_paste();
         }
         app
+    }
+
+    /// Register a new extra window, cascaded off the one being drawn. It shows
+    /// up later in this same frame (see the window loop in `ui`).
+    fn open_window(&mut self) -> u64 {
+        let id = self.next_win;
+        self.next_win += 1;
+        let mut w = Win::new(id);
+        let here = self.wins.iter().find(|w| w.id == self.cur_win);
+        w.open_size = here.and_then(|h| h.size);
+        // Step past windows already sitting on the cascade, so a second new
+        // window does not land exactly on top of the first.
+        let taken = |p: Pos2| self.wins.iter().any(|o| o.pos.or(o.open_at).is_some_and(|q| q.distance(p) < 8.0));
+        let mut at = here.and_then(|h| h.pos).map(|p| p + Vec2::splat(32.0));
+        while let Some(p) = at.filter(|p| taken(*p)) {
+            at = Some(p + Vec2::splat(32.0));
+        }
+        w.open_at = at;
+        self.wins.push(w);
+        id
+    }
+
+    /// Draw window `k`. Its sessions and UI state are swapped in for the pass
+    /// and back out after it, so everything below sees just this window.
+    fn window_pass(&mut self, k: usize, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let wid = self.wins[k].id;
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.sessions).into_iter().partition(|s| s.window == wid);
+        self.sessions = mine;
+        self.parked = rest;
+        std::mem::swap(&mut self.w, &mut self.wins[k].ui);
+        self.cur_win = wid;
+        self.window_ui(k, ui, &ctx);
+        std::mem::swap(&mut self.w, &mut self.wins[k].ui);
+        self.cur_win = 0;
+        let parked = std::mem::take(&mut self.parked);
+        self.sessions.extend(parked);
+    }
+
+    fn window_ui(&mut self, k: usize, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let z = ctx.zoom_factor();
+        let (pos, size) = ctx.input(|i| {
+            (i.viewport().outer_rect.map(|r| r.min * z), i.viewport().inner_rect.map(|r| r.size() * z))
+        });
+        self.wins[k].drawn |= pos.is_some();
+        if pos.is_some() && (pos != self.wins[k].pos || size != self.wins[k].size) {
+            self.wins[k].pos = pos;
+            self.wins[k].size = size;
+            self.geom_at = Some(Instant::now());
+        }
+        if k > 0 && ctx.input(|i| i.viewport().close_requested()) {
+            self.wins[k].closing = true;
+        }
+        if std::mem::take(&mut self.wins[k].renorm) {
+            self.normalize_order();
+        }
+        if let Some(dir) = self.wins[k].pending_spawn.take() {
+            self.spawn(dir, None, ctx);
+        }
+        // Folders opened from Finder's Services menu ("New kip Window Here").
+        #[cfg(target_os = "macos")]
+        if k == 0 {
+            let pending = mac_service::take_pending();
+            if !pending.is_empty() {
+                for dir in pending {
+                    self.spawn(dir, None, ctx);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
+
+        // Paste without text (Finder file, screenshot image) -> insert as a path.
+        // Such a pasteboard has no string type, so egui emits no paste event at
+        // all; the Cmd+V hook is what tells us it happened. When egui did produce
+        // a paste event the text is the paste and the terminal handles it. The
+        // hook is app-wide, so only the window with focus takes it.
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(k == 0));
+        if focused
+            && paste_shortcut()
+            && ctx.input(|i| !i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))))
+        {
+            if let Some(p) = plat::clipboard_paths() {
+                self.insert_paths(shell_escape(&p));
+            }
+        }
+        // Drag & drop of files from Finder.
+        let dropped: Vec<String> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.as_ref().map(|p| p.to_string_lossy().into_owned()))
+                .collect()
+        });
+        if !dropped.is_empty() {
+            let text = dropped.iter().map(|p| shell_escape(p)).collect::<Vec<_>>().join(" ");
+            self.insert_paths(text);
+        }
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("dnd-overlay"),
+            ));
+            let r = ctx.content_rect();
+            painter.rect_filled(r, 0.0, Color32::from_black_alpha(90));
+            painter.rect_stroke(
+                r.shrink(12.0),
+                CornerRadius::same(10),
+                Stroke::new(2.0, UNREAD),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                r.center(),
+                Align2::CENTER_CENTER,
+                tr("Отпусти - вставлю путь к файлу", "Drop to insert the file path"),
+                FontId::proportional(15.0),
+                palette::text(),
+            );
+        }
+        self.shortcuts(ctx);
+
+        if self.w.active.is_none_or(|_| self.active_idx().is_none()) {
+            self.w.active = self.sessions.first().map(|s| s.id);
+        }
+
+        // Session panel: drag its right edge. Never past half the window (the
+        // terminal has to stay the main thing) and never below a width where a
+        // row still reads - name, path and the close button.
+        let max_w = (ui.max_rect().width() * 0.5).max(SIDEBAR_MIN);
+        let panel = egui::Panel::left(egui::Id::new(("sidebar", self.cur_win)))
+            .default_size(self.settings.sidebar_w.clamp(SIDEBAR_MIN, max_w))
+            .size_range(SIDEBAR_MIN..=max_w)
+            .resizable(true)
+            .frame(Frame::new().fill(palette::chrome_sidebar()))
+            .show(ui, |ui| self.sidebar(ui));
+        // Remember the dragged width; it rides along with the next persist
+        // (any session change, and the one on exit) rather than writing state
+        // on every pixel of the drag.
+        let w = panel.response.rect.width();
+        if (w - self.settings.sidebar_w).abs() > 0.5 {
+            self.settings.sidebar_w = w;
+        }
+        self.apply(panel.inner, ctx);
+
+        if self.w.explorer.open {
+            let acts = egui::Panel::left(egui::Id::new(("explorer", self.cur_win)))
+                .exact_size(240.0)
+                .resizable(false)
+                .frame(Frame::new().fill(palette::chrome_sidebar()))
+                .show(ui, |ui| self.explorer_panel(ui))
+                .inner;
+            self.apply(acts, ctx);
+        }
+
+        let acts = egui::Panel::bottom(egui::Id::new(("statusbar", self.cur_win)))
+            .exact_size(34.0)
+            .frame(Frame::new().fill(palette::chrome_bar()))
+            .show(ui, |ui| self.bottom_bar(ui))
+            .inner;
+        self.apply(acts, ctx);
+
+        let acts = egui::CentralPanel::default()
+            .frame(Frame::new().fill(palette::term_bg()))
+            .show(ui, |ui| self.central(ui))
+            .inner;
+        self.apply(acts, ctx);
+
+        // Settings is app-wide, so it lives in the main window only.
+        if k == 0 && self.settings_open {
+            self.settings_window(ctx);
+        }
+        self.dir_popup(ctx);
+        self.stats_ui(ctx);
+        self.usage_ui(ctx);
     }
 
     fn drain_update(&mut self) {
@@ -469,9 +740,17 @@ impl App {
         }
     }
 
+    /// Mark state for saving. The write happens at the end of the frame
+    /// (`save_now`): mid-pass `sessions` holds only the drawn window's share.
     fn persist(&self) {
+        self.dirty.set(true);
+    }
+
+    fn save_now(&self) {
+        self.dirty.set(false);
         // Only keep collapse state for groups that still exist.
         let live: HashSet<&String> = self.sessions.iter().filter_map(|s| s.group.as_ref()).collect();
+        let used: HashSet<u64> = self.sessions.iter().map(|s| s.window).collect();
         save_state(&AppState {
             settings: self.settings.clone(),
             sessions: self.sessions.iter().map(|s| s.to_saved()).collect(),
@@ -480,6 +759,16 @@ impl App {
                 .iter()
                 .filter(|g| live.contains(g))
                 .cloned()
+                .collect(),
+            windows: self
+                .wins
+                .iter()
+                .filter(|w| w.id == 0 || used.contains(&w.id))
+                .map(|w| config::SavedWindow {
+                    id: w.id,
+                    pos: w.pos.map(|p| [p.x.round(), p.y.round()]),
+                    size: w.size.map(|v| [v.x.round(), v.y.round()]),
+                })
                 .collect(),
         });
     }
@@ -577,12 +866,12 @@ impl App {
             live.notifier.notify(out);
             s.last_activity = Instant::now();
         } else {
-            if !self.cmd_input.is_empty() && !self.cmd_input.ends_with(' ') {
-                self.cmd_input.push(' ');
+            if !self.w.cmd_input.is_empty() && !self.w.cmd_input.ends_with(' ') {
+                self.w.cmd_input.push(' ');
             }
-            self.cmd_input.push_str(&text);
-            self.cmd_input.push(' ');
-            self.hist_query = self.cmd_input.clone();
+            self.w.cmd_input.push_str(&text);
+            self.w.cmd_input.push(' ');
+            self.w.hist_query = self.w.cmd_input.clone();
         }
     }
 
@@ -612,6 +901,7 @@ impl App {
         }
         if bound {
             self.poll_ctx_now(&self.sessions[idx], ctx);
+            self.persist();
         }
     }
 
@@ -621,14 +911,14 @@ impl App {
         if !self.sessions[idx].pinned {
             return false;
         }
-        self.pin_shake = Some((self.sessions[idx].id, Instant::now()));
+        self.w.pin_shake = Some((self.sessions[idx].id, Instant::now()));
         true
     }
 
     fn remove_session(&mut self, idx: usize) {
         let id = self.sessions[idx].id;
         self.sessions.remove(idx);
-        if self.active == Some(id) {
+        if self.w.active == Some(id) {
             let next = idx.min(self.sessions.len().saturating_sub(1));
             self.set_active(self.sessions.get(next).map(|s| s.id));
         }
@@ -838,9 +1128,9 @@ impl App {
     /// the queued RenameCommit into a no-op, silently losing the typed name.
     /// Empty buffer clears the override, same as RenameCommit.
     fn commit_rename(&mut self) {
-        let Some(id) = self.renaming.take() else { return };
+        let Some(id) = self.w.renaming.take() else { return };
         let Some(idx) = self.idx_of(id) else { return };
-        let name = self.rename_buf.trim();
+        let name = self.w.rename_buf.trim();
         self.sessions[idx].custom_name = (!name.is_empty()).then(|| name.to_string());
         self.persist();
     }
@@ -848,13 +1138,13 @@ impl App {
     /// Switch the active session, dropping per-session UI state (popup, input, history nav).
     fn set_active(&mut self, id: Option<u64>) {
         self.commit_rename();
-        self.active = id;
-        self.dir_open = false;
-        self.cmd_input.clear();
-        self.hist_query.clear();
-        self.hist_sel = None;
-        self.hist_forced = false;
-        self.hist_dismissed = false;
+        self.w.active = id;
+        self.w.dir_open = false;
+        self.w.cmd_input.clear();
+        self.w.hist_query.clear();
+        self.w.hist_sel = None;
+        self.w.hist_forced = false;
+        self.w.hist_dismissed = false;
     }
 
     fn idx_of(&self, id: u64) -> Option<usize> {
@@ -862,7 +1152,7 @@ impl App {
     }
 
     fn active_idx(&self) -> Option<usize> {
-        self.active.and_then(|id| self.idx_of(id))
+        self.w.active.and_then(|id| self.idx_of(id))
     }
 
     /// Current directory of the active session's shell, for spawning siblings.
@@ -896,6 +1186,7 @@ impl App {
                 keep_awake: false,
                 pinned: false,
                 snapshot: None,
+                window: self.cur_win,
             },
             id,
         );
@@ -1057,28 +1348,28 @@ impl App {
                 },
                 Act::BeginRename(id) => {
                     if let Some(idx) = self.idx_of(id) {
-                        self.renaming = Some(id);
-                        self.renaming_group = None;
-                        self.rename_buf = self.sessions[idx].display_name();
-                        self.rename_focus = true;
+                        self.w.renaming = Some(id);
+                        self.w.renaming_group = None;
+                        self.w.rename_buf = self.sessions[idx].display_name();
+                        self.w.rename_focus = true;
                     }
                 },
                 Act::RenameCommit(id) => {
-                    if self.renaming == Some(id) {
+                    if self.w.renaming == Some(id) {
                         if let Some(idx) = self.idx_of(id) {
-                            let name = self.rename_buf.trim();
+                            let name = self.w.rename_buf.trim();
                             // Empty = clear the override, falling back to the
                             // Claude/directory name.
                             self.sessions[idx].custom_name =
                                 (!name.is_empty()).then(|| name.to_string());
                             self.persist();
                         }
-                        self.renaming = None;
+                        self.w.renaming = None;
                     }
                 },
                 Act::RenameCancel => {
-                    self.renaming = None;
-                    self.renaming_group = None;
+                    self.w.renaming = None;
+                    self.w.renaming_group = None;
                 },
                 Act::MoveSession { id, group, before } => {
                     if let Some(idx) = self.idx_of(id) {
@@ -1091,10 +1382,10 @@ impl App {
                 Act::NewGroup(id) => {
                     let name = self.unique_group_name();
                     self.move_session(id, Some(name.clone()), None);
-                    self.renaming_group = Some(name.clone());
-                    self.renaming = None;
-                    self.rename_buf = name;
-                    self.rename_focus = true;
+                    self.w.renaming_group = Some(name.clone());
+                    self.w.renaming = None;
+                    self.w.rename_buf = name;
+                    self.w.rename_focus = true;
                 },
                 Act::ToggleGroup(name) => {
                     if !self.collapsed_groups.remove(&name) {
@@ -1103,14 +1394,14 @@ impl App {
                     self.persist();
                 },
                 Act::BeginRenameGroup(name) => {
-                    self.rename_buf = name.clone();
-                    self.renaming_group = Some(name);
-                    self.renaming = None;
-                    self.rename_focus = true;
+                    self.w.rename_buf = name.clone();
+                    self.w.renaming_group = Some(name);
+                    self.w.renaming = None;
+                    self.w.rename_focus = true;
                 },
                 Act::RenameGroupCommit(old) => {
-                    if self.renaming_group.as_deref() == Some(old.as_str()) {
-                        let new = self.rename_buf.trim().to_string();
+                    if self.w.renaming_group.as_deref() == Some(old.as_str()) {
+                        let new = self.w.rename_buf.trim().to_string();
                         // Empty or a name that already exists = keep the old one.
                         let clash = self.sessions.iter().any(|s| s.group.as_deref() == Some(new.as_str()));
                         if !new.is_empty() && (new == old || !clash) {
@@ -1124,7 +1415,7 @@ impl App {
                             }
                             self.persist();
                         }
-                        self.renaming_group = None;
+                        self.w.renaming_group = None;
                     }
                 },
                 Act::DeleteGroup(name) => {
@@ -1139,26 +1430,77 @@ impl App {
                     self.normalize_order();
                     self.persist();
                 },
-                Act::Settings => self.settings_open = !self.settings_open,
+                Act::Settings => {
+                    self.settings_open = !self.settings_open;
+                    if self.settings_open && self.cur_win != 0 {
+                        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+                    }
+                },
+                Act::NewWindow => {
+                    let cwd = self.active_cwd();
+                    let wid = self.open_window();
+                    if let Some(w) = self.wins.iter_mut().find(|w| w.id == wid) {
+                        w.pending_spawn = Some(cwd);
+                    }
+                },
+                Act::MoveToWindow { id, win } => {
+                    let Some(idx) = self.idx_of(id) else { continue };
+                    if self.refuse_pinned(idx) {
+                        continue;
+                    }
+                    let target = win.unwrap_or_else(|| self.open_window());
+                    let mut s = self.sessions.remove(idx);
+                    s.window = target;
+                    self.parked.push(s);
+                    if self.w.active == Some(id) {
+                        let next = idx.min(self.sessions.len().saturating_sub(1));
+                        self.set_active(self.sessions.get(next).map(|s| s.id));
+                    }
+                    if let Some(t) = self.wins.iter_mut().find(|w| w.id == target) {
+                        t.ui.active = Some(id);
+                        t.renorm = true;
+                        ctx.send_viewport_cmd_to(t.viewport(), egui::ViewportCommand::Focus);
+                    }
+                    self.persist();
+                },
                 Act::ToggleExplorer => {
-                    self.explorer.open = !self.explorer.open;
-                    if self.explorer.open {
+                    self.w.explorer.open = !self.w.explorer.open;
+                    if self.w.explorer.open {
                         // Open on the active session's directory each time.
-                        self.explorer.dir = self.active_cwd();
-                        self.explorer.mode = ExMode::Browse;
-                        self.explorer.list_dir = None;
+                        self.w.explorer.dir = self.active_cwd();
+                        self.w.explorer.mode = ExMode::Browse;
+                        self.w.explorer.list_dir = None;
                     }
                 },
             }
         }
     }
 
+    /// Session `id` is the one on screen in its window. Background passes
+    /// only: mid-pass the drawn window's `WinUi` is swapped out of `wins`.
+    fn shown(&self, id: u64) -> bool {
+        self.wins.iter().any(|w| w.ui.active == Some(id))
+    }
+
+    /// Windows with keyboard focus (the main one counts as focused when the
+    /// platform does not say).
+    fn focused_wins<'a>(&'a self, ctx: &'a egui::Context) -> impl Iterator<Item = &'a Win> + 'a {
+        self.wins
+            .iter()
+            .filter(move |w| ctx.input_for(w.viewport(), |i| i.viewport().focused.unwrap_or(w.id == 0)))
+    }
+
+    /// On screen in a focused window: the user is looking at it.
+    fn seen(&self, ctx: &egui::Context, id: u64) -> bool {
+        self.focused_wins(ctx).any(|w| w.ui.active == Some(id))
+    }
+
     fn drain_events(&mut self, ctx: &egui::Context) {
-        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         let mut persist = false;
         while let Ok((id, ev)) = self.ev_rx.try_recv() {
             let Some(idx) = self.idx_of(id) else { continue };
-            let is_active = self.active == Some(id);
+            let is_active = self.shown(id);
+            let seen = self.seen(ctx, id);
             let s = &mut self.sessions[idx];
             match ev {
                 TermEvent::Wakeup => {
@@ -1189,7 +1531,7 @@ impl App {
                     }
                 },
                 TermEvent::Bell => {
-                    if !is_active || !focused {
+                    if !seen {
                         s.unread = true;
                         if self.settings.notify_bell {
                             let name = s.display_name();
@@ -1272,6 +1614,11 @@ impl App {
                 }
             }
         }
+        // Write the new id down now: after a force quit there is no on_exit to
+        // capture it, and "Resume Claude" would come back empty.
+        if !lookups.is_empty() {
+            self.persist();
+        }
         for (sid, cwd) in lookups {
             ctx_index::lookup(sid, cwd, self.jsonl_map.clone(), self.ctxi_tx.clone(), ctx.clone());
         }
@@ -1288,6 +1635,7 @@ impl App {
                         if s.fg_is_claude {
                             s.claude_session_id = Some(update.sid.clone());
                             s.ctx_stat = Default::default();
+                            self.dirty.set(true);
                         }
                     }
                     self.ctx_index.apply(update);
@@ -1327,8 +1675,7 @@ impl App {
                 self.update_state = UpdateState::Checking;
                 update::check(self.upd_tx.clone(), ctx.clone());
             }
-            let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-            let active = self.active;
+            let seen: Vec<u64> = self.focused_wins(ctx).filter_map(|w| w.ui.active).collect();
             let idle_limit = self.settings.idle_suspend_min as u64 * 60;
             let mut suspend_any = false;
             let mut kill_pids: Vec<i32> = Vec::new();
@@ -1384,7 +1731,7 @@ impl App {
                     s.busy = false;
                     s.running_cmd = None;
                     let dur = s.busy_since.take().map(|t| now - t).unwrap_or_default();
-                    if dur >= BUSY_NOTIFY_MIN && (active != Some(s.id) || !focused) {
+                    if dur >= BUSY_NOTIFY_MIN && !seen.contains(&s.id) {
                         s.unread = true;
                         if self.settings.notify_job_done {
                             plat::notify(
@@ -1430,8 +1777,8 @@ impl App {
                 self.persist();
             }
 
-            if focused {
-                if let Some(idx) = self.active_idx() {
+            for id in seen {
+                if let Some(idx) = self.idx_of(id) {
                     let s = &mut self.sessions[idx];
                     let due = s.last_git_poll.is_none_or(|t| now.duration_since(t) >= GIT_INTERVAL);
                     let stuck = s.last_git_poll.is_some_and(|t| now.duration_since(t) >= Duration::from_secs(60));
@@ -1592,10 +1939,14 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let mut acts = Vec::new();
-        let active = self.active;
+        let active = self.w.active;
         ctx.input_mut(|i| {
             if consume_cmd(i, Key::T) {
                 acts.push(Act::NewSame);
+            }
+            // Before Cmd+N, which would otherwise take the Shift variant too.
+            if consume_mods(i, Modifiers::COMMAND | Modifiers::SHIFT, Key::N) {
+                acts.push(Act::NewWindow);
             }
             if consume_cmd(i, Key::N) {
                 acts.push(Act::NewPick);
@@ -1635,7 +1986,7 @@ impl App {
         // then stops being drawn, so nothing commits or cancels it, and a stuck
         // renaming* flag freezes terminal input (accept/interactive gate on it).
         // Commit the orphan so input never dead-ends and the edit is not lost.
-        let orphan = self.renaming.is_some_and(|id| match self.idx_of(id) {
+        let orphan = self.w.renaming.is_some_and(|id| match self.idx_of(id) {
             None => true,
             Some(i) => self.sessions[i]
                 .group
@@ -1646,14 +1997,15 @@ impl App {
             self.commit_rename();
         }
         if self
-            .renaming_group
+            .w.renaming_group
             .as_deref()
             .is_some_and(|g| !self.sessions.iter().any(|s| s.group.as_deref() == Some(g)))
         {
-            self.renaming_group = None;
+            self.w.renaming_group = None;
         }
         ui.add_space(10.0);
-        ui.horizontal(|ui| {
+        // Wraps when the panel is dragged narrow, instead of clipping a button.
+        ui.horizontal_wrapped(|ui| {
             ui.add_space(10.0);
             if ui
                 .button(RichText::new(tr("+ Терминал", "+ Terminal")).size(12.5))
@@ -1663,8 +2015,16 @@ impl App {
                 acts.push(Act::NewSame);
             }
             ui.add_space(4.0);
+            if ui
+                .button(RichText::new(tr("+ Окно", "+ Window")).size(12.5))
+                .on_hover_text(tr("Новое окно kip (Cmd+Shift+N)", "New kip window (Cmd+Shift+N)"))
+                .clicked()
+            {
+                acts.push(Act::NewWindow);
+            }
+            ui.add_space(4.0);
             let files = ui
-                .selectable_label(self.explorer.open, RichText::new(tr("Файлы", "Files")).size(12.5))
+                .selectable_label(self.w.explorer.open, RichText::new(tr("Файлы", "Files")).size(12.5))
                 .on_hover_text(tr("Проводник файлов", "File explorer"));
             if files.clicked() {
                 acts.push(Act::ToggleExplorer);
@@ -1722,7 +2082,7 @@ impl App {
 
         // Drag overlay: insertion marker every frame, the move on release.
         let py = ui.input(|i| i.pointer.interact_pos()).map(|p| p.y);
-        if let Some(drag) = self.dragging {
+        if let Some(drag) = self.w.dragging {
             if let Some(tgt) = py.and_then(|py| self.resolve_drop(&items, py)) {
                 let x = ui.max_rect().x_range();
                 ui.painter().hline(x, tgt.line_y, Stroke::new(2.0, palette::accent_bar()));
@@ -1731,7 +2091,7 @@ impl App {
                 }
             }
             ui.ctx().request_repaint();
-        } else if let Some(name) = self.dragging_group.clone() {
+        } else if let Some(name) = self.w.dragging_group.clone() {
             if let Some((before, line_y)) = py.and_then(|py| self.resolve_group_drop(&items, py)) {
                 let x = ui.max_rect().x_range();
                 ui.painter().hline(x, line_y, Stroke::new(2.0, palette::group_accent()));
@@ -1742,33 +2102,33 @@ impl App {
             ui.ctx().request_repaint();
         }
         if released {
-            self.dragging = None;
+            self.w.dragging = None;
         }
         if group_released {
-            self.dragging_group = None;
+            self.w.dragging_group = None;
         }
         acts
     }
 
     fn explorer_panel(&mut self, ui: &mut egui::Ui) -> Vec<Act> {
-        let dir = self.explorer.dir.clone();
+        let dir = self.w.explorer.dir.clone();
         // Refresh the browse listing (single-dir read, throttled to 1.5s).
-        let stale = self.explorer.list_dir.as_deref() != Some(dir.as_path())
-            || self.explorer.list_at.is_none_or(|t| t.elapsed().as_millis() > 1500);
+        let stale = self.w.explorer.list_dir.as_deref() != Some(dir.as_path())
+            || self.w.explorer.list_at.is_none_or(|t| t.elapsed().as_millis() > 1500);
         if stale {
-            self.explorer.list = read_dir_sorted(&dir);
-            self.explorer.list_dir = Some(dir.clone());
-            self.explorer.list_at = Some(Instant::now());
+            self.w.explorer.list = read_dir_sorted(&dir);
+            self.w.explorer.list_dir = Some(dir.clone());
+            self.w.explorer.list_at = Some(Instant::now());
         }
         // Recompute recursive search hits only when the query or dir changes.
-        let query = self.explorer.query.trim().to_string();
-        if self.explorer.mode == ExMode::Search && !query.is_empty() {
+        let query = self.w.explorer.query.trim().to_string();
+        if self.w.explorer.mode == ExMode::Search && !query.is_empty() {
             let key = (dir.clone(), query.clone());
-            if self.explorer.hits_key.as_ref() != Some(&key) {
+            if self.w.explorer.hits_key.as_ref() != Some(&key) {
                 let mut hits = Vec::new();
                 ex_search(&dir, &query, &mut hits);
-                self.explorer.hits = hits;
-                self.explorer.hits_key = Some(key);
+                self.w.explorer.hits = hits;
+                self.w.explorer.hits_key = Some(key);
             }
         }
 
@@ -1787,36 +2147,36 @@ impl App {
             ui.label(RichText::new(truncate_head(&name, 20)).size(12.5).strong().color(palette::text()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
-                let new_on = self.explorer.mode == ExMode::New;
+                let new_on = self.w.explorer.mode == ExMode::New;
                 if ex_icon_button(ui, new_on, draw_newfile).on_hover_text(tr("Новый файл", "New file")).clicked() {
-                    self.explorer.mode = if new_on { ExMode::Browse } else { ExMode::New };
-                    self.explorer.new_name.clear();
-                    self.explorer.focus = true;
+                    self.w.explorer.mode = if new_on { ExMode::Browse } else { ExMode::New };
+                    self.w.explorer.new_name.clear();
+                    self.w.explorer.focus = true;
                 }
                 ui.add_space(2.0);
-                let search_on = self.explorer.mode == ExMode::Search;
+                let search_on = self.w.explorer.mode == ExMode::Search;
                 if ex_icon_button(ui, search_on, draw_search).on_hover_text(tr("Поиск", "Search")).clicked() {
-                    self.explorer.mode = if search_on { ExMode::Browse } else { ExMode::Search };
-                    self.explorer.query.clear();
-                    self.explorer.focus = true;
+                    self.w.explorer.mode = if search_on { ExMode::Browse } else { ExMode::Search };
+                    self.w.explorer.query.clear();
+                    self.w.explorer.focus = true;
                 }
             });
         });
         ui.add_space(6.0);
 
         // Input row for the active mode.
-        match self.explorer.mode {
+        match self.w.explorer.mode {
             ExMode::Search => {
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
                     let te = ui.add(
-                        egui::TextEdit::singleline(&mut self.explorer.query)
+                        egui::TextEdit::singleline(&mut self.w.explorer.query)
                             .desired_width(f32::INFINITY)
                             .hint_text(tr("Поиск файлов...", "Find files...")),
                     );
-                    if self.explorer.focus {
+                    if self.w.explorer.focus {
                         te.request_focus();
-                        self.explorer.focus = false;
+                        self.w.explorer.focus = false;
                     }
                 });
                 ui.add_space(4.0);
@@ -1825,13 +2185,13 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
                     let te = ui.add(
-                        egui::TextEdit::singleline(&mut self.explorer.new_name)
+                        egui::TextEdit::singleline(&mut self.w.explorer.new_name)
                             .desired_width(f32::INFINITY)
                             .hint_text(tr("Имя файла, Enter", "File name, Enter")),
                     );
-                    if self.explorer.focus {
+                    if self.w.explorer.focus {
                         te.request_focus();
-                        self.explorer.focus = false;
+                        self.w.explorer.focus = false;
                     }
                     if te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         create = true;
@@ -1842,17 +2202,17 @@ impl App {
             ExMode::Browse => {},
         }
 
-        let searching = self.explorer.mode == ExMode::Search && !query.is_empty();
+        let searching = self.w.explorer.mode == ExMode::Search && !query.is_empty();
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if searching {
-                if self.explorer.hits.is_empty() {
+                if self.w.explorer.hits.is_empty() {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.add_space(12.0);
                         ui.label(RichText::new(tr("Ничего не найдено", "No matches")).size(12.0).color(palette::text_faint()));
                     });
                 }
-                for hit in &self.explorer.hits {
+                for hit in &self.w.explorer.hits {
                     let rel = hit.strip_prefix(&dir).unwrap_or(hit);
                     let is_dir = hit.is_dir();
                     if ex_row(ui, &rel.to_string_lossy(), is_dir).clicked() {
@@ -1869,7 +2229,7 @@ impl App {
                         go_dir = Some(parent.to_path_buf());
                     }
                 }
-                for e in &self.explorer.list {
+                for e in &self.w.explorer.list {
                     if ex_row(ui, &e.name, e.is_dir).clicked() {
                         let p = dir.join(&e.name);
                         if e.is_dir {
@@ -1884,7 +2244,7 @@ impl App {
         });
 
         if create {
-            let name = self.explorer.new_name.trim().to_string();
+            let name = self.w.explorer.new_name.trim().to_string();
             // Only allow a new file inside the browsed tree: reject empty, absolute,
             // or `..`-escaping names. create_new never clobbers an existing file.
             let safe = !name.is_empty()
@@ -1901,18 +2261,18 @@ impl App {
                 && path.parent().is_none_or(|p| std::fs::create_dir_all(p).is_ok())
                 && std::fs::OpenOptions::new().write(true).create_new(true).open(&path).is_ok();
             if created {
-                self.explorer.mode = ExMode::Browse;
-                self.explorer.new_name.clear();
-                self.explorer.list_dir = None; // force a refresh so it shows up
+                self.w.explorer.mode = ExMode::Browse;
+                self.w.explorer.new_name.clear();
+                self.w.explorer.list_dir = None; // force a refresh so it shows up
             }
             // On failure (bad name / already exists / no permission) keep the New
             // field open so the no-op is visible rather than silently swallowed.
         }
         if let Some(d) = go_dir {
-            self.explorer.dir = d;
-            self.explorer.list_dir = None;
-            self.explorer.mode = ExMode::Browse;
-            self.explorer.query.clear();
+            self.w.explorer.dir = d;
+            self.w.explorer.list_dir = None;
+            self.w.explorer.mode = ExMode::Browse;
+            self.w.explorer.query.clear();
         }
         if let Some(f) = open_file {
             self.insert_paths(shell_escape(&f.to_string_lossy()));
@@ -1965,8 +2325,8 @@ impl App {
     /// Returns its rect (a drop target) and whether a group drag ended on it.
     /// Click toggles collapse, double-click renames, drag reorders groups.
     fn group_header(&mut self, ui: &mut egui::Ui, name: &str, collapsed: bool, acts: &mut Vec<Act>) -> (Rect, bool) {
-        let editing = self.renaming_group.as_deref() == Some(name);
-        let is_dragging = self.dragging_group.as_deref() == Some(name);
+        let editing = self.w.renaming_group.as_deref() == Some(name);
+        let is_dragging = self.w.dragging_group.as_deref() == Some(name);
         let count = self.sessions.iter().filter(|s| s.group.as_deref() == Some(name)).count();
         // A touch of top space so each group reads as a new section.
         ui.add_space(4.0);
@@ -2037,14 +2397,14 @@ impl App {
                 .fixed_pos(Pos2::new(rect.min.x + 22.0, rect.center().y - 13.0))
                 .show(&cctx, |ui| {
                     let r = ui.add(
-                        egui::TextEdit::singleline(&mut self.rename_buf)
+                        egui::TextEdit::singleline(&mut self.w.rename_buf)
                             .font(FontId::proportional(11.5))
                             .desired_width(width),
                     );
-                    if self.rename_focus {
+                    if self.w.rename_focus {
                         r.request_focus();
-                        select_all_text(ui.ctx(), r.id, self.rename_buf.chars().count());
-                        self.rename_focus = false;
+                        select_all_text(ui.ctx(), r.id, self.w.rename_buf.chars().count());
+                        self.w.rename_focus = false;
                     }
                     r
                 })
@@ -2056,7 +2416,7 @@ impl App {
             }
         }
         if drag_started {
-            self.dragging_group = Some(name.to_string());
+            self.w.dragging_group = Some(name.to_string());
         }
         (rect, released)
     }
@@ -2065,17 +2425,17 @@ impl App {
     /// target) and whether a drag ended on it.
     fn session_row(&mut self, ui: &mut egui::Ui, idx: usize, indent: f32, acts: &mut Vec<Act>) -> (Rect, bool) {
         let id = self.sessions[idx].id;
-        let renaming = self.renaming == Some(id);
-        let is_dragging = self.dragging == Some(id);
+        let renaming = self.w.renaming == Some(id);
+        let is_dragging = self.w.dragging == Some(id);
         let pinned = self.sessions[idx].pinned;
         // Seconds since this row's pin refused something (close, drag, move).
         let shake = self
-            .pin_shake
+            .w.pin_shake
             .filter(|(sid, _)| *sid == id)
             .map(|(_, t)| t.elapsed().as_secs_f32())
             .filter(|t| *t < SHAKE_SECS);
         let s = &self.sessions[idx];
-        let selected = self.active == Some(s.id);
+        let selected = self.w.active == Some(s.id);
         let row_h = 48.0;
         let (rect, resp) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::click_and_drag());
@@ -2316,6 +2676,20 @@ impl App {
                 }
             }
         }
+        let other_wins: Vec<(u64, String)> = self
+            .wins
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.id != self.cur_win)
+            .map(|(n, w)| {
+                let name = if w.id == 0 {
+                    tr("Главное окно", "Main window").to_string()
+                } else {
+                    format!("{} {}", tr("Окно", "Window"), n + 1)
+                };
+                (w.id, name)
+            })
+            .collect();
         resp.context_menu(|ui| {
             if ui.button(tr("Переименовать", "Rename")).clicked() {
                 acts.push(Act::BeginRename(sid));
@@ -2348,6 +2722,21 @@ impl App {
                 }
                 if cur_group.is_some() && ui.button(tr("Без группы", "No group")).clicked() {
                     acts.push(Act::MoveSession { id: sid, group: None, before: None });
+                    ui.close();
+                }
+            });
+            ui.menu_button(tr("В окно", "Move to window"), |ui| {
+                for (wid, name) in &other_wins {
+                    if ui.button(name).clicked() {
+                        acts.push(Act::MoveToWindow { id: sid, win: Some(*wid) });
+                        ui.close();
+                    }
+                }
+                if !other_wins.is_empty() {
+                    ui.separator();
+                }
+                if ui.button(tr("Новое окно", "New window")).clicked() {
+                    acts.push(Act::MoveToWindow { id: sid, win: None });
                     ui.close();
                 }
             });
@@ -2394,14 +2783,14 @@ impl App {
                 .fixed_pos(Pos2::new(text_x - 4.0, rect.center().y - 18.0))
                 .show(&cctx, |ui| {
                     let r = ui.add(
-                        egui::TextEdit::singleline(&mut self.rename_buf)
+                        egui::TextEdit::singleline(&mut self.w.rename_buf)
                             .font(FontId::proportional(13.0))
                             .desired_width(width),
                     );
-                    if self.rename_focus {
+                    if self.w.rename_focus {
                         r.request_focus();
-                        select_all_text(ui.ctx(), r.id, self.rename_buf.chars().count());
-                        self.rename_focus = false;
+                        select_all_text(ui.ctx(), r.id, self.w.rename_buf.chars().count());
+                        self.w.rename_focus = false;
                     }
                     r
                 })
@@ -2415,9 +2804,9 @@ impl App {
         }
         if drag_started {
             if pinned {
-                self.pin_shake = Some((id, Instant::now()));
+                self.w.pin_shake = Some((id, Instant::now()));
             } else {
-                self.dragging = Some(id);
+                self.w.dragging = Some(id);
             }
         }
         (rect, released)
@@ -2554,12 +2943,12 @@ impl App {
                 });
             });
         }
-        self.chip_rect = Some(chip_rect);
+        self.w.chip_rect = Some(chip_rect);
         if chip_clicked {
-            self.dir_open = !self.dir_open;
-            if self.dir_open {
-                self.dir_query.clear();
-                self.dir_path = self.sessions[idx].cwd.clone();
+            self.w.dir_open = !self.w.dir_open;
+            if self.w.dir_open {
+                self.w.dir_query.clear();
+                self.w.dir_path = self.sessions[idx].cwd.clone();
             }
         }
         acts
@@ -2585,11 +2974,11 @@ impl App {
             let settings = self.settings.clone();
             let accept = busy_now
                 && !self.settings_open
-                && !self.dir_open
-                && self.renaming.is_none()
-                && self.renaming_group.is_none()
+                && !self.w.dir_open
+                && self.w.renaming.is_none()
+                && self.w.renaming_group.is_none()
                 // Don't steal focus from the explorer's active text field.
-                && !(self.explorer.open && self.explorer.mode != ExMode::Browse);
+                && !(self.w.explorer.open && self.w.explorer.mode != ExMode::Browse);
             let term_rect = ui.available_rect_before_wrap();
             let s = &mut self.sessions[idx];
             let info = term_view::show(ui, s, &settings, accept);
@@ -2650,24 +3039,24 @@ impl App {
         let ctx = ui.ctx().clone();
         self.refresh_history(&ctx);
         let interactive = !self.settings_open
-            && !self.dir_open
-            && self.renaming.is_none()
-            && self.renaming_group.is_none()
+            && !self.w.dir_open
+            && self.w.renaming.is_none()
+            && self.w.renaming_group.is_none()
             // The explorer's search / new-file field owns the keyboard while open.
-            && !(self.explorer.open && self.explorer.mode != ExMode::Browse);
+            && !(self.w.explorer.open && self.w.explorer.mode != ExMode::Browse);
         let mut submit: Option<String> = None;
 
         // Multiline once the command has a newline (added with Shift+Enter, which
         // the singleline consume below lets through to the editor). Plain Enter
         // still submits. While multiline, arrows move the caret, not history.
-        let multiline = self.cmd_input.contains('\n');
+        let multiline = self.w.cmd_input.contains('\n');
         // Down on the last line has nowhere to go, so make it mean "end of the
         // text" the way every editor does.
-        let editor_id = egui::Id::new("cmdline-editor");
+        let editor_id = egui::Id::new(("cmdline-editor", self.cur_win));
         let caret = egui::text_edit::TextEditState::load(&ctx, editor_id)
             .and_then(|s| s.cursor.char_range())
             .map(|r| r.primary.index.0);
-        let last_line = on_last_line(&self.cmd_input, caret);
+        let last_line = on_last_line(&self.w.cmd_input, caret);
         let (mut enter, mut up, mut down, mut esc) = (false, false, false, false);
         let mut to_end = false;
         if interactive {
@@ -2685,7 +3074,7 @@ impl App {
             });
         }
 
-        let q = self.hist_query.to_lowercase();
+        let q = self.w.hist_query.to_lowercase();
         let mut display: Vec<String> = self
             .history
             .iter()
@@ -2700,12 +3089,12 @@ impl App {
         // While settings or the directory switcher is open the editor is not
         // interactive; close the history popup so it does not sit there frozen.
         if !interactive {
-            self.hist_forced = false;
-            self.hist_sel = None;
+            self.w.hist_forced = false;
+            self.w.hist_sel = None;
         }
         let mut hist_visible = interactive
-            && !self.hist_dismissed
-            && (!self.cmd_input.is_empty() || self.hist_forced)
+            && !self.w.hist_dismissed
+            && (!self.w.cmd_input.is_empty() || self.w.hist_forced)
             && show_n > 0;
 
         // Any programmatic fill (history nav) or a plain ArrowDown puts the caret
@@ -2716,33 +3105,33 @@ impl App {
                 // A background history reload can shrink the filtered list under
                 // a stale hist_sel, so clamp before stepping up; indexing it raw
                 // panics. (The Down branch already guards with i + 1 < show_n.)
-                let sel = match self.hist_sel {
+                let sel = match self.w.hist_sel {
                     None => show_n - 1,
                     Some(i) => i.min(show_n - 1).saturating_sub(1),
                 };
-                self.hist_sel = Some(sel);
-                self.cmd_input = display[sel].clone();
+                self.w.hist_sel = Some(sel);
+                self.w.cmd_input = display[sel].clone();
                 caret_end = true;
-            } else if self.cmd_input.is_empty() && show_n > 0 {
+            } else if self.w.cmd_input.is_empty() && show_n > 0 {
                 // First Up on an empty line: open and land on the most recent
                 // command right away, not on a second press.
-                self.hist_forced = true;
-                self.hist_dismissed = false;
-                self.hist_sel = Some(show_n - 1);
-                self.cmd_input = display[show_n - 1].clone();
+                self.w.hist_forced = true;
+                self.w.hist_dismissed = false;
+                self.w.hist_sel = Some(show_n - 1);
+                self.w.cmd_input = display[show_n - 1].clone();
                 caret_end = true;
                 hist_visible = true;
             }
         }
         if down {
-            match self.hist_sel {
+            match self.w.hist_sel {
                 Some(i) if hist_visible && i + 1 < show_n => {
-                    self.hist_sel = Some(i + 1);
-                    self.cmd_input = display[i + 1].clone();
+                    self.w.hist_sel = Some(i + 1);
+                    self.w.cmd_input = display[i + 1].clone();
                 },
                 Some(_) if hist_visible => {
-                    self.hist_sel = None;
-                    self.cmd_input = self.hist_query.clone();
+                    self.w.hist_sel = None;
+                    self.w.cmd_input = self.w.hist_query.clone();
                 },
                 _ => {},
             }
@@ -2750,17 +3139,17 @@ impl App {
         }
         if esc {
             if hist_visible {
-                self.hist_dismissed = true;
-                self.hist_forced = false;
-                self.hist_sel = None;
+                self.w.hist_dismissed = true;
+                self.w.hist_forced = false;
+                self.w.hist_sel = None;
                 hist_visible = false;
             } else {
-                self.cmd_input.clear();
-                self.hist_query.clear();
+                self.w.cmd_input.clear();
+                self.w.hist_query.clear();
             }
         }
         if enter {
-            let text = self.cmd_input.trim();
+            let text = self.w.cmd_input.trim();
             if !text.is_empty() {
                 submit = Some(text.to_string());
             }
@@ -2768,9 +3157,9 @@ impl App {
 
         let font = FontId::monospace(self.settings.font_size);
         // Grow the editor with the number of lines (Shift+Enter), capped.
-        let n_lines = (self.cmd_input.matches('\n').count() + 1).clamp(1, 8);
+        let n_lines = (self.w.cmd_input.matches('\n').count() + 1).clamp(1, 8);
         let panel_h = 36.0 + (n_lines as f32 - 1.0) * (self.settings.font_size + 6.0);
-        let field_rect = egui::Panel::bottom("cmdline")
+        let field_rect = egui::Panel::bottom(egui::Id::new(("cmdline", self.cur_win)))
             .exact_size(panel_h)
             .resizable(false)
             .show_separator_line(false)
@@ -2789,7 +3178,7 @@ impl App {
                     // point that at Shift+Enter. Plain Enter is consumed above and
                     // submits, so the editor never sees it.
                     let resp = ui.add(
-                        egui::TextEdit::multiline(&mut self.cmd_input)
+                        egui::TextEdit::multiline(&mut self.w.cmd_input)
                             .id(editor_id)
                             .frame(Frame::new())
                             .font(font.clone())
@@ -2816,16 +3205,16 @@ impl App {
                     });
                     if caret_end {
                         if let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), resp.id) {
-                            let end = egui::text::CCursor::new(self.cmd_input.chars().count());
+                            let end = egui::text::CCursor::new(self.w.cmd_input.chars().count());
                             state.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
                             state.store(ui.ctx(), resp.id);
                         }
                     }
                     if resp.changed() {
-                        self.hist_query = self.cmd_input.clone();
-                        self.hist_dismissed = false;
-                        self.hist_forced = false;
-                        self.hist_sel = None;
+                        self.w.hist_query = self.w.cmd_input.clone();
+                        self.w.hist_dismissed = false;
+                        self.w.hist_forced = false;
+                        self.w.hist_sel = None;
                     }
                     resp.rect
                 })
@@ -2849,7 +3238,7 @@ impl App {
                             ui.label(RichText::new(tr("История", "History")).size(9.5).color(palette::text_faint()));
                             ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                                 for (i, cmd) in display.iter().enumerate() {
-                                    let selected = self.hist_sel == Some(i);
+                                    let selected = self.w.hist_sel == Some(i);
                                     let resp = ui.selectable_label(
                                         selected,
                                         RichText::new(truncate_end(cmd, 90)).monospace().size(11.5),
@@ -2872,11 +3261,11 @@ impl App {
         }
 
         if submit.is_some() {
-            self.cmd_input.clear();
-            self.hist_query.clear();
-            self.hist_sel = None;
-            self.hist_forced = false;
-            self.hist_dismissed = false;
+            self.w.cmd_input.clear();
+            self.w.hist_query.clear();
+            self.w.hist_sel = None;
+            self.w.hist_forced = false;
+            self.w.hist_dismissed = false;
         }
         submit
     }
@@ -2889,7 +3278,7 @@ impl App {
             .anchor(Align2::RIGHT_TOP, Vec2::new(-10.0, 8.0))
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(30.0, 20.0), Sense::hover());
-                let active = resp.hovered() || self.stats_rect.is_some();
+                let active = resp.hovered() || self.w.stats_rect.is_some();
                 let bg = if active { palette::surface_hi() } else { palette::surface() };
                 ui.painter().rect_filled(rect, CornerRadius::same(5), bg);
                 ui.painter().rect_stroke(
@@ -2912,11 +3301,11 @@ impl App {
 
         let pointer = ctx.input(|i| i.pointer.interact_pos());
         let over_popup = self
-            .stats_rect
+            .w.stats_rect
             .is_some_and(|r| pointer.is_some_and(|p| r.expand(6.0).contains(p)));
         let open = chip.inner.hovered() || over_popup;
         if !open {
-            self.stats_rect = None;
+            self.w.stats_rect = None;
             return;
         }
 
@@ -3054,7 +3443,7 @@ impl App {
                         );
                     });
             });
-        self.stats_rect = Some(area.response.rect);
+        self.w.stats_rect = Some(area.response.rect);
     }
 
     /// Subscription-limit chip in the bottom-right corner. Hovering opens every
@@ -3087,7 +3476,7 @@ impl App {
                     None => 30.0,
                 };
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 20.0), Sense::hover());
-                let active = resp.hovered() || self.usage_rect.is_some();
+                let active = resp.hovered() || self.w.usage_rect.is_some();
                 let bg = if active { palette::surface_hi() } else { palette::surface() };
                 let p = ui.painter();
                 p.rect_filled(rect, CornerRadius::same(5), bg);
@@ -3142,7 +3531,7 @@ impl App {
 
         let pointer = ctx.input(|i| i.pointer.interact_pos());
         let over_popup = self
-            .usage_rect
+            .w.usage_rect
             .is_some_and(|r| pointer.is_some_and(|p| r.expand(6.0).contains(p)));
         let open = chip.inner.hovered() || over_popup;
 
@@ -3161,7 +3550,7 @@ impl App {
             ctx.request_repaint_after(Duration::from_secs(30));
         }
         if !open {
-            self.usage_rect = None;
+            self.w.usage_rect = None;
             return;
         }
 
@@ -3306,19 +3695,19 @@ impl App {
                 if self.settings.usage_pin.as_deref() == Some(&key) { None } else { Some(key) };
             self.persist();
         }
-        self.usage_rect = Some(area.response.rect);
+        self.w.usage_rect = Some(area.response.rect);
     }
 
     /// Directory switcher over the path chip: navigating runs `cd` in the shell.
     fn dir_popup(&mut self, ctx: &egui::Context) {
-        if !self.dir_open {
+        if !self.w.dir_open {
             // Catches every way the popup can close - the path chip, switching
             // session, Escape - so a half-typed folder name never comes back.
-            self.new_dir = None;
-            self.new_dir_err = None;
+            self.w.new_dir = None;
+            self.w.new_dir_err = None;
             return;
         }
-        let Some(chip) = self.chip_rect else { return };
+        let Some(chip) = self.w.chip_rect else { return };
 
         let (mut esc, mut enter) = (false, false);
         ctx.input_mut(|i| {
@@ -3327,23 +3716,23 @@ impl App {
         });
         if esc {
             // Escape backs out of the folder editor first, the popup second.
-            if self.new_dir.take().is_none() {
-                self.dir_open = false;
+            if self.w.new_dir.take().is_none() {
+                self.w.dir_open = false;
             }
-            self.new_dir_err = None;
+            self.w.new_dir_err = None;
             return;
         }
-        if enter && self.new_dir.is_some() {
+        if enter && self.w.new_dir.is_some() {
             self.create_dir_and_enter(ctx);
             return;
         }
 
         let stale = self
-            .dir_cache_at
+            .w.dir_cache_at
             .as_ref()
-            .is_none_or(|(p, t)| p != &self.dir_path || t.elapsed() >= Duration::from_secs(2));
+            .is_none_or(|(p, t)| p != &self.w.dir_path || t.elapsed() >= Duration::from_secs(2));
         if stale {
-            self.dir_cache = std::fs::read_dir(&self.dir_path)
+            self.w.dir_cache = std::fs::read_dir(&self.w.dir_path)
                 .map(|rd| {
                     rd.flatten()
                         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
@@ -3351,13 +3740,13 @@ impl App {
                         .collect()
                 })
                 .unwrap_or_default();
-            self.dir_cache.sort_by_key(|d| d.to_lowercase());
-            self.dir_cache.truncate(2000);
-            self.dir_cache_at = Some((self.dir_path.clone(), Instant::now()));
+            self.w.dir_cache.sort_by_key(|d| d.to_lowercase());
+            self.w.dir_cache.truncate(2000);
+            self.w.dir_cache_at = Some((self.w.dir_path.clone(), Instant::now()));
         }
-        let q = self.dir_query.to_lowercase();
+        let q = self.w.dir_query.to_lowercase();
         let mut dirs: Vec<String> = self
-            .dir_cache
+            .w.dir_cache
             .iter()
             .filter(|d| !d.starts_with('.') || q.starts_with('.'))
             .filter(|d| q.is_empty() || d.to_lowercase().contains(&q))
@@ -3380,7 +3769,7 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_width(430.0);
                         let resp = ui.add(
-                            egui::TextEdit::singleline(&mut self.dir_query)
+                            egui::TextEdit::singleline(&mut self.w.dir_query)
                                 .frame(Frame::new())
                                 .font(FontId::proportional(12.5))
                                 .hint_text(tr("Поиск папок...", "Search folders..."))
@@ -3388,21 +3777,21 @@ impl App {
                         );
                         // The search field owns the keyboard except while a new
                         // folder name is being typed.
-                        if self.new_dir.is_none() {
+                        if self.w.new_dir.is_none() {
                             resp.request_focus();
                         }
                         ui.separator();
 
-                        match self.new_dir.clone() {
+                        match self.w.new_dir.clone() {
                             None => {
                                 let label = RichText::new(tr("+ Новая папка", "+ New folder"))
                                     .size(11.5)
                                     .color(palette::text_dim());
                                 if ui.add(egui::Button::new(label).frame(false)).clicked() {
-                                    self.new_dir =
+                                    self.w.new_dir =
                                         Some(tr("Новая папка", "New folder").to_string());
-                                    self.new_dir_focus = true;
-                                    self.new_dir_err = None;
+                                    self.w.new_dir_focus = true;
+                                    self.w.new_dir_err = None;
                                 }
                             },
                             Some(mut name) => {
@@ -3410,7 +3799,7 @@ impl App {
                                     .font(FontId::proportional(12.5))
                                     .desired_width(f32::INFINITY)
                                     .show(ui);
-                                if self.new_dir_focus {
+                                if self.w.new_dir_focus {
                                     out.response.request_focus();
                                     let end = CCursor::new(name.chars().count());
                                     let mut state = out.state;
@@ -3419,10 +3808,10 @@ impl App {
                                         end,
                                     )));
                                     state.store(ui.ctx(), out.response.id);
-                                    self.new_dir_focus = false;
+                                    self.w.new_dir_focus = false;
                                 }
-                                self.new_dir = Some(name);
-                                if let Some(err) = &self.new_dir_err {
+                                self.w.new_dir = Some(name);
+                                if let Some(err) = &self.w.new_dir_err {
                                     ui.label(
                                         RichText::new(truncate_end(err, 60)).size(10.5).color(GIT_DEL),
                                     );
@@ -3431,7 +3820,7 @@ impl App {
                         }
                         ui.separator();
                         ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                            if self.dir_path.parent().is_some()
+                            if self.w.dir_path.parent().is_some()
                                 && ui
                                     .selectable_label(false, RichText::new(tr("..  (наверх)", "..  (up)")).size(12.0).color(palette::text_dim()))
                                     .clicked()
@@ -3451,7 +3840,7 @@ impl App {
                             }
                         });
                         ui.label(
-                            RichText::new(truncate_head(&tilde(&self.dir_path), 52))
+                            RichText::new(truncate_head(&tilde(&self.w.dir_path), 52))
                                 .monospace()
                                 .size(9.5)
                                 .color(palette::text_faint()),
@@ -3475,39 +3864,39 @@ impl App {
                     .is_some_and(|p| !area.response.rect.contains(p) && !chip.contains(p))
         });
         if clicked_outside {
-            self.dir_open = false;
+            self.w.dir_open = false;
         }
     }
 
     /// Create the folder named in the inline editor and step into it. A failure
     /// (name taken, read-only parent) keeps the editor open with the reason.
     fn create_dir_and_enter(&mut self, ctx: &egui::Context) {
-        let name = self.new_dir.as_deref().unwrap_or_default().trim().to_string();
+        let name = self.w.new_dir.as_deref().unwrap_or_default().trim().to_string();
         if name.is_empty() {
             return; // Enter on an empty field does nothing, the editor stays
         }
-        self.new_dir = None;
-        match std::fs::create_dir(self.dir_path.join(&name)) {
+        self.w.new_dir = None;
+        match std::fs::create_dir(self.w.dir_path.join(&name)) {
             Ok(()) => {
-                self.new_dir_err = None;
-                self.dir_cache_at = None;
+                self.w.new_dir_err = None;
+                self.w.dir_cache_at = None;
                 self.dir_navigate(Some(name), ctx);
             },
             Err(e) => {
-                self.new_dir_err = Some(e.to_string());
-                self.new_dir = Some(name);
-                self.new_dir_focus = true;
+                self.w.new_dir_err = Some(e.to_string());
+                self.w.new_dir = Some(name);
+                self.w.new_dir_focus = true;
             },
         }
     }
 
     fn dir_navigate(&mut self, step: Option<String>, ctx: &egui::Context) {
         let new_path = match &step {
-            None => match self.dir_path.parent() {
+            None => match self.w.dir_path.parent() {
                 Some(p) => p.to_path_buf(),
                 None => return,
             },
-            Some(name) => self.dir_path.join(name),
+            Some(name) => self.w.dir_path.join(name),
         };
         if let Some(idx) = self.active_idx() {
             let is_live = matches!(self.sessions[idx].phase, Phase::Live(_));
@@ -3525,10 +3914,10 @@ impl App {
                 self.persist();
             }
         }
-        self.dir_path = new_path;
-        self.dir_query.clear();
-        self.new_dir = None;
-        self.new_dir_err = None;
+        self.w.dir_path = new_path;
+        self.w.dir_query.clear();
+        self.w.new_dir = None;
+        self.w.new_dir_err = None;
     }
 
     fn frozen_view(&mut self, ui: &mut egui::Ui, idx: usize, acts: &mut Vec<Act>) {
@@ -3974,17 +4363,6 @@ impl eframe::App for App {
         self.drain_ctx_index();
         self.drain_update();
         self.drain_history();
-        // Folders opened from Finder's Services menu ("New kip Window Here").
-        #[cfg(target_os = "macos")]
-        {
-            let pending = mac_service::take_pending();
-            if !pending.is_empty() {
-                for dir in pending {
-                    self.spawn(dir, None, &ctx);
-                }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
-        }
         while let Ok(st) = self.stats_rx.try_recv() {
             self.stats = Some(st);
             self.stats_at = Some(Instant::now());
@@ -4002,56 +4380,7 @@ impl eframe::App for App {
             self.usage_at = Some(Instant::now());
             self.usage_inflight = false;
         }
-
-        // Paste without text (Finder file, screenshot image) -> insert as a path.
-        // Such a pasteboard has no string type, so egui emits no paste event at
-        // all; the Cmd+V hook is what tells us it happened. When egui did produce
-        // a paste event the text is the paste and the terminal handles it.
-        if paste_shortcut() && ctx.input(|i| !i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))) {
-            if let Some(p) = plat::clipboard_paths() {
-                self.insert_paths(shell_escape(&p));
-            }
-        }
-        // Drag & drop of files from Finder.
-        let dropped: Vec<String> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .filter_map(|f| f.path.as_ref().map(|p| p.to_string_lossy().into_owned()))
-                .collect()
-        });
-        if !dropped.is_empty() {
-            let text = dropped.iter().map(|p| shell_escape(p)).collect::<Vec<_>>().join(" ");
-            self.insert_paths(text);
-        }
-        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
-            let painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("dnd-overlay"),
-            ));
-            let r = ctx.content_rect();
-            painter.rect_filled(r, 0.0, Color32::from_black_alpha(90));
-            painter.rect_stroke(
-                r.shrink(12.0),
-                CornerRadius::same(10),
-                Stroke::new(2.0, UNREAD),
-                egui::StrokeKind::Inside,
-            );
-            painter.text(
-                r.center(),
-                Align2::CENTER_CENTER,
-                tr("Отпусти - вставлю путь к файлу", "Drop to insert the file path"),
-                FontId::proportional(15.0),
-                palette::text(),
-            );
-        }
         self.housekeeping(&ctx);
-        self.shortcuts(&ctx);
-
-        if self.active.is_some() && self.active_idx().is_none() {
-            self.active = self.sessions.first().map(|s| s.id);
-        }
-        self.active_shared.store(self.active.unwrap_or(0), Ordering::Relaxed);
 
         // Adopt zoom changed via Cmd+= / Cmd+- (egui built-in); while the
         // settings window is open the slider owns the value instead.
@@ -4062,54 +4391,67 @@ impl eframe::App for App {
             }
         }
 
-        // Session panel: drag its right edge. Never past half the window (the
-        // terminal has to stay the main thing) and never below a width where a
-        // row still reads - name, path and the close button.
-        let max_w = (ui.max_rect().width() * 0.5).max(SIDEBAR_MIN);
-        let panel = egui::Panel::left("sidebar")
-            .default_size(self.settings.sidebar_w.clamp(SIDEBAR_MIN, max_w))
-            .size_range(SIDEBAR_MIN..=max_w)
-            .resizable(true)
-            .frame(Frame::new().fill(palette::chrome_sidebar()))
-            .show(ui, |ui| self.sidebar(ui));
-        // Remember the dragged width; it rides along with the next persist
-        // (any session change, and the one on exit) rather than writing state
-        // on every pixel of the drag.
-        let w = panel.response.rect.width();
-        if (w - self.settings.sidebar_w).abs() > 0.5 {
-            self.settings.sidebar_w = w;
-        }
-        self.apply(panel.inner, &ctx);
-
-        if self.explorer.open {
-            let acts = egui::Panel::left("explorer")
-                .exact_size(240.0)
-                .resizable(false)
-                .frame(Frame::new().fill(palette::chrome_sidebar()))
-                .show(ui, |ui| self.explorer_panel(ui))
-                .inner;
-            self.apply(acts, &ctx);
+        // The main window draws into the root viewport; every other window is
+        // an immediate viewport drawn from here, so all of them share this
+        // frame (and this App). A window opened during a pass is drawn in the
+        // same frame - hence the index loop.
+        self.window_pass(0, ui);
+        let z = ctx.zoom_factor();
+        let mut k = 1;
+        while k < self.wins.len() {
+            let w = &mut self.wins[k];
+            let b = w.builder.get_or_insert_with(|| {
+                let b = egui::ViewportBuilder::default()
+                    .with_icon(self.icon.clone())
+                    .with_inner_size(w.open_size.unwrap_or(Vec2::new(1160.0, 740.0)) / z)
+                    .with_min_inner_size(Vec2::new(680.0, 420.0) / z);
+                match w.open_at {
+                    Some(p) => b.with_position(p / z),
+                    None => b,
+                }
+            });
+            let b = b.clone().with_title(format!("kip {}", k + 1));
+            let vid = w.viewport();
+            ctx.show_viewport_immediate(vid, b, |ui, _| self.window_pass(k, ui));
+            k += 1;
         }
 
-        let acts = egui::Panel::bottom("statusbar")
-            .exact_size(34.0)
-            .frame(Frame::new().fill(palette::chrome_bar()))
-            .show(ui, |ui| self.bottom_bar(ui))
-            .inner;
-        self.apply(acts, &ctx);
-
-        let acts = egui::CentralPanel::default()
-            .frame(Frame::new().fill(palette::term_bg()))
-            .show(ui, |ui| self.central(ui))
-            .inner;
-        self.apply(acts, &ctx);
-
-        if self.settings_open {
-            self.settings_window(&ctx);
+        // A closed extra window hands its sessions to the end of the main one,
+        // live ones still running - closing a window never loses a session.
+        self.wins.retain(|w| !w.closing);
+        if self.sessions.iter().any(|s| !self.wins.iter().any(|w| w.id == s.window)) {
+            let (mut keep, moved): (Vec<_>, Vec<_>) = std::mem::take(&mut self.sessions)
+                .into_iter()
+                .partition(|s| self.wins.iter().any(|w| w.id == s.window));
+            keep.extend(moved.into_iter().map(|mut s| {
+                s.window = 0;
+                s
+            }));
+            self.sessions = keep;
+            self.wins[0].renorm = true;
+            self.persist();
         }
-        self.dir_popup(&ctx);
-        self.stats_ui(&ctx);
-        self.usage_ui(&ctx);
+
+        // eframe creates a window on a frame that runs inside the event loop;
+        // an idle kip may not get another one for a while, so keep frames
+        // coming until every window is actually up.
+        if self.wins.iter().any(|w| !w.drawn) {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if let Ok(mut a) = self.active_shared.lock() {
+            *a = self.wins.iter().filter_map(|w| w.ui.active).collect();
+        }
+        if let Some(t) = self.geom_at {
+            if t.elapsed() >= Duration::from_secs(1) {
+                self.geom_at = None;
+                self.persist();
+            } else {
+                ctx.request_repaint_after(Duration::from_secs(1));
+            }
+        }
+        if self.dirty.get() {
+            self.save_now();
+        }
     }
 
     fn on_exit(&mut self) {
@@ -4120,7 +4462,7 @@ impl eframe::App for App {
                 s.save_claude_session();
             }
         }
-        self.persist();
+        self.save_now();
     }
 }
 
@@ -4498,11 +4840,16 @@ fn consume_plain(i: &mut egui::InputState, target: Key) -> bool {
 
 /// Cmd+key shortcut match on both logical and physical key, so it works in any keyboard layout.
 fn consume_cmd(i: &mut egui::InputState, target: Key) -> bool {
+    consume_mods(i, Modifiers::COMMAND, target)
+}
+
+/// `mods` must be held (extra Shift/Alt is tolerated unless `mods` names it).
+fn consume_mods(i: &mut egui::InputState, mods: Modifiers, target: Key) -> bool {
     let mut hit = false;
     i.events.retain(|e| {
         if !hit {
             if let egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } = e {
-                if modifiers.matches_logically(Modifiers::COMMAND)
+                if modifiers.matches_logically(mods)
                     && (*key == target || *physical_key == Some(target))
                 {
                     hit = true;
