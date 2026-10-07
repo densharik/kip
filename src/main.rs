@@ -5,6 +5,7 @@
 mod config;
 mod ctx_index;
 mod i18n;
+mod live;
 #[cfg(target_os = "macos")]
 mod mac_service;
 mod plat;
@@ -251,6 +252,10 @@ struct WinUi {
     stats_rect: Option<Rect>,
     usage_rect: Option<Rect>,
     explorer: Explorer,
+    /// Where the terminal was drawn this frame, for the live-runs card over it.
+    term_rect: Option<Rect>,
+    /// The live-runs card is folded to its header.
+    live_folded: bool,
 }
 
 /// One native window. Id 0 is the main (root) window: closing it quits kip.
@@ -336,6 +341,10 @@ struct App {
     ctxi_tx: Sender<ctx_index::CtxMsg>,
     ctxi_rx: Receiver<ctx_index::CtxMsg>,
     jsonl_map: ctx_index::SharedMap,
+    /// Live Bash output and subagents per Claude session (see `live`).
+    live: std::collections::HashMap<String, live::LiveView>,
+    live_watch: Arc<std::sync::Mutex<Vec<String>>>,
+    live_rx: Receiver<live::LiveMsg>,
     /// Own 500ms cadence of the context poller, independent of TICK.
     last_ctx_stat: Option<Instant>,
     /// Slow cadence of the transcript pass for sessions without a live claude.
@@ -398,6 +407,9 @@ impl App {
         let (ctx_tx, ctx_rx) = mpsc::channel();
         let (ctxi_tx, ctxi_rx) = mpsc::channel();
         let (stats_tx, stats_rx) = mpsc::channel();
+        let (live_tx, live_rx) = mpsc::channel();
+        let live_watch: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        live::start(live_watch.clone(), live_tx, cc.egui_ctx.clone());
         let (usage_tx, usage_rx) = mpsc::channel();
         let (upd_tx, upd_rx) = mpsc::channel();
         let (hist_tx, hist_rx) = mpsc::channel();
@@ -450,6 +462,9 @@ impl App {
             ctxi_tx,
             ctxi_rx,
             jsonl_map,
+            live: Default::default(),
+            live_watch,
+            live_rx,
             last_ctx_stat: None,
             last_idle_scan: None,
             hook_error: None,
@@ -688,11 +703,13 @@ impl App {
             .inner;
         self.apply(acts, ctx);
 
+        self.w.term_rect = None;
         let acts = egui::CentralPanel::default()
             .frame(Frame::new().fill(palette::term_bg()))
             .show(ui, |ui| self.central(ui))
             .inner;
         self.apply(acts, ctx);
+        self.live_card(ctx);
 
         // Settings is app-wide, so it lives in the main window only.
         if k == 0 && self.settings_open {
@@ -1640,6 +1657,26 @@ impl App {
                     }
                     self.ctx_index.apply(update);
                 },
+            }
+        }
+    }
+
+    fn drain_live(&mut self) {
+        while let Ok(msg) = self.live_rx.try_recv() {
+            self.live.insert(msg.sid, msg.view);
+        }
+        let sids: Vec<String> = self
+            .wins
+            .iter()
+            .filter_map(|w| w.ui.active)
+            .chain(self.w.active)
+            .filter_map(|id| self.sessions.iter().find(|s| s.id == id))
+            .filter_map(|s| s.claude_session_id.clone())
+            .collect();
+        self.live.retain(|sid, _| sids.contains(sid));
+        if let Ok(mut w) = self.live_watch.lock() {
+            if *w != sids {
+                *w = sids;
             }
         }
     }
@@ -2980,6 +3017,7 @@ impl App {
                 // Don't steal focus from the explorer's active text field.
                 && !(self.w.explorer.open && self.w.explorer.mode != ExMode::Browse);
             let term_rect = ui.available_rect_before_wrap();
+            self.w.term_rect = Some(term_rect);
             let s = &mut self.sessions[idx];
             let info = term_view::show(ui, s, &settings, accept);
             self.cell = (info.cell_w.round().max(1.0) as u16, info.cell_h.round().max(1.0) as u16);
@@ -3920,6 +3958,148 @@ impl App {
         self.w.new_dir_err = None;
     }
 
+    /// The card over the terminal's top right while Claude runs Bash or
+    /// subagents: their live output, so a long turn is not a blank wait. It
+    /// floats over the terminal instead of taking a panel, so the PTY keeps
+    /// its size and claude does not redraw each time a command starts.
+    fn live_card(&mut self, ctx: &egui::Context) {
+        const LINGER_MS: u64 = 6000;
+        let Some(term) = self.w.term_rect else { return };
+        let Some(idx) = self.active_idx() else { return };
+        let Some(sid) = self.sessions[idx].claude_session_id.clone() else { return };
+        let Some(view) = self.live.get(&sid) else { return };
+        let now = live::now_ms();
+        let busy = view.is_busy();
+        if !busy && view.last_end().is_none_or(|t| now.saturating_sub(t) > LINGER_MS) {
+            return;
+        }
+        let secs = |from: u64, to: u64| fmt_dur(Duration::from_millis(to.saturating_sub(from)));
+        let width = (term.width() * 0.5).clamp(280.0, 520.0);
+        let max_h = term.height() * 0.6;
+        let running: Vec<&live::Run> = view.running().collect();
+        let agents: Vec<&live::Agent> = view.agents_running().collect();
+        let recent: Vec<&live::Run> = view
+            .runs
+            .iter()
+            .rev()
+            .filter(|r| r.ended_at.is_some_and(|t| now.saturating_sub(t) <= LINGER_MS))
+            .take(3)
+            .collect();
+        let mut toggle = false;
+
+        egui::Area::new(egui::Id::new(("live-card", self.cur_win)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(Pos2::new(term.right() - width - 12.0, term.top() + 48.0))
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(palette::popup_bg())
+                    .stroke(Stroke::new(1.0, palette::border()))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 20.0);
+                        ui.set_max_height(max_h);
+                        let mut head = if busy {
+                            let mut parts = Vec::new();
+                            if !running.is_empty() {
+                                parts.push(format!("bash: {}", running.len()));
+                            }
+                            if !agents.is_empty() {
+                                parts.push(format!("{}: {}", tr("агенты", "agents"), agents.len()));
+                            }
+                            format!("{}  {}", tr("Идёт", "Running"), parts.join(", "))
+                        } else {
+                            tr("Готово", "Done").to_string()
+                        };
+                        head.push_str(if self.w.live_folded { "  +" } else { "  -" });
+                        let color = if busy { palette::accent_bar() } else { palette::text_dim() };
+                        let resp = ui.add(
+                            egui::Label::new(RichText::new(head).size(11.5).strong().color(color))
+                                .sense(egui::Sense::click()),
+                        );
+                        if resp.clicked() {
+                            toggle = true;
+                        }
+                        if self.w.live_folded {
+                            return;
+                        }
+                        egui::ScrollArea::vertical().stick_to_bottom(true).max_height(max_h - 24.0).show(ui, |ui| {
+                            for r in &running {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(format!("{} {}", secs(r.started_at, now), truncate_end(&r.label, 70)))
+                                        .size(12.0)
+                                        .color(palette::text_strong()),
+                                );
+                                let cmd = r.command.lines().next().unwrap_or("");
+                                ui.label(
+                                    RichText::new(format!("$ {}", truncate_end(cmd, 90)))
+                                        .font(FontId::monospace(10.5))
+                                        .color(palette::text_faint()),
+                                );
+                                let lines = view.tails.get(&r.id).map(|v| v.as_slice()).unwrap_or(&[]);
+                                if lines.is_empty() {
+                                    ui.label(
+                                        RichText::new(tr("пока без вывода", "no output yet"))
+                                            .font(FontId::monospace(10.5))
+                                            .color(palette::text_faint()),
+                                    );
+                                }
+                                for line in lines.iter().rev().take(live::TAIL_LINES).rev() {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(truncate_end(line, 140))
+                                                .font(FontId::monospace(10.5))
+                                                .color(palette::text_dim()),
+                                        )
+                                        .truncate(),
+                                    );
+                                }
+                            }
+                            for a in &agents {
+                                ui.add_space(4.0);
+                                let tool = a.last_tool.as_deref().map(|t| format!(" - {t}")).unwrap_or_default();
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!(
+                                            "{} {}: {}{}",
+                                            secs(a.started_at, now),
+                                            a.kind,
+                                            a.label,
+                                            truncate_end(&tool, 60)
+                                        ))
+                                        .size(11.5)
+                                        .color(palette::text()),
+                                    )
+                                    .truncate(),
+                                );
+                            }
+                            if !busy {
+                                for r in &recent {
+                                    let mark = if r.status == "error" { tr("ошибка", "error") } else { "ok" };
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format!(
+                                                "{mark} {} {}",
+                                                secs(r.started_at, r.ended_at.unwrap_or(now)),
+                                                truncate_end(&r.label, 70)
+                                            ))
+                                            .size(11.5)
+                                            .color(palette::text_dim()),
+                                        )
+                                        .truncate(),
+                                    );
+                                }
+                            }
+                        });
+                    });
+            });
+        if toggle {
+            self.w.live_folded = !self.w.live_folded;
+        }
+        ctx.request_repaint_after(Duration::from_millis(if busy { 1000 } else { LINGER_MS }));
+    }
+
     fn frozen_view(&mut self, ui: &mut egui::Ui, idx: usize, acts: &mut Vec<Act>) {
         let font_size = self.settings.font_size;
         let mut skip_changed = false;
@@ -4361,6 +4541,7 @@ impl eframe::App for App {
         self.drain_git();
         self.drain_ctx(&ctx);
         self.drain_ctx_index();
+        self.drain_live();
         self.drain_update();
         self.drain_history();
         while let Ok(st) = self.stats_rx.try_recv() {
