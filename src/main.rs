@@ -5,7 +5,7 @@
 mod config;
 mod ctx_index;
 mod i18n;
-mod live;
+mod mods;
 #[cfg(target_os = "macos")]
 mod mac_service;
 mod plat;
@@ -252,10 +252,10 @@ struct WinUi {
     stats_rect: Option<Rect>,
     usage_rect: Option<Rect>,
     explorer: Explorer,
-    /// Where the terminal was drawn this frame, for the live-runs card over it.
+    /// Where the terminal was drawn this frame, for the mod cards over it.
     term_rect: Option<Rect>,
-    /// The live-runs card is folded to its header.
-    live_folded: bool,
+    /// Mods whose card is folded to its header.
+    mods_folded: HashSet<String>,
 }
 
 /// One native window. Id 0 is the main (root) window: closing it quits kip.
@@ -341,10 +341,10 @@ struct App {
     ctxi_tx: Sender<ctx_index::CtxMsg>,
     ctxi_rx: Receiver<ctx_index::CtxMsg>,
     jsonl_map: ctx_index::SharedMap,
-    /// Live Bash output and subagents per Claude session (see `live`).
-    live: std::collections::HashMap<String, live::LiveView>,
-    live_watch: Arc<std::sync::Mutex<Vec<String>>>,
-    live_rx: Receiver<live::LiveMsg>,
+    /// What each mod shows per Claude session (see `mods`).
+    mods: std::collections::HashMap<String, Vec<(String, mods::ModView)>>,
+    mods_watch: Arc<std::sync::Mutex<Vec<String>>>,
+    mods_rx: Receiver<mods::ModsMsg>,
     /// Own 500ms cadence of the context poller, independent of TICK.
     last_ctx_stat: Option<Instant>,
     /// Slow cadence of the transcript pass for sessions without a live claude.
@@ -407,9 +407,9 @@ impl App {
         let (ctx_tx, ctx_rx) = mpsc::channel();
         let (ctxi_tx, ctxi_rx) = mpsc::channel();
         let (stats_tx, stats_rx) = mpsc::channel();
-        let (live_tx, live_rx) = mpsc::channel();
-        let live_watch: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
-        live::start(live_watch.clone(), live_tx, cc.egui_ctx.clone());
+        let (mods_tx, mods_rx) = mpsc::channel();
+        let mods_watch: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        mods::start(mods_watch.clone(), mods_tx, cc.egui_ctx.clone());
         let (usage_tx, usage_rx) = mpsc::channel();
         let (upd_tx, upd_rx) = mpsc::channel();
         let (hist_tx, hist_rx) = mpsc::channel();
@@ -462,9 +462,9 @@ impl App {
             ctxi_tx,
             ctxi_rx,
             jsonl_map,
-            live: Default::default(),
-            live_watch,
-            live_rx,
+            mods: Default::default(),
+            mods_watch,
+            mods_rx,
             last_ctx_stat: None,
             last_idle_scan: None,
             hook_error: None,
@@ -709,7 +709,7 @@ impl App {
             .show(ui, |ui| self.central(ui))
             .inner;
         self.apply(acts, ctx);
-        self.live_card(ctx);
+        self.mod_cards(ctx);
 
         // Settings is app-wide, so it lives in the main window only.
         if k == 0 && self.settings_open {
@@ -1661,20 +1661,14 @@ impl App {
         }
     }
 
-    fn drain_live(&mut self) {
-        while let Ok(msg) = self.live_rx.try_recv() {
-            self.live.insert(msg.sid, msg.view);
+    fn drain_mods(&mut self) {
+        while let Ok(msg) = self.mods_rx.try_recv() {
+            self.mods.insert(msg.sid, msg.views);
         }
-        let sids: Vec<String> = self
-            .wins
-            .iter()
-            .filter_map(|w| w.ui.active)
-            .chain(self.w.active)
-            .filter_map(|id| self.sessions.iter().find(|s| s.id == id))
-            .filter_map(|s| s.claude_session_id.clone())
-            .collect();
-        self.live.retain(|sid, _| sids.contains(sid));
-        if let Ok(mut w) = self.live_watch.lock() {
+        // Every session in the list: badges show on rows that are not open.
+        let sids: Vec<String> = self.sessions.iter().filter_map(|s| s.claude_session_id.clone()).collect();
+        self.mods.retain(|sid, _| sids.contains(sid));
+        if let Ok(mut w) = self.mods_watch.lock() {
             if *w != sids {
                 *w = sids;
             }
@@ -2575,6 +2569,8 @@ impl App {
         // size, calibrated so the default 236px panel keeps its old cutoffs.
         let text_w = rect.width() - indent - 28.0;
         let mut name_max = ((text_w - 34.0) / 6.6).max(4.0) as usize;
+        // Right edge of the free space on the name's line; badges go left of it.
+        let mut right = rect.max.x - 8.0;
         if let Some(e) = ctx_entry {
             let pct = e.pct.clamp(1.0, 100.0);
             let lt = palette::light();
@@ -2615,11 +2611,38 @@ impl App {
             );
             painter.rect_filled(pill, CornerRadius::same(7), bg);
             painter.galley(pill.min + pad, galley, fg);
+            right = pill.min.x - 4.0;
             if pct >= 70.0 {
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
             }
             // The badge eats into the name's line.
             name_max = name_max.saturating_sub(5);
+        }
+
+        // Mod badges (see `mods`), right to left after the context badge.
+        let now = mods::now_ms();
+        let badges: Vec<mods::Badge> = s
+            .claude_session_id
+            .as_deref()
+            .and_then(|sid| self.mods.get(sid))
+            .into_iter()
+            .flatten()
+            .filter(|(_, v)| v.alive(now))
+            .filter_map(|(_, v)| v.badge.clone())
+            .collect();
+        for b in &badges {
+            let fg = tone_color(b.tone);
+            let galley = painter.layout_no_wrap(truncate_end(&b.text, 12), FontId::monospace(9.5), fg);
+            let pad = Vec2::new(5.0, 2.0);
+            let size = galley.size() + pad * 2.0;
+            let pill = Rect::from_min_size(Pos2::new(right - size.x, rect.min.y + 5.0), size);
+            painter.rect_stroke(pill, CornerRadius::same(7), Stroke::new(1.0, fg.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+            painter.galley(pill.min + pad, galley, fg);
+            if let Some(hint) = &b.hint {
+                ui.interact(pill, ui.id().with(("mod-badge", id, &b.text)), Sense::hover()).on_hover_text(hint);
+            }
+            right = pill.min.x - 4.0;
+            name_max = name_max.saturating_sub((size.x / 6.6) as usize + 1);
         }
 
         // How long since Claude last answered here. It lives in the bottom-right
@@ -3958,146 +3981,87 @@ impl App {
         self.w.new_dir_err = None;
     }
 
-    /// The card over the terminal's top right while Claude runs Bash or
-    /// subagents: their live output, so a long turn is not a blank wait. It
-    /// floats over the terminal instead of taking a panel, so the PTY keeps
-    /// its size and claude does not redraw each time a command starts.
-    fn live_card(&mut self, ctx: &egui::Context) {
-        const LINGER_MS: u64 = 6000;
+    /// Mod cards over the terminal's top right, stacked in mod-name order
+    /// (see `mods`). They float over the terminal instead of taking a panel,
+    /// so the PTY keeps its size and claude does not redraw each time a card
+    /// comes or goes. A click on a card's title folds it.
+    fn mod_cards(&mut self, ctx: &egui::Context) {
         let Some(term) = self.w.term_rect else { return };
         let Some(idx) = self.active_idx() else { return };
         let Some(sid) = self.sessions[idx].claude_session_id.clone() else { return };
-        let Some(view) = self.live.get(&sid) else { return };
-        let now = live::now_ms();
-        let busy = view.is_busy();
-        if !busy && view.last_end().is_none_or(|t| now.saturating_sub(t) > LINGER_MS) {
+        let Some(views) = self.mods.get(&sid) else { return };
+        let now = mods::now_ms();
+        let cards: Vec<(&String, &mods::Card)> = views
+            .iter()
+            .filter(|(_, v)| v.alive(now))
+            .filter_map(|(m, v)| v.card.as_ref().map(|c| (m, c)))
+            .collect();
+        if let Some(t) = views.iter().filter_map(|(_, v)| v.expires()).filter(|t| *t >= now).min() {
+            ctx.request_repaint_after(Duration::from_millis(t - now + 50));
+        }
+        if cards.is_empty() {
             return;
         }
-        let secs = |from: u64, to: u64| fmt_dur(Duration::from_millis(to.saturating_sub(from)));
         let width = (term.width() * 0.5).clamp(280.0, 520.0);
-        let max_h = term.height() * 0.6;
-        let running: Vec<&live::Run> = view.running().collect();
-        let agents: Vec<&live::Agent> = view.agents_running().collect();
-        let recent: Vec<&live::Run> = view
-            .runs
-            .iter()
-            .rev()
-            .filter(|r| r.ended_at.is_some_and(|t| now.saturating_sub(t) <= LINGER_MS))
-            .take(3)
-            .collect();
-        let mut toggle = false;
+        let max_h = term.height() * 0.6 / cards.len() as f32;
+        let mut toggle = None;
 
-        egui::Area::new(egui::Id::new(("live-card", self.cur_win)))
+        egui::Area::new(egui::Id::new(("mod-cards", self.cur_win)))
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(term.right() - width - 12.0, term.top() + 48.0))
             .show(ctx, |ui| {
-                Frame::new()
-                    .fill(palette::popup_bg())
-                    .stroke(Stroke::new(1.0, palette::border()))
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(egui::Margin::same(10))
-                    .show(ui, |ui| {
-                        ui.set_width(width - 20.0);
-                        ui.set_max_height(max_h);
-                        let mut head = if busy {
-                            let mut parts = Vec::new();
-                            if !running.is_empty() {
-                                parts.push(format!("bash: {}", running.len()));
+                ui.spacing_mut().item_spacing.y = 6.0;
+                for (name, card) in &cards {
+                    let folded = self.w.mods_folded.contains(*name);
+                    Frame::new()
+                        .fill(palette::popup_bg())
+                        .stroke(Stroke::new(1.0, palette::border()))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_width(width - 20.0);
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            let head = format!("{}  {}", card.title, if folded { "+" } else { "-" });
+                            let resp = ui.add(
+                                egui::Label::new(RichText::new(head).size(11.5).strong().color(tone_color(card.tone)))
+                                    .sense(egui::Sense::click()),
+                            );
+                            if resp.clicked() {
+                                toggle = Some((*name).clone());
                             }
-                            if !agents.is_empty() {
-                                parts.push(format!("{}: {}", tr("агенты", "agents"), agents.len()));
+                            if folded || card.rows.is_empty() {
+                                return;
                             }
-                            format!("{}  {}", tr("Идёт", "Running"), parts.join(", "))
-                        } else {
-                            tr("Готово", "Done").to_string()
-                        };
-                        head.push_str(if self.w.live_folded { "  +" } else { "  -" });
-                        let color = if busy { palette::accent_bar() } else { palette::text_dim() };
-                        let resp = ui.add(
-                            egui::Label::new(RichText::new(head).size(11.5).strong().color(color))
-                                .sense(egui::Sense::click()),
-                        );
-                        if resp.clicked() {
-                            toggle = true;
-                        }
-                        if self.w.live_folded {
-                            return;
-                        }
-                        egui::ScrollArea::vertical().stick_to_bottom(true).max_height(max_h - 24.0).show(ui, |ui| {
-                            for r in &running {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new(format!("{} {}", secs(r.started_at, now), truncate_end(&r.label, 70)))
-                                        .size(12.0)
-                                        .color(palette::text_strong()),
-                                );
-                                let cmd = r.command.lines().next().unwrap_or("");
-                                ui.label(
-                                    RichText::new(format!("$ {}", truncate_end(cmd, 90)))
-                                        .font(FontId::monospace(10.5))
-                                        .color(palette::text_faint()),
-                                );
-                                let lines = view.tails.get(&r.id).map(|v| v.as_slice()).unwrap_or(&[]);
-                                if lines.is_empty() {
-                                    ui.label(
-                                        RichText::new(tr("пока без вывода", "no output yet"))
-                                            .font(FontId::monospace(10.5))
-                                            .color(palette::text_faint()),
-                                    );
-                                }
-                                for line in lines.iter().rev().take(live::TAIL_LINES).rev() {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(truncate_end(line, 140))
+                            egui::ScrollArea::vertical()
+                                .id_salt(*name)
+                                .stick_to_bottom(true)
+                                .max_height(max_h - 44.0)
+                                .show(ui, |ui| {
+                                    for r in &card.rows {
+                                        let text = match r.style {
+                                            mods::Style::Strong => {
+                                                RichText::new(&r.text).size(12.0).color(palette::text_strong())
+                                            },
+                                            mods::Style::Mono => RichText::new(&r.text)
                                                 .font(FontId::monospace(10.5))
                                                 .color(palette::text_dim()),
-                                        )
-                                        .truncate(),
-                                    );
-                                }
-                            }
-                            for a in &agents {
-                                ui.add_space(4.0);
-                                let tool = a.last_tool.as_deref().map(|t| format!(" - {t}")).unwrap_or_default();
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(format!(
-                                            "{} {}: {}{}",
-                                            secs(a.started_at, now),
-                                            a.kind,
-                                            a.label,
-                                            truncate_end(&tool, 60)
-                                        ))
-                                        .size(11.5)
-                                        .color(palette::text()),
-                                    )
-                                    .truncate(),
-                                );
-                            }
-                            if !busy {
-                                for r in &recent {
-                                    let mark = if r.status == "error" { tr("ошибка", "error") } else { "ok" };
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(format!(
-                                                "{mark} {} {}",
-                                                secs(r.started_at, r.ended_at.unwrap_or(now)),
-                                                truncate_end(&r.label, 70)
-                                            ))
-                                            .size(11.5)
-                                            .color(palette::text_dim()),
-                                        )
-                                        .truncate(),
-                                    );
-                                }
-                            }
+                                            mods::Style::Dim => RichText::new(&r.text).size(11.5).color(palette::text_dim()),
+                                            mods::Style::Faint => RichText::new(&r.text)
+                                                .font(FontId::monospace(10.5))
+                                                .color(palette::text_faint()),
+                                            mods::Style::Text => RichText::new(&r.text).size(11.5).color(palette::text()),
+                                        };
+                                        ui.add(egui::Label::new(text).truncate());
+                                    }
+                                });
                         });
-                    });
+                }
             });
-        if toggle {
-            self.w.live_folded = !self.w.live_folded;
+        if let Some(name) = toggle {
+            if !self.w.mods_folded.remove(&name) {
+                self.w.mods_folded.insert(name);
+            }
         }
-        ctx.request_repaint_after(Duration::from_millis(if busy { 1000 } else { LINGER_MS }));
     }
 
     fn frozen_view(&mut self, ui: &mut egui::Ui, idx: usize, acts: &mut Vec<Act>) {
@@ -4541,7 +4505,7 @@ impl eframe::App for App {
         self.drain_git();
         self.drain_ctx(&ctx);
         self.drain_ctx_index();
-        self.drain_live();
+        self.drain_mods();
         self.drain_update();
         self.drain_history();
         while let Ok(st) = self.stats_rx.try_recv() {
@@ -4992,6 +4956,17 @@ fn draw_newfile(p: &egui::Painter, c: Pos2, col: Color32) {
 }
 
 /// Keep the head, char-boundary safe. See `truncate_head` for the clamp.
+fn tone_color(tone: mods::Tone) -> Color32 {
+    match tone {
+        mods::Tone::Busy => palette::accent_bar(),
+        mods::Tone::Ok => GIT_ADD,
+        mods::Tone::Warn => ORANGE,
+        mods::Tone::Error => DOT_EXITED,
+        mods::Tone::Dim => palette::text_dim(),
+        mods::Tone::Info => palette::text(),
+    }
+}
+
 fn truncate_end(s: &str, max: usize) -> String {
     let max = max.max(3);
     let n = s.chars().count();

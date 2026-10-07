@@ -151,6 +151,35 @@ kip gets it two ways. By default it reads the session transcript under
 no setup. Turn on the statusline hook in settings (macOS/Linux) and Claude feeds
 kip the exact number it shows itself, about once a second.
 
+## Mods
+
+A Claude Code mod (a plugin of function hooks running inside `claude`) can
+show things in kip without any kip code. It writes
+`~/.kip/mods/<mod>/<claude session id>.json`, and kip draws a badge in that
+session's row and a card over its terminal:
+
+```json
+{
+  "updatedAt": 1760000000000,
+  "ttlMs": 5000,
+  "badge": { "text": "VPN", "tone": "ok", "hint": "shown on hover" },
+  "card": {
+    "title": "Running bash: 1",
+    "tone": "busy",
+    "rows": [
+      { "text": "Run tests", "style": "strong" },
+      { "text": "test a ... ok", "style": "mono" }
+    ]
+  }
+}
+```
+
+Every field is optional. `ttlMs` hides the view once the mod stops refreshing
+it (its `claude` exited); without it the view stays until the file changes.
+Tones: `info`, `ok`, `warn`, `error`, `busy`, `dim`. Row styles: `text`,
+`strong`, `mono`, `dim`, `faint`. ANSI colors in the text are stripped. A click
+on a card's title folds it.
+
 ## Platform support
 
 |                          | macOS | Linux | Windows |
