@@ -1669,8 +1669,10 @@ impl App {
                         }
                     },
                     Some(_) => {
-                        if let Some(t) = s.turn_since.take() {
-                            if t.elapsed() >= BUSY_NOTIFY_MIN && !seen {
+                        // Any reply counts, even a 2-second one: you sent it
+                        // and looked away, now it waits for you.
+                        if s.turn_since.take().is_some() {
+                            if !seen {
                                 s.done = true;
                                 s.unread = true;
                             }
