@@ -253,13 +253,18 @@ impl Session {
     }
 
     pub fn from_saved(saved: SavedSession, id: u64) -> Self {
+        let fresh_title = saved
+            .claude_session_id
+            .as_deref()
+            .filter(|s| valid_sid(s))
+            .and_then(|sid| transcript_title(&project_dir(&saved.cwd)?.join(format!("{sid}.jsonl"))));
         Session {
             id,
             window: saved.window,
             cwd: saved.cwd,
             phase: Phase::Suspended,
             title: String::new(),
-            claude_title: saved.claude_title,
+            claude_title: fresh_title.or(saved.claude_title),
             custom_name: saved.custom_name,
             group: saved.group,
             last_activity: Instant::now(),
@@ -582,13 +587,49 @@ pub fn spawn_meta_read(
         let Some(sid) = v["sessionId"].as_str().filter(|s| valid_sid(s)) else { return };
         let info = ClaudeInfo {
             session_id: Some(sid.to_string()),
-            name: v["name"].as_str().map(String::from),
+            name: meta_name(&v, sid),
             claude_pid: Some(pid),
         };
         if tx.send((id, info)).is_ok() {
             ctx.request_repaint();
         }
     });
+}
+
+/// Session title: a name the user gave (/rename), else the title Claude
+/// generated into the transcript, else Claude's derived "dir-xx" name.
+fn meta_name(v: &serde_json::Value, sid: &str) -> Option<String> {
+    let name = v["name"].as_str().map(String::from);
+    if v["nameSource"].as_str().is_some_and(|s| s != "derived" && s != "collision") {
+        return name;
+    }
+    let cwd = Path::new(v["cwd"].as_str()?);
+    transcript_title(&project_dir(cwd)?.join(format!("{sid}.jsonl"))).or(name)
+}
+
+/// Last custom/ai title in the transcript tail (Claude re-appends it every turn).
+pub(crate) fn transcript_title(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 512 * 1024;
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let (mut custom, mut ai) = (None, None);
+    for line in text.lines() {
+        if !line.contains("-title\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        match v["type"].as_str() {
+            Some("custom-title") => custom = v["customTitle"].as_str().map(String::from),
+            Some("ai-title") => ai = v["aiTitle"].as_str().map(String::from),
+            _ => {},
+        }
+    }
+    custom.or(ai).filter(|t| !t.trim().is_empty())
 }
 
 struct MetaHit {
@@ -639,7 +680,7 @@ fn find_claude_meta(
         if better {
             best = Some(MetaHit {
                 session_id: sid.to_string(),
-                name: v["name"].as_str().map(String::from),
+                name: meta_name(&v, sid),
                 score,
                 updated,
             });
@@ -744,6 +785,22 @@ mod tests {
         assert!(valid_uuid(SID) && valid_sid(SID));
         assert!(!valid_uuid("not-a-uuid") && !valid_sid("../etc/passwd"));
         assert!(valid_sid("shortid") && !valid_uuid("shortid"));
+    }
+
+    #[test]
+    fn transcript_title_prefers_custom() {
+        let p = std::env::temp_dir().join(format!("kip-title-{}.jsonl", std::process::id()));
+        std::fs::write(
+            &p,
+            "{\"type\":\"ai-title\",\"aiTitle\":\"old\"}\n{\"type\":\"user\"}\n\
+             {\"type\":\"ai-title\",\"aiTitle\":\"Чистка ADB\"}\n",
+        )
+        .unwrap();
+        assert_eq!(transcript_title(&p).as_deref(), Some("Чистка ADB"));
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        std::io::Write::write_all(&mut f, b"{\"type\":\"custom-title\",\"customTitle\":\"mine\"}\n").unwrap();
+        assert_eq!(transcript_title(&p).as_deref(), Some("mine"));
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
