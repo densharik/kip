@@ -193,13 +193,13 @@ or by hand:
 claude mcp add -s user kip -- /Applications/kip.app/Contents/MacOS/kip mcp
 ```
 
-Small on context: 17 tools, about 5 KB of schema (~1.5k tokens) - and Claude
+Small on context: 19 tools, about 5.7 KB of schema (~1.6k tokens) - and Claude
 Code usually defers MCP tools, keeping only their names in context until one
 is used. If kip is not running, the first call starts it.
 
 | Tool | Does |
 |---|---|
-| `list_sessions`, `list_windows` | sessions with folder, group, window, state, busy, pinned, context %, idle time |
+| `list_sessions`, `list_windows` | sessions with folder, group, window, state, busy, finished-unseen, pinned, context %, idle time |
 | `open_session` | new terminal in a folder: plain, with Claude, `--resume <id>`, or a command; window, group, name |
 | `close_session`, `suspend_session`, `wake_session` | pinned sessions refuse to close without `force` |
 | `focus_session`, `rename_session`, `set_group`, `pin_session` | |
@@ -208,6 +208,7 @@ is used. If kip is not running, the first call starts it.
 | `read_screen`, `read_transcript` | terminal text and the Claude conversation, for summaries |
 | `send_input` | type into a session - off until enabled in Settings |
 | `cleanup` | suspend or remove long-idle sessions; dry run by default |
+| `get_settings`, `set_settings` | read and change any kip setting |
 
 Under the hood kip listens on 127.0.0.1 with a per-run token in
 `~/.kip/ctl.json` (readable by you only); `kip mcp` relays tool calls there.

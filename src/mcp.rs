@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use crate::ctl;
 
 const INSTRUCTIONS: &str = "kip is the terminal app these Claude Code sessions run in. \
-Session ids come from list_sessions. A pinned session refuses close/move unless force is set. \
+Session ids come from list_sessions; done = its agent finished unseen. A pinned session refuses close/move unless force is set. \
 To summarize a session, read_transcript it and summarize the text yourself.";
 
 fn tools() -> Value {
@@ -53,6 +53,10 @@ fn tools() -> Value {
          "inputSchema": {"type": "object", "properties": {"id": id, "max_chars": {"type": "integer", "description": "Default 20000"}}, "required": ["id"]}},
         {"name": "send_input", "description": "Type text into a live session (Enter appended by default). Off unless enabled in kip settings.",
          "inputSchema": {"type": "object", "properties": {"id": id, "text": {"type": "string"}, "enter": {"type": "boolean"}}, "required": ["id", "text"]}},
+        {"name": "get_settings", "description": "All kip settings (font, theme, notifications, finished-session glow, idle suspend...).",
+         "inputSchema": {"type": "object", "properties": {}}},
+        {"name": "set_settings", "description": "Change kip settings: pass only the keys to change, names and value types as get_settings returns them.",
+         "inputSchema": {"type": "object", "additionalProperties": true}},
         {"name": "cleanup", "description": "Find idle sessions (not pinned, not busy, not on screen) and suspend live ones or remove sleeping ones. dry_run (default true) only lists them.",
          "inputSchema": {"type": "object", "properties": {
             "idle_minutes": {"type": "integer", "description": "Default 120"},

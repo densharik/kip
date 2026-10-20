@@ -103,6 +103,7 @@ impl App {
             "group": s.group,
             "state": state,
             "busy": s.busy,
+            "done": s.done,
             "claude_running": s.fg_is_claude,
             "running_cmd": s.running_cmd,
             "pinned": s.pinned,
@@ -340,6 +341,38 @@ impl App {
                 }
                 Ok(json!({"action": if remove { "remove" } else { "suspend" }, "dry_run": dry, "sessions": listed}))
             },
+            "get_settings" => serde_json::to_value(&self.settings).map_err(|e| e.to_string()),
+            "set_settings" => {
+                let mut cur = serde_json::to_value(&self.settings).map_err(|e| e.to_string())?;
+                let changes = args.as_object().ok_or("pass the settings to change as an object")?;
+                for (k, v) in changes {
+                    if cur.get(k).is_none() {
+                        return Err(format!("no setting {k}"));
+                    }
+                    cur[k] = v.clone();
+                }
+                let new: config::Settings = serde_json::from_value(cur).map_err(|e| e.to_string())?;
+                let old = std::mem::replace(&mut self.settings, new);
+                if old.font != self.settings.font {
+                    self.font_applied = install_fonts(ctx, &self.settings.font);
+                }
+                if old.ui_scale != self.settings.ui_scale {
+                    ctx.set_zoom_factor(self.settings.ui_scale.clamp(0.5, 2.0));
+                }
+                if old.lang != self.settings.lang {
+                    i18n::set(i18n::resolve(&self.settings.lang));
+                }
+                if old.theme != self.settings.theme || old.accent != self.settings.accent {
+                    palette::apply(&self.settings.theme, self.settings.accent.map(rgb32));
+                    apply_style(ctx);
+                }
+                // The statusline hook is installed by its own settings checkbox only.
+                self.settings.ctx_hook = old.ctx_hook;
+                self.settings.prev_statusline = old.prev_statusline;
+                self.persist();
+                ctx.request_repaint();
+                serde_json::to_value(&self.settings).map_err(|e| e.to_string())
+            },
             _ => Err(format!("unknown op {op}")),
         }
     }
@@ -403,8 +436,8 @@ impl App {
                 }
                 ui.label(
                     RichText::new(tr(
-                        "Компактно: 17 инструментов, около 1.5 тыс. токенов контекста. Ставится одной командой: claude mcp add -s user kip. Печатать в чужие сессии MCP не может, пока вы не разрешите это в настройках.",
-                        "Compact: 17 tools, about 1.5k tokens of context. Installs with one command: claude mcp add -s user kip. MCP cannot type into sessions unless you allow it in Settings.",
+                        "Компактно: 19 инструментов, около 1.6 тыс. токенов контекста. Ставится одной командой: claude mcp add -s user kip. Печатать в чужие сессии MCP не может, пока вы не разрешите это в настройках.",
+                        "Compact: 19 tools, about 1.6k tokens of context. Installs with one command: claude mcp add -s user kip. MCP cannot type into sessions unless you allow it in Settings.",
                     ))
                     .size(10.5)
                     .color(palette::text_faint()),

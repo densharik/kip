@@ -1345,6 +1345,7 @@ impl App {
                     self.set_active(Some(id));
                     if let Some(idx) = self.idx_of(id) {
                         self.sessions[idx].unread = false;
+                        self.sessions[idx].done = false;
                         self.sessions[idx].last_git_poll = None;
                     }
                 },
@@ -1757,6 +1758,9 @@ impl App {
             let mut kill_pids: Vec<i32> = Vec::new();
 
             for s in &mut self.sessions {
+                if seen.contains(&s.id) {
+                    s.done = false;
+                }
                 let (master_fd, shell_pid) = match &s.phase {
                     Phase::Live(l) => (l.master_fd, l.shell_pid),
                     _ => continue,
@@ -1801,6 +1805,7 @@ impl App {
                 }
                 if busy_now && !s.busy {
                     s.busy = true;
+                    s.done = false;
                     s.busy_since = Some(now);
                     s.running_cmd = s.pending_cmd.take();
                 } else if !busy_now && s.busy {
@@ -1809,6 +1814,7 @@ impl App {
                     let dur = s.busy_since.take().map(|t| now - t).unwrap_or_default();
                     if dur >= BUSY_NOTIFY_MIN && !seen.contains(&s.id) {
                         s.unread = true;
+                        s.done = true;
                         if self.settings.notify_job_done {
                             plat::notify(
                                 "kip",
@@ -2536,6 +2542,21 @@ impl App {
             );
         } else if hovered {
             painter.rect_filled(rect, 0.0, palette::row_hover_bg());
+        }
+        if s.done && self.settings.blink_done {
+            let period = self.settings.blink_period.max(0.2) as f64;
+            let t = (ui.input(|i| i.time) % period / period) as f32;
+            let a = if self.settings.blink_smooth {
+                0.5 - 0.5 * (t * std::f32::consts::TAU).cos()
+            } else if t < 0.5 {
+                1.0
+            } else {
+                0.0
+            };
+            let c = rgb32(self.settings.blink_color);
+            painter.rect_filled(rect, 0.0, c.gamma_multiply(0.28 * a));
+            painter.rect_filled(Rect::from_min_size(rect.min, Vec2::new(3.0, row_h)), 0.0, c.gamma_multiply(0.35 + 0.65 * a));
+            ui.ctx().request_repaint_after(Duration::from_millis(if self.settings.blink_smooth { 33 } else { 100 }));
         }
         if is_dragging {
             painter.rect_stroke(
@@ -4392,6 +4413,28 @@ impl App {
                 });
                 ui.separator();
                 ui.checkbox(&mut self.settings.notify_job_done, tr("Уведомлять, когда агент завершил работу", "Notify when the agent finishes"));
+                ui.checkbox(
+                    &mut self.settings.blink_done,
+                    tr("Подсвечивать сессию, где агент закончил", "Highlight a session whose agent finished"),
+                )
+                .on_hover_text(tr(
+                    "Строка сессии мигает выбранным цветом, пока вы её не откроете.",
+                    "The session row glows in the chosen color until you open it.",
+                ));
+                if self.settings.blink_done {
+                    ui.horizontal(|ui| {
+                        ui.add_space(22.0);
+                        ui.color_edit_button_srgb(&mut self.settings.blink_color);
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.blink_period, 0.4..=4.0)
+                                .step_by(0.1)
+                                .suffix(tr(" с", " s")),
+                        )
+                        .on_hover_text(tr("Длина одного цикла мигания", "Length of one glow cycle"));
+                        ui.selectable_value(&mut self.settings.blink_smooth, true, tr("плавно", "smooth"));
+                        ui.selectable_value(&mut self.settings.blink_smooth, false, tr("мигание", "blink"));
+                    });
+                }
                 ui.checkbox(&mut self.settings.notify_bell, tr("Уведомлять по сигналу терминала (bell)", "Notify on terminal bell"));
                 ui.checkbox(&mut self.settings.notify_sound, tr("Звук уведомлений", "Notification sound"));
                 ui.checkbox(&mut self.settings.copy_on_select, tr("Копировать выделенное сразу в буфер", "Copy selection to clipboard immediately"));

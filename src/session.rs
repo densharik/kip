@@ -108,6 +108,8 @@ pub struct Session {
     pub pinned: bool,
     pub snapshot: Option<String>,
     pub unread: bool,
+    /// The agent finished while nobody was looking; the row glows until seen.
+    pub done: bool,
     pub busy: bool,
     pub busy_since: Option<Instant>,
     pub git: Option<GitStats>,
@@ -275,6 +277,7 @@ impl Session {
             pinned: saved.pinned,
             snapshot: saved.snapshot,
             unread: false,
+            done: false,
             busy: false,
             busy_since: None,
             git: None,

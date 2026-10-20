@@ -42,6 +42,13 @@ pub struct Settings {
     pub mcp_send_input: bool,
     /// "Do not remind me" on the MCP install offer.
     pub mcp_offer_off: bool,
+    /// A session whose agent finished glows in the list until you look at it.
+    pub blink_done: bool,
+    pub blink_color: [u8; 3],
+    /// One full glow cycle, seconds.
+    pub blink_period: f32,
+    /// Smooth fade in and out; false = hard on/off blink.
+    pub blink_smooth: bool,
     /// Settings schema version, so a changed default can reach existing installs
     /// (see `migrate`). The field-level `default` is what makes that work: the
     /// struct-level one would hand an old file the current version and skip the
@@ -78,6 +85,10 @@ impl Default for Settings {
             usage_pin: None,
             mcp_send_input: false,
             mcp_offer_off: false,
+            blink_done: true,
+            blink_color: [0x8f, 0xb5, 0x7a],
+            blink_period: 1.6,
+            blink_smooth: true,
             version: SETTINGS_VERSION,
         }
     }
