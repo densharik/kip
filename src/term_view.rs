@@ -241,38 +241,63 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     // A filesystem path under the pointer becomes a clickable link (Warp-style):
     // hover underlines it, a plain click opens an Open / Reveal menu. Skip while
     // drag-selecting so a selection stroke over a path shows no stray underline.
-    let mut hovered_link: Option<(Rect, std::path::PathBuf)> = None;
+    let mut hovered_link: Option<(Vec<Rect>, std::path::PathBuf)> = None;
     if let Some(pos) = response.hover_pos().filter(|_| !response.dragged()) {
         let rel = pos - origin;
         let col = (rel.x / cell_w) as i32;
         let row = (rel.y / cell_h) as i32;
         if rel.x >= 0.0 && rel.y >= 0.0 && col < cols as i32 && row < rows as i32 {
-            let line = Line(row - display_offset as i32);
             let grid = term.grid();
-            let chars: Vec<char> = (0..cols as usize).map(|c| grid[line][Column(c)].c).collect();
+            let (top, bottom) = (grid.topmost_line().0, grid.bottommost_line().0);
+            let row_chars = |r: i32| -> Option<Vec<char>> {
+                let l = r - display_offset as i32;
+                (top..=bottom)
+                    .contains(&l)
+                    .then(|| (0..cols as usize).map(|c| grid[Line(l)][Column(c)].c).collect())
+            };
+            let chars = row_chars(row).unwrap_or_default();
             if let Some((span, token)) = link_span(&chars, col as usize) {
+                // A path broken across lines (claude wraps its own output at the
+                // terminal width) is tried whole first, then just this line's part.
+                let parts = wrapped_parts(&row_chars, row, span.clone());
+                let joined: String = parts
+                    .iter()
+                    .filter_map(|(r, sp)| Some(row_chars(*r)?[sp.clone()].iter().collect::<String>()))
+                    .collect();
+                let joined = link_span(&joined.chars().collect::<Vec<_>>(), 0).map(|(_, t)| t);
                 // Hit the filesystem only when the token changed since the last
                 // frame; a parked pointer (or a redraw storm) must not stat every
                 // frame, which would also freeze the UI over a hung network mount.
+                let key = joined.clone().unwrap_or_else(|| token.clone());
                 let probe_id = egui::Id::new(("kip_link_probe", session_id));
-                let cached =
-                    ui.ctx().data(|d| d.get_temp::<(String, Option<std::path::PathBuf>)>(probe_id));
+                let cached = ui
+                    .ctx()
+                    .data(|d| d.get_temp::<(String, Option<(std::path::PathBuf, bool)>)>(probe_id));
                 let resolved = match &cached {
-                    Some((t, r)) if *t == token => r.clone(),
+                    Some((t, r)) if *t == key => r.clone(),
                     _ => {
-                        let r = probe_path(&token, shell_pid, &session_cwd);
-                        ui.ctx().data_mut(|d| d.insert_temp(probe_id, (token.clone(), r.clone())));
+                        let whole = joined
+                            .filter(|_| parts.len() > 1)
+                            .and_then(|j| probe_path(&j, shell_pid, &session_cwd))
+                            .map(|p| (p, true));
+                        let r = whole.or_else(|| probe_path(&token, shell_pid, &session_cwd).map(|p| (p, false)));
+                        ui.ctx().data_mut(|d| d.insert_temp(probe_id, (key, r.clone())));
                         r
                     },
                 };
-                if let Some(p) = resolved {
-                    let x0 = origin.x + span.start as f32 * cell_w;
-                    let x1 = origin.x + span.end as f32 * cell_w;
-                    let y = origin.y + row as f32 * cell_h;
-                    hovered_link = Some((
-                        Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1, y + cell_h)),
-                        p,
-                    ));
+                if let Some((p, whole)) = resolved {
+                    let spans = if whole { parts } else { vec![(row, span)] };
+                    let rects = spans
+                        .into_iter()
+                        .map(|(r, sp)| {
+                            let y = origin.y + r as f32 * cell_h;
+                            Rect::from_min_max(
+                                Pos2::new(origin.x + sp.start as f32 * cell_w, y),
+                                Pos2::new(origin.x + sp.end as f32 * cell_w, y + cell_h),
+                            )
+                        })
+                        .collect();
+                    hovered_link = Some((rects, p));
                 }
             }
         }
@@ -434,12 +459,14 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     }
 
     // Underline the path under the pointer so it reads as clickable.
-    if let Some((lrect, _)) = &hovered_link {
-        let uy = lrect.bottom() - 1.0;
-        painter.line_segment(
-            [Pos2::new(lrect.left(), uy), Pos2::new(lrect.right(), uy)],
-            Stroke::new(1.0, palette::group_accent()),
-        );
+    if let Some((rects, _)) = &hovered_link {
+        for lrect in rects {
+            let uy = lrect.bottom() - 1.0;
+            painter.line_segment(
+                [Pos2::new(lrect.left(), uy), Pos2::new(lrect.right(), uy)],
+                Stroke::new(1.0, palette::group_accent()),
+            );
+        }
     }
 
     // Cursor.
@@ -602,6 +629,74 @@ fn is_link_char(c: char) -> bool {
             c,
             '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '|' | '*' | '?'
         )
+}
+
+/// A line counts as wrapped when its text runs to within this many columns of
+/// the right edge (claude keeps a small margin when it wraps its own output).
+const WRAP_SLACK: usize = 4;
+
+fn runs_to_edge(chars: &[char]) -> Option<usize> {
+    let end = chars.iter().rposition(|c| !c.is_whitespace())? + 1;
+    (end + WRAP_SLACK >= chars.len()).then_some(end)
+}
+
+/// The rows and column spans a path token covers when lines were broken in
+/// the middle of it: a token touching the line's end continues at the start
+/// of the next line (after its indent), one starting a line continues from the
+/// end of the previous one. `row_chars(r)` is None outside the grid.
+fn wrapped_parts(
+    row_chars: &dyn Fn(i32) -> Option<Vec<char>>,
+    row: i32,
+    span: std::ops::Range<usize>,
+) -> Vec<(i32, std::ops::Range<usize>)> {
+    const MAX_LINES: i32 = 4;
+    let raw_end = |c: &[char], start: usize| {
+        let mut e = start;
+        while e < c.len() && is_link_char(c[e]) {
+            e += 1;
+        }
+        e
+    };
+    let mut parts = vec![(row, span.start..raw_end(&row_chars(row).unwrap_or_default(), span.start))];
+    // Backward.
+    let mut r = row;
+    let mut start = span.start;
+    while row - r < MAX_LINES {
+        let Some(cur) = row_chars(r) else { break };
+        if cur.iter().position(|c| !c.is_whitespace()) != Some(start) {
+            break;
+        }
+        let Some(prev) = row_chars(r - 1) else { break };
+        let Some(end) = runs_to_edge(&prev) else { break };
+        let mut st = end;
+        while st > 0 && is_link_char(prev[st - 1]) {
+            st -= 1;
+        }
+        if st == end {
+            break;
+        }
+        parts.insert(0, (r - 1, st..end));
+        r -= 1;
+        start = st;
+    }
+    // Forward.
+    let mut r = row;
+    while r - row < MAX_LINES {
+        let Some(cur) = row_chars(r) else { break };
+        let last_end = parts.last().map(|p| p.1.end).unwrap_or(0);
+        if runs_to_edge(&cur) != Some(last_end) {
+            break;
+        }
+        let Some(next) = row_chars(r + 1) else { break };
+        let Some(st) = next.iter().position(|c| !c.is_whitespace()) else { break };
+        let end = raw_end(&next, st);
+        if end == st {
+            break;
+        }
+        parts.push((r + 1, st..end));
+        r += 1;
+    }
+    parts
 }
 
 /// The maximal path token covering column `col`, with a trailing `:line[:col]`
@@ -978,7 +1073,7 @@ fn encode_key(key: Key, mods: Modifiers, mode: TermMode, claude: bool) -> Option
 
 #[cfg(test)]
 mod tests {
-    use super::{backspace_accel, encode_key, find_near, join_ci, link_span, BS_WORD_AFTER};
+    use super::{backspace_accel, encode_key, find_near, join_ci, link_span, wrapped_parts, BS_WORD_AFTER};
     use super::{Key, Modifiers, TermMode};
 
     fn span(s: &str, col: usize) -> Option<(std::ops::Range<usize>, String)> {
@@ -1014,6 +1109,25 @@ mod tests {
         // Another key ends the streak, and the next hold starts over.
         backspace_accel(&mut n, Key::A, false, Modifiers::NONE);
         assert!(!word(backspace_accel(&mut n, Key::Backspace, true, Modifiers::NONE)));
+    }
+
+    #[test]
+    fn path_broken_across_lines_is_joined() {
+        // The real case: claude wrapped "Файл: /private/.../scratchp" + "  ad/comp/x.jpg".
+        let lines = ["  Файл: /private/tmp/sc/scratchp", "  ad/comp/hand.jpg  done", "  next line"];
+        let rows: Vec<Vec<char>> = lines.iter().map(|l| format!("{l:<32}").chars().collect()).collect();
+        let get = |r: i32| rows.get(r as usize).cloned();
+        let text = |parts: &[(i32, std::ops::Range<usize>)]| -> String {
+            parts.iter().map(|(r, sp)| rows[*r as usize][sp.clone()].iter().collect::<String>()).collect()
+        };
+        // Hover on either half gives the whole path.
+        let (sp, _) = link_span(&rows[0], 12).unwrap();
+        assert_eq!(text(&wrapped_parts(&get, 0, sp)), "/private/tmp/sc/scratchpad/comp/hand.jpg");
+        let (sp, _) = link_span(&rows[1], 4).unwrap();
+        assert_eq!(text(&wrapped_parts(&get, 1, sp)), "/private/tmp/sc/scratchpad/comp/hand.jpg");
+        // A short line is not a wrap: nothing is glued on.
+        let (sp, _) = link_span(&rows[2], 3).unwrap();
+        assert_eq!(wrapped_parts(&get, 2, sp).len(), 1);
     }
 
     #[test]
