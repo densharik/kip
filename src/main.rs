@@ -2,9 +2,12 @@
 // Debug keeps it so panics and logs stay visible.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod app_ctl;
 mod config;
+mod ctl;
 mod ctx_index;
 mod i18n;
+mod mcp;
 mod mods;
 #[cfg(target_os = "macos")]
 mod mac_service;
@@ -57,6 +60,10 @@ const UNREAD: Color32 = Color32::from_rgb(0x9c, 0xb5, 0xcc);
 const ORANGE: Color32 = Color32::from_rgb(0xd4, 0xa0, 0x5a);
 
 fn main() -> eframe::Result {
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        mcp::serve();
+        return Ok(());
+    }
     // If kip itself was launched from a Claude Code session, its CLAUDE* markers
     // leak into our shells and a claude started there thinks it is a child session
     // and disables transcript saving (breaking resume and context tracking).
@@ -96,6 +103,20 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("kip", options, Box::new(|cc| Ok(Box::new(App::new(cc, state, icon)))))
+}
+
+/// The "connect kip to Claude Code" offer and the install it runs.
+#[derive(Default)]
+struct McpUi {
+    show: bool,
+    dont_remind: bool,
+    busy: bool,
+    status: Option<Result<String, String>>,
+}
+
+enum McpMsg {
+    Installed(bool),
+    Done(Result<String, String>),
 }
 
 enum UpdateState {
@@ -393,6 +414,10 @@ struct App {
     grid: (u16, u16),
     /// Font actually in use - the pick can silently fall back (settings show it).
     font_applied: &'static str,
+    ctl_rx: Receiver<ctl::Req>,
+    mcp: McpUi,
+    mcp_tx: Sender<McpMsg>,
+    mcp_rx: Receiver<McpMsg>,
 }
 
 impl App {
@@ -413,6 +438,16 @@ impl App {
         let (usage_tx, usage_rx) = mpsc::channel();
         let (upd_tx, upd_rx) = mpsc::channel();
         let (hist_tx, hist_rx) = mpsc::channel();
+        let (ctl_tx, ctl_rx) = mpsc::channel();
+        ctl::start(ctl_tx, cc.egui_ctx.clone());
+        let (mcp_tx, mcp_rx) = mpsc::channel();
+        if !state.settings.mcp_offer_off {
+            let (tx, ctx) = (mcp_tx.clone(), cc.egui_ctx.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(McpMsg::Installed(mcp::installed()));
+                ctx.request_repaint();
+            });
+        }
         let jsonl_map: ctx_index::SharedMap = Default::default();
         ctx_index::spawn_initial_scan(jsonl_map.clone());
         ctx_index::sweep();
@@ -499,6 +534,10 @@ impl App {
             cell: (8, 17),
             grid: (100, 28),
             font_applied,
+            ctl_rx,
+            mcp: McpUi::default(),
+            mcp_tx,
+            mcp_rx,
         };
         for mut saved in state.sessions {
             if !app.wins.iter().any(|w| w.id == saved.window) {
@@ -569,17 +608,24 @@ impl App {
     /// and back out after it, so everything below sees just this window.
     fn window_pass(&mut self, k: usize, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.in_window(k, |a| a.window_ui(k, ui, &ctx));
+    }
+
+    /// Run `f` as if window `k` were being drawn: its sessions and UI state
+    /// swapped in, everything else parked.
+    fn in_window<R>(&mut self, k: usize, f: impl FnOnce(&mut Self) -> R) -> R {
         let wid = self.wins[k].id;
         let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.sessions).into_iter().partition(|s| s.window == wid);
         self.sessions = mine;
         self.parked = rest;
         std::mem::swap(&mut self.w, &mut self.wins[k].ui);
         self.cur_win = wid;
-        self.window_ui(k, ui, &ctx);
+        let r = f(self);
         std::mem::swap(&mut self.w, &mut self.wins[k].ui);
         self.cur_win = 0;
         let parked = std::mem::take(&mut self.parked);
         self.sessions.extend(parked);
+        r
     }
 
     fn window_ui(&mut self, k: usize, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -714,6 +760,9 @@ impl App {
         // Settings is app-wide, so it lives in the main window only.
         if k == 0 && self.settings_open {
             self.settings_window(ctx);
+        }
+        if k == 0 && self.mcp.show {
+            self.mcp_offer(ctx);
         }
         self.dir_popup(ctx);
         self.stats_ui(ctx);
@@ -1260,11 +1309,7 @@ impl App {
     fn resume(&mut self, id: u64, with_claude: bool, ctx: &egui::Context) {
         let Some(idx) = self.idx_of(id) else { return };
         let base = if with_claude { self.sessions[idx].resume_command(&self.settings) } else { None };
-        // Drop to a fresh shell when claude exits instead of killing the tab.
-        #[cfg(not(windows))]
-        let command = base.as_ref().map(|cmd| format!("{cmd} ; exec ${{SHELL:-/bin/zsh}} -il"));
-        #[cfg(windows)]
-        let command = base.as_ref().map(|cmd| format!("{cmd}; powershell.exe -NoLogo"));
+        let command = base.as_deref().map(keep_shell);
         let mut s = std::mem::replace(&mut self.sessions[idx], Session::from_saved(SavedSession::default(), 0));
         // Reopening as a plain terminal: seed the fresh shell's scrollback with
         // the suspended snapshot so the on-screen history is not wiped. Claude
@@ -4410,6 +4455,32 @@ impl App {
                     }
                 }
 
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(tr("MCP для Claude Code", "MCP for Claude Code"));
+                    if ui
+                        .add_enabled(!self.mcp.busy, egui::Button::new(tr("Установить / обновить", "Install / update")))
+                        .on_hover_text(tr(
+                            "Регистрирует kip как MCP-сервер Claude Code (claude mcp add -s user kip): \
+                             Claude сможет видеть, открывать, закрывать, переименовывать и чистить сессии kip.",
+                            "Registers kip as a Claude Code MCP server (claude mcp add -s user kip): \
+                             Claude can list, open, close, rename and clean up kip sessions.",
+                        ))
+                        .clicked()
+                    {
+                        self.start_mcp_install(ctx);
+                    }
+                });
+                self.mcp_status_ui(ui);
+                ui.checkbox(
+                    &mut self.settings.mcp_send_input,
+                    tr("MCP может печатать в сессии (send_input)", "MCP may type into sessions (send_input)"),
+                )
+                .on_hover_text(tr(
+                    "Разрешает Claude из одной сессии отправлять текст и команды в другие сессии kip.",
+                    "Lets Claude in one session send text and commands to other kip sessions.",
+                ));
+
                 // Updates. Flags are collected during the immutable borrow of
                 // update_state and acted on afterwards to avoid a borrow clash.
                 ui.separator();
@@ -4526,6 +4597,7 @@ impl eframe::App for App {
             self.usage_inflight = false;
         }
         self.housekeeping(&ctx);
+        self.drain_ctl(&ctx);
 
         // Adopt zoom changed via Cmd+= / Cmd+- (egui built-in); while the
         // settings window is open the slider owns the value instead.
@@ -5084,6 +5156,14 @@ fn shell_escape(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// Drop to a fresh shell when the command exits instead of killing the tab.
+fn keep_shell(cmd: &str) -> String {
+    #[cfg(not(windows))]
+    return format!("{cmd} ; exec ${{SHELL:-/bin/zsh}} -il");
+    #[cfg(windows)]
+    return format!("{cmd}; powershell.exe -NoLogo");
 }
 
 fn fmt_mem(rss_kb: u64) -> String {

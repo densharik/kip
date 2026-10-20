@@ -296,7 +296,7 @@ impl Session {
     }
 }
 
-fn grab_snapshot(term: &FairMutex<Term<EventProxy>>) -> String {
+pub(crate) fn grab_snapshot(term: &FairMutex<Term<EventProxy>>) -> String {
     let term = term.lock();
     let grid = term.grid();
     let top = grid.topmost_line().0.max(-200);

@@ -1,0 +1,436 @@
+//! What kip does on control-channel requests (MCP tools), and the offer to
+//! connect kip to Claude Code as an MCP server.
+use serde_json::{json, Value};
+
+use super::*;
+
+fn arg_id(args: &Value) -> Result<u64, String> {
+    args["id"].as_u64().ok_or_else(|| "id is required".to_string())
+}
+
+fn expand(path: &str) -> PathBuf {
+    match path.strip_prefix('~') {
+        Some(rest) => dirs::home_dir().unwrap_or_default().join(rest.trim_start_matches(['/', '\\'])),
+        None => PathBuf::from(path),
+    }
+}
+
+/// Plain user/Claude text of a transcript tail, oldest first.
+fn transcript_text(path: &std::path::Path, max_chars: usize) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(4 * 1024 * 1024))).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let mut out = String::new();
+    for line in String::from_utf8_lossy(&buf).lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let who = match v["type"].as_str() {
+            Some("user") => "User",
+            Some("assistant") => "Claude",
+            _ => continue,
+        };
+        let content = &v["message"]["content"];
+        let text = match content {
+            Value::String(t) => t.clone(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter(|p| p["type"] == "text")
+                .filter_map(|p| p["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        out.push_str(&format!("{who}: {}\n\n", text.trim()));
+    }
+    if out.len() > max_chars {
+        let cut = out.len() - max_chars;
+        let cut = out.char_indices().map(|(i, _)| i).find(|&i| i >= cut).unwrap_or(0);
+        out = out.split_off(cut);
+    }
+    Some(out)
+}
+
+impl App {
+    pub(super) fn drain_ctl(&mut self, ctx: &egui::Context) {
+        while let Ok(req) = self.ctl_rx.try_recv() {
+            let r = self.ctl(&req.op, &req.args, ctx);
+            let _ = req.reply.send(r);
+        }
+        while let Ok(msg) = self.mcp_rx.try_recv() {
+            match msg {
+                McpMsg::Installed(yes) => self.mcp.show = !yes && !self.settings.mcp_offer_off,
+                McpMsg::Done(r) => {
+                    self.mcp.busy = false;
+                    self.mcp.status = Some(r);
+                },
+            }
+        }
+    }
+
+    fn win_index(&self, wid: u64) -> Result<usize, String> {
+        self.wins.iter().position(|w| w.id == wid).ok_or_else(|| format!("no window {wid}"))
+    }
+
+    fn session_index(&self, id: u64) -> Result<usize, String> {
+        self.idx_of(id).ok_or_else(|| format!("no session {id}"))
+    }
+
+    /// Window index of session `id` (call outside a window pass).
+    fn win_of(&self, id: u64) -> Result<usize, String> {
+        let idx = self.session_index(id)?;
+        self.win_index(self.sessions[idx].window)
+    }
+
+    fn session_json(&self, s: &Session) -> Value {
+        let state = match s.phase {
+            Phase::Live(_) => "live",
+            Phase::Suspended => "suspended",
+            Phase::Exited(_) => "exited",
+        };
+        let ctx = s.claude_session_id.as_deref().and_then(|sid| self.ctx_index.get(sid));
+        json!({
+            "id": s.id,
+            "window": s.window,
+            "name": s.display_name(),
+            "custom_name": s.custom_name,
+            "claude_title": s.claude_title,
+            "cwd": s.cwd,
+            "group": s.group,
+            "state": state,
+            "busy": s.busy,
+            "claude_running": s.fg_is_claude,
+            "running_cmd": s.running_cmd,
+            "pinned": s.pinned,
+            "on_screen": self.shown(s.id),
+            "claude_session_id": s.claude_session_id,
+            "context_pct": ctx.map(|c| c.pct.round()),
+            "idle_minutes": s.last_activity.elapsed().as_secs() / 60,
+        })
+    }
+
+    fn ctl(&mut self, op: &str, args: &Value, ctx: &egui::Context) -> Result<Value, String> {
+        match op {
+            "ping" => Ok(json!({"version": env!("CARGO_PKG_VERSION")})),
+            "list_sessions" => Ok(Value::Array(self.sessions.iter().map(|s| self.session_json(s)).collect())),
+            "list_windows" => Ok(Value::Array(
+                self.wins
+                    .iter()
+                    .map(|w| {
+                        let n = self.sessions.iter().filter(|s| s.window == w.id).count();
+                        json!({"id": w.id, "active_session": w.ui.active, "sessions": n})
+                    })
+                    .collect(),
+            )),
+            "open_session" => {
+                let cwd = expand(args["cwd"].as_str().ok_or("cwd is required")?);
+                if !cwd.is_dir() {
+                    return Err(format!("not a folder: {}", cwd.display()));
+                }
+                let k = self.win_index(args["window"].as_u64().unwrap_or(0))?;
+                let resume = args["resume"].as_str().filter(|s| session::valid_sid(s)).map(String::from);
+                let command = if args["claude"].as_bool() == Some(true) {
+                    let mut c = self.settings.claude_cmd.clone();
+                    if self.settings.skip_permissions_default {
+                        c.push_str(" --dangerously-skip-permissions");
+                    }
+                    Some(c)
+                } else {
+                    args["command"].as_str().map(String::from)
+                };
+                let id = self.in_window(k, |a| {
+                    a.spawn(cwd, command.as_deref().map(keep_shell), ctx);
+                    let id = a.w.active?;
+                    let idx = a.idx_of(id)?;
+                    if let Some(name) = args["name"].as_str().filter(|n| !n.trim().is_empty()) {
+                        a.sessions[idx].custom_name = Some(name.trim().to_string());
+                    }
+                    // Unlike a click, no group given means ungrouped, not the active one's.
+                    let g = args["group"].as_str().map(str::trim).filter(|g| !g.is_empty()).map(String::from);
+                    if a.sessions[idx].group != g {
+                        a.move_session(id, g, None);
+                    }
+                    if let Some(sid) = resume {
+                        if let Some(idx) = a.idx_of(id) {
+                            a.sessions[idx].claude_session_id = Some(sid);
+                            a.resume(id, true, ctx);
+                        }
+                    }
+                    a.persist();
+                    Some(id)
+                });
+                let id = id.ok_or("failed to open")?;
+                let idx = self.session_index(id)?;
+                Ok(self.session_json(&self.sessions[idx]))
+            },
+            "close_session" => {
+                let id = arg_id(args)?;
+                let idx = self.session_index(id)?;
+                if self.sessions[idx].pinned && args["force"].as_bool() != Some(true) {
+                    return Err("session is pinned; pass force to close it".into());
+                }
+                let k = self.win_of(id)?;
+                self.in_window(k, |a| {
+                    if let Some(i) = a.idx_of(id) {
+                        a.remove_session(i);
+                    }
+                });
+                Ok(json!("closed"))
+            },
+            "suspend_session" => {
+                let idx = self.session_index(arg_id(args)?)?;
+                if !matches!(self.sessions[idx].phase, Phase::Live(_)) {
+                    return Err("session is not running".into());
+                }
+                self.sessions[idx].suspend();
+                self.persist();
+                Ok(json!("suspended"))
+            },
+            "wake_session" => {
+                let id = arg_id(args)?;
+                let idx = self.session_index(id)?;
+                if matches!(self.sessions[idx].phase, Phase::Live(_)) {
+                    return Err("session is already running".into());
+                }
+                let claude = args["claude"].as_bool() != Some(false) && self.sessions[idx].claude_session_id.is_some();
+                let k = self.win_of(id)?;
+                self.in_window(k, |a| a.resume(id, claude, ctx));
+                self.persist();
+                Ok(json!(if claude { "resumed with Claude" } else { "reopened as a shell" }))
+            },
+            "focus_session" => {
+                let id = arg_id(args)?;
+                let k = self.win_of(id)?;
+                self.in_window(k, |a| a.apply(vec![Act::Select(id)], ctx));
+                ctx.send_viewport_cmd_to(self.wins[k].viewport(), egui::ViewportCommand::Focus);
+                Ok(json!("focused"))
+            },
+            "rename_session" => {
+                let idx = self.session_index(arg_id(args)?)?;
+                let name = args["name"].as_str().unwrap_or_default().trim();
+                self.sessions[idx].custom_name = (!name.is_empty()).then(|| name.to_string());
+                self.persist();
+                Ok(json!(self.sessions[idx].display_name()))
+            },
+            "set_group" => {
+                let id = arg_id(args)?;
+                let idx = self.session_index(id)?;
+                if self.sessions[idx].pinned {
+                    return Err("session is pinned; unpin it first".into());
+                }
+                let g = args["group"].as_str().map(str::trim).filter(|g| !g.is_empty()).map(String::from);
+                let k = self.win_of(id)?;
+                self.in_window(k, |a| a.move_session(id, g, None));
+                Ok(json!("moved"))
+            },
+            "pin_session" => {
+                let idx = self.session_index(arg_id(args)?)?;
+                self.sessions[idx].pinned = args["pinned"].as_bool().ok_or("pinned is required")?;
+                self.persist();
+                Ok(json!(self.sessions[idx].pinned))
+            },
+            "open_window" => {
+                let cwd = args["cwd"].as_str().map(expand).unwrap_or_else(|| dirs::home_dir().unwrap_or_default());
+                if !cwd.is_dir() {
+                    return Err(format!("not a folder: {}", cwd.display()));
+                }
+                let wid = self.open_window();
+                if let Some(w) = self.wins.iter_mut().find(|w| w.id == wid) {
+                    w.pending_spawn = Some(cwd);
+                }
+                ctx.request_repaint();
+                Ok(json!({"window": wid}))
+            },
+            "move_to_window" => {
+                let id = arg_id(args)?;
+                let idx = self.session_index(id)?;
+                if self.sessions[idx].pinned {
+                    return Err("session is pinned; unpin it first".into());
+                }
+                let win = args["window"].as_u64();
+                if let Some(w) = win {
+                    self.win_index(w)?;
+                }
+                let k = self.win_of(id)?;
+                self.in_window(k, |a| a.apply(vec![Act::MoveToWindow { id, win }], ctx));
+                // MoveToWindow parks the session; outside a pass it is back in `sessions`.
+                let idx = self.session_index(id)?;
+                Ok(json!({"window": self.sessions[idx].window}))
+            },
+            "save_state" => {
+                for s in &mut self.sessions {
+                    if matches!(s.phase, Phase::Live(_)) {
+                        s.save_claude_session();
+                    }
+                }
+                self.save_now();
+                Ok(json!("saved"))
+            },
+            "read_screen" => {
+                let s = &self.sessions[self.session_index(arg_id(args)?)?];
+                let text = match s.live() {
+                    Some(l) => session::grab_snapshot(&l.term),
+                    None => s.snapshot.clone().unwrap_or_default(),
+                };
+                let n = args["lines"].as_u64().unwrap_or(60) as usize;
+                let lines: Vec<&str> = text.lines().collect();
+                Ok(json!(lines[lines.len().saturating_sub(n)..].join("\n")))
+            },
+            "read_transcript" => {
+                let s = &self.sessions[self.session_index(arg_id(args)?)?];
+                let sid = s.claude_session_id.as_deref().ok_or("no Claude session in this terminal")?;
+                let path = ctx_index::resolve_jsonl(&self.jsonl_map, sid, Some(&s.cwd)).ok_or("transcript not found")?;
+                let max = args["max_chars"].as_u64().unwrap_or(20_000) as usize;
+                transcript_text(&path, max).map(Value::String).ok_or_else(|| "cannot read transcript".into())
+            },
+            "send_input" => {
+                if !self.settings.mcp_send_input {
+                    return Err("typing into sessions is off; enable it in kip Settings > MCP".into());
+                }
+                let id = arg_id(args)?;
+                let text = args["text"].as_str().ok_or("text is required")?.to_string();
+                let idx = self.session_index(id)?;
+                if self.sessions[idx].live().is_none() {
+                    return Err("session is not running; wake_session it first".into());
+                }
+                if args["enter"].as_bool() == Some(false) {
+                    if let Some(l) = self.sessions[idx].live() {
+                        l.notifier.notify(text.into_bytes());
+                    }
+                } else {
+                    self.send_command_to(idx, &text, ctx);
+                }
+                Ok(json!("sent"))
+            },
+            "cleanup" => {
+                let idle = Duration::from_secs(args["idle_minutes"].as_u64().unwrap_or(120) * 60);
+                let remove = args["action"].as_str() == Some("remove");
+                let dry = args["dry_run"].as_bool() != Some(false);
+                let picked: Vec<u64> = self
+                    .sessions
+                    .iter()
+                    .filter(|s| !s.pinned && !s.busy && !self.shown(s.id) && s.last_activity.elapsed() >= idle)
+                    .filter(|s| matches!(s.phase, Phase::Live(_)) != remove)
+                    .map(|s| s.id)
+                    .collect();
+                let listed: Vec<Value> = picked
+                    .iter()
+                    .filter_map(|id| self.idx_of(*id))
+                    .map(|i| self.session_json(&self.sessions[i]))
+                    .collect();
+                if !dry {
+                    for id in &picked {
+                        let Ok(k) = self.win_of(*id) else { continue };
+                        let id = *id;
+                        self.in_window(k, |a| {
+                            if let Some(i) = a.idx_of(id) {
+                                if remove {
+                                    a.remove_session(i);
+                                } else {
+                                    a.sessions[i].suspend();
+                                    a.persist();
+                                }
+                            }
+                        });
+                    }
+                }
+                Ok(json!({"action": if remove { "remove" } else { "suspend" }, "dry_run": dry, "sessions": listed}))
+            },
+            _ => Err(format!("unknown op {op}")),
+        }
+    }
+
+    pub(super) fn start_mcp_install(&mut self, ctx: &egui::Context) {
+        self.mcp.busy = true;
+        self.mcp.status = None;
+        let (tx, ctx, cmd) = (self.mcp_tx.clone(), ctx.clone(), self.settings.claude_cmd.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(McpMsg::Done(mcp::install(&cmd)));
+            ctx.request_repaint();
+        });
+    }
+
+    pub(super) fn mcp_status_ui(&self, ui: &mut egui::Ui) {
+        match &self.mcp.status {
+            Some(Ok(_)) => {
+                ui.label(
+                    RichText::new(tr(
+                        "Готово. Новые сессии Claude Code увидят инструменты kip.",
+                        "Done. New Claude Code sessions will see kip's tools.",
+                    ))
+                    .size(11.0)
+                    .color(GIT_ADD),
+                );
+            },
+            Some(Err(e)) => {
+                ui.label(RichText::new(e).size(10.5).color(GIT_DEL));
+            },
+            None if self.mcp.busy => {
+                ui.label(RichText::new(tr("устанавливаю...", "installing...")).size(10.5).color(palette::text_faint()));
+            },
+            None => {},
+        }
+    }
+
+    pub(super) fn mcp_offer(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        let mut install = false;
+        let mut later = false;
+        egui::Window::new(tr("Подключить kip к Claude Code", "Connect kip to Claude Code"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-16.0, -48.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.label(tr(
+                    "Рекомендуем поставить MCP-сервер kip. Тогда Claude в любой сессии сможет управлять kip по вашей просьбе:",
+                    "We recommend installing kip's MCP server. Claude in any session can then manage kip when you ask:",
+                ));
+                for line in [
+                    tr("видеть все сессии, их папки, статус и % контекста", "see all sessions, their folders, status and context %"),
+                    tr("открывать сессии в нужной папке и окне, сразу с Claude", "open sessions in a folder and window, with Claude started"),
+                    tr("закрывать, усыплять и будить сессии", "close, suspend and wake sessions"),
+                    tr("переименовывать, раскладывать по группам и окнам, закреплять", "rename, group, move between windows, pin"),
+                    tr("читать экран и переписку сессии и делать саммари", "read a session's screen and conversation and summarize it"),
+                    tr("чистить давно простаивающие сессии", "clean up long-idle sessions"),
+                ] {
+                    ui.label(RichText::new(format!("- {line}")).size(11.5).color(palette::text_faint()));
+                }
+                ui.label(
+                    RichText::new(tr(
+                        "Компактно: 17 инструментов, около 1.5 тыс. токенов контекста. Ставится одной командой: claude mcp add -s user kip. Печатать в чужие сессии MCP не может, пока вы не разрешите это в настройках.",
+                        "Compact: 17 tools, about 1.5k tokens of context. Installs with one command: claude mcp add -s user kip. MCP cannot type into sessions unless you allow it in Settings.",
+                    ))
+                    .size(10.5)
+                    .color(palette::text_faint()),
+                );
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.mcp.dont_remind, tr("Больше не напоминать", "Don't remind me again"));
+                ui.horizontal(|ui| {
+                    let ok = matches!(self.mcp.status, Some(Ok(_)));
+                    if !ok && ui.add_enabled(!self.mcp.busy, egui::Button::new(tr("Установить", "Install"))).clicked() {
+                        install = true;
+                    }
+                    if ui.button(if ok { tr("Закрыть", "Close") } else { tr("Не сейчас", "Not now") }).clicked() {
+                        later = true;
+                    }
+                });
+                self.mcp_status_ui(ui);
+            });
+        if install {
+            self.start_mcp_install(ctx);
+        }
+        if !open || later {
+            self.mcp.show = false;
+            if self.mcp.dont_remind {
+                self.settings.mcp_offer_off = true;
+                self.persist();
+            }
+        }
+    }
+}

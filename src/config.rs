@@ -38,6 +38,10 @@ pub struct Settings {
     pub row_separators: bool,
     /// Key of the usage limit pinned to the corner chip (see usage::Limit::key).
     pub usage_pin: Option<String>,
+    /// MCP may type into sessions (send_input). Off: one Claude must not drive another unasked.
+    pub mcp_send_input: bool,
+    /// "Do not remind me" on the MCP install offer.
+    pub mcp_offer_off: bool,
     /// Settings schema version, so a changed default can reach existing installs
     /// (see `migrate`). The field-level `default` is what makes that work: the
     /// struct-level one would hand an old file the current version and skip the
@@ -72,6 +76,8 @@ impl Default for Settings {
             show_last_msg: true,
             row_separators: false,
             usage_pin: None,
+            mcp_send_input: false,
+            mcp_offer_off: false,
             version: SETTINGS_VERSION,
         }
     }
