@@ -110,6 +110,8 @@ pub struct Session {
     pub unread: bool,
     /// The agent finished while nobody was looking; the row glows until seen.
     pub done: bool,
+    /// When Claude's current turn started (its metadata status went "busy").
+    pub turn_since: Option<Instant>,
     pub busy: bool,
     pub busy_since: Option<Instant>,
     pub git: Option<GitStats>,
@@ -278,6 +280,7 @@ impl Session {
             snapshot: saved.snapshot,
             unread: false,
             done: false,
+            turn_since: None,
             busy: false,
             busy_since: None,
             git: None,
@@ -516,6 +519,8 @@ pub struct ClaudeInfo {
     /// The actual claude process (the PTY leader itself, or its descendant
     /// when claude runs behind a wrapper tool).
     pub claude_pid: Option<i32>,
+    /// Claude's own turn status from its metadata ("busy", "idle", ...).
+    pub status: Option<String>,
 }
 
 /// Resolve the Claude session running in a terminal (via ~/.claude/sessions
@@ -550,7 +555,7 @@ pub fn poll_claude(
             },
             None => {},
         }
-        if tx.send((id, ClaudeInfo { session_id: store_sid, name, claude_pid: cpid })).is_ok() {
+        if tx.send((id, ClaudeInfo { session_id: store_sid, name, claude_pid: cpid, status: None })).is_ok() {
             ctx.request_repaint();
         }
     });
@@ -592,6 +597,7 @@ pub fn spawn_meta_read(
             session_id: Some(sid.to_string()),
             name: meta_name(&v, sid),
             claude_pid: Some(pid),
+            status: v["status"].as_str().map(String::from),
         };
         if tx.send((id, info)).is_ok() {
             ctx.request_repaint();

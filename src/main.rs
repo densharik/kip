@@ -1653,9 +1653,30 @@ impl App {
         let mut lookups: Vec<(String, PathBuf)> = Vec::new();
         while let Ok((id, info)) = self.ctx_rx.try_recv() {
             if let Some(idx) = self.idx_of(id) {
+                let seen = self.seen(ctx, id);
                 let s = &mut self.sessions[idx];
                 if info.name.is_some() {
                     s.claude_title = info.name;
+                }
+                // Claude stays the foreground process between turns, so the
+                // end of a turn is its own status leaving "busy" - also when
+                // it stops to ask for a permission.
+                match info.status.as_deref() {
+                    Some("busy") => {
+                        if s.turn_since.is_none() {
+                            s.turn_since = Some(Instant::now());
+                            s.done = false;
+                        }
+                    },
+                    Some(_) => {
+                        if let Some(t) = s.turn_since.take() {
+                            if t.elapsed() >= BUSY_NOTIFY_MIN && !seen {
+                                s.done = true;
+                                s.unread = true;
+                            }
+                        }
+                    },
+                    None => {},
                 }
                 // Claude found behind a wrapper: adopt right away, don't wait
                 // for the next housekeeping tick to re-validate.
