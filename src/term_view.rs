@@ -124,6 +124,13 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     let mode = *term.mode();
     let mut out: Vec<u8> = Vec::new();
 
+    let alt = mode.contains(TermMode::ALT_SCREEN);
+    if term.selection.is_none() {
+        if let Some((sel, _)) = session.sel_keep.as_ref().filter(|(_, a)| *a == alt) {
+            term.selection = Some(sel.clone());
+        }
+    }
+
     // A link popup swallows Escape (it closes the menu, see link_menu) instead of
     // letting it reach claude and cancel whatever it is doing.
     let menu_open = ui
@@ -224,6 +231,25 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                 } else {
                     term.scroll_display(Scroll::Delta(lines));
                 }
+            }
+        }
+    }
+
+    // Dragging a selection past the top or bottom edge scrolls the scrollback,
+    // faster the farther the pointer is, and keeps going while it is held still.
+    if response.dragged_by(PointerButton::Primary) && term.selection.is_some() && !alt {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let over = if pos.y < rect.top() {
+                pos.y - rect.top()
+            } else if pos.y > rect.bottom() {
+                pos.y - rect.bottom()
+            } else {
+                0.0
+            };
+            if over != 0.0 {
+                let n = 1 + (over.abs() / cell_h) as i32;
+                term.scroll_display(Scroll::Delta(if over < 0.0 { n } else { -n }));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
             }
         }
     }
@@ -353,6 +379,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         session.scroll_accum = 0.0;
         info.had_input = true;
     }
+    session.sel_keep = term.selection.clone().map(|s| (s, alt));
 
     // ---- Snapshot cells under the lock, paint after releasing it ----
     // Painting shapes ~1-3ms per frame; doing it under the FairMutex would

@@ -118,6 +118,10 @@ pub struct Session {
     pub last_git_poll: Option<Instant>,
     pub git_inflight: bool,
     pub scroll_accum: f32,
+    /// Last selection and whether it was on the alt screen. Claude repaints its
+    /// live area with erase-line/erase-below, and alacritty drops any selection
+    /// those touch; we put it back so a drag or a copy survives the repaint.
+    pub sel_keep: Option<(alacritty_terminal::selection::Selection, bool)>,
     /// Auto-repeat streak of a held Backspace (drives word-wise erase).
     pub bs_repeat: u8,
     /// Name of the PTY foreground process while busy (e.g. "claude").
@@ -287,6 +291,7 @@ impl Session {
             last_git_poll: None,
             git_inflight: false,
             scroll_accum: 0.0,
+            sel_keep: None,
             bs_repeat: 0,
             fg_name: None,
             fg_is_claude: false,
