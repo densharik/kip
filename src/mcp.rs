@@ -49,6 +49,8 @@ fn tools() -> Value {
          "inputSchema": {"type": "object", "properties": {}}},
         {"name": "read_screen", "description": "Text currently on a session's terminal (or its snapshot if asleep).",
          "inputSchema": {"type": "object", "properties": {"id": id, "lines": {"type": "integer", "description": "Last N lines (default 60)"}}, "required": ["id"]}},
+        {"name": "search", "description": "Case-insensitive text search in sessions' screen and scrollback (sleeping ones: their snapshot). Sessions with hits, count, up to 5 newest matching lines.",
+         "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "id": {"type": "integer", "description": "Only this session"}}, "required": ["query"]}},
         {"name": "read_transcript", "description": "The user/Claude messages of a session's Claude conversation (tail), for summaries.",
          "inputSchema": {"type": "object", "properties": {"id": id, "max_chars": {"type": "integer", "description": "Default 20000"}}, "required": ["id"]}},
         {"name": "send_input", "description": "Type text into a live session (Enter appended by default). Off unless enabled in kip settings.",

@@ -122,6 +122,9 @@ pub struct Session {
     /// live area with erase-line/erase-below, and alacritty drops any selection
     /// those touch; we put it back so a drag or a copy survives the repaint.
     pub sel_keep: Option<(alacritty_terminal::selection::Selection, bool)>,
+    /// Ctrl+F matches in this terminal (grid points) and the one jumped to.
+    pub find_hits: Vec<alacritty_terminal::term::search::Match>,
+    pub find_cur: Option<usize>,
     /// Auto-repeat streak of a held Backspace (drives word-wise erase).
     pub bs_repeat: u8,
     /// Name of the PTY foreground process while busy (e.g. "claude").
@@ -292,6 +295,8 @@ impl Session {
             git_inflight: false,
             scroll_accum: 0.0,
             sel_keep: None,
+            find_hits: Vec::new(),
+            find_cur: None,
             bs_repeat: 0,
             fg_name: None,
             fg_is_claude: false,

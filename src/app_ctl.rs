@@ -281,6 +281,42 @@ impl App {
                 let lines: Vec<&str> = text.lines().collect();
                 Ok(json!(lines[lines.len().saturating_sub(n)..].join("\n")))
             },
+            "search" => {
+                use alacritty_terminal::grid::Dimensions;
+                use alacritty_terminal::index::{Column, Point};
+                let q = args["query"].as_str().filter(|q| !q.is_empty()).ok_or("query is required")?;
+                let only = args["id"].as_u64();
+                let mut found = Vec::new();
+                for s in self.sessions.iter().filter(|s| only.is_none_or(|id| id == s.id)) {
+                    let (n, lines): (usize, Vec<String>) = match s.live() {
+                        Some(l) => {
+                            let term = l.term.lock();
+                            let hits = term_view::find_all(&term, q);
+                            let lines = hits
+                                .iter()
+                                .rev()
+                                .take(5)
+                                .map(|m| {
+                                    let ln = m.start().line;
+                                    let end = Point::new(ln, term.last_column());
+                                    term.bounds_to_string(Point::new(ln, Column(0)), end).trim().to_string()
+                                })
+                                .collect();
+                            (hits.len(), lines)
+                        },
+                        None => {
+                            let snap = s.snapshot.as_deref().unwrap_or_default();
+                            let lq = q.to_lowercase();
+                            let lines = snap.lines().filter(|l| l.to_lowercase().contains(&lq)).rev().take(5);
+                            (snapshot_hits(Some(snap), q), lines.map(|l| l.trim().to_string()).collect())
+                        },
+                    };
+                    if n > 0 {
+                        found.push(json!({"id": s.id, "name": self.session_json(s)["name"], "hits": n, "lines": lines}));
+                    }
+                }
+                Ok(Value::Array(found))
+            },
             "read_transcript" => {
                 let s = &self.sessions[self.session_index(arg_id(args)?)?];
                 let sid = s.claude_session_id.as_deref().ok_or("no Claude session in this terminal")?;
@@ -436,8 +472,8 @@ impl App {
                 }
                 ui.label(
                     RichText::new(tr(
-                        "Компактно: 19 инструментов, около 1.6 тыс. токенов контекста. Ставится одной командой: claude mcp add -s user kip. Печатать в чужие сессии MCP не может, пока вы не разрешите это в настройках.",
-                        "Compact: 19 tools, about 1.6k tokens of context. Installs with one command: claude mcp add -s user kip. MCP cannot type into sessions unless you allow it in Settings.",
+                        "Компактно: 20 инструментов, около 1.7 тыс. токенов контекста. Ставится одной командой: claude mcp add -s user kip. Печатать в чужие сессии MCP не может, пока вы не разрешите это в настройках.",
+                        "Compact: 20 tools, about 1.7k tokens of context. Installs with one command: claude mcp add -s user kip. MCP cannot type into sessions unless you allow it in Settings.",
                     ))
                     .size(10.5)
                     .color(palette::text_faint()),

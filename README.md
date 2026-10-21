@@ -193,7 +193,7 @@ or by hand:
 claude mcp add -s user kip -- /Applications/kip.app/Contents/MacOS/kip mcp
 ```
 
-Small on context: 19 tools, about 5.7 KB of schema (~1.6k tokens) - and Claude
+Small on context: 20 tools, about 6.1 KB of schema (~1.7k tokens) - and Claude
 Code usually defers MCP tools, keeping only their names in context until one
 is used. If kip is not running, the first call starts it.
 
@@ -206,6 +206,7 @@ is used. If kip is not running, the first call starts it.
 | `open_window`, `move_to_window` | |
 | `save_state` | write sessions and windows to disk now |
 | `read_screen`, `read_transcript` | terminal text and the Claude conversation, for summaries |
+| `search` | case-insensitive text search across sessions' screen and scrollback |
 | `send_input` | type into a session - off until enabled in Settings |
 | `cleanup` | suspend or remove long-idle sessions; dry run by default |
 | `get_settings`, `set_settings` | read and change any kip setting |

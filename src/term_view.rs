@@ -5,7 +5,8 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::TermMode;
+use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
+use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor};
 use egui::{
     Align2, Color32, CornerRadius, Event, EventFilter, FontId, Key, Modifiers, PointerButton,
@@ -26,6 +27,39 @@ pub struct GridInfo {
     pub interacted: bool,
     /// Content has outgrown the viewport (scrollback exists).
     pub grown: bool,
+}
+
+/// Every case-insensitive occurrence of `query` in the screen and scrollback,
+/// top to bottom. Matches across soft-wrapped lines too.
+pub fn find_all<T>(term: &Term<T>, query: &str) -> Vec<Match> {
+    const MAX: usize = 5000;
+    if query.is_empty() {
+        return Vec::new();
+    }
+    // All-lowercase pattern = case-insensitive in alacritty's smart case.
+    let mut pat = String::new();
+    for c in query.to_lowercase().chars() {
+        if "\\.+*?()|[]{}^$#&-~".contains(c) {
+            pat.push('\\');
+        }
+        pat.push(c);
+    }
+    let Ok(mut re) = RegexSearch::new(&pat) else { return Vec::new() };
+    let start = Point::new(term.topmost_line(), Column(0));
+    let end = Point::new(term.bottommost_line(), term.last_column());
+    RegexIter::new(start, end, alacritty_terminal::index::Direction::Right, term, &mut re).take(MAX).collect()
+}
+
+/// Scroll so the match is in view (centered), unless it already is.
+pub fn reveal<T: alacritty_terminal::event::EventListener>(term: &mut Term<T>, m: &Match) {
+    let rows = term.screen_lines() as i32;
+    let d = term.grid().display_offset() as i32;
+    let line = m.start().line.0;
+    if line + d >= 0 && line + d < rows {
+        return;
+    }
+    let want = (rows / 2 - line).clamp(0, term.history_size() as i32);
+    term.scroll_display(Scroll::Delta(want - d));
 }
 
 /// Characters that only exist in a color-emoji font, which egui cannot
@@ -403,6 +437,16 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     let cursor = content.cursor;
     let show_cursor = content.mode.contains(TermMode::SHOW_CURSOR);
 
+    // Search hits that touch the viewport, flagged when it is the current one.
+    let (vtop, vbot) = (-(display_offset as i32), rows as i32 - 1 - display_offset as i32);
+    let hits: Vec<(&Match, bool)> = session
+        .find_hits
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.end().line.0 >= vtop && m.start().line.0 <= vbot)
+        .map(|(i, m)| (m, session.find_cur == Some(i)))
+        .collect();
+
     let mut cursor_cell: Option<(char, Color32)> = None;
     let mut cells: Vec<DrawCell> = Vec::with_capacity(512);
 
@@ -418,7 +462,11 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         let y = origin.y + vp_line as f32 * cell_h;
 
         let selected = sel.is_some_and(|r| selection_contains(&r, point));
-        let (fg, bg) = palette::cell_colors(cell.fg, cell.bg, flags, colors, selected);
+        let (fg, mut bg) = palette::cell_colors(cell.fg, cell.bg, flags, colors, selected);
+        if let Some(&(_, cur)) = hits.iter().find(|(m, _)| m.contains(&point)) {
+            let a = palette::selection();
+            bg = Some(if cur { a } else { a.gamma_multiply(0.45) });
+        }
 
         if point == cursor.point {
             cursor_cell = Some((substitute(cell.c), bg.unwrap_or(palette::term_bg())));
@@ -983,6 +1031,10 @@ fn backspace_accel(count: &mut u8, key: Key, repeat: bool, mods: Modifiers) -> M
 }
 
 fn encode_key(key: Key, mods: Modifiers, mode: TermMode, claude: bool) -> Option<Vec<u8>> {
+    // Cmd+Z = undo: Ctrl+_ is undo in Claude's prompt (chat:undo), zsh and bash.
+    if mods.mac_cmd && !mods.shift && key == Key::Z {
+        return Some(vec![0x1f]);
+    }
     if mods.command {
         return None; // App-level shortcuts.
     }
@@ -1213,5 +1265,30 @@ mod tests {
         let ci = join_ci(&base, std::path::Path::new("Content-Factory/REELS")).unwrap();
         assert_eq!(ci.canonicalize().ok(), base.join("content-factory/reels").canonicalize().ok());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    fn term_with(cols: usize, text: &str) -> alacritty_terminal::Term<alacritty_terminal::event::VoidListener> {
+        let size = alacritty_terminal::term::test::TermSize::new(cols, 5);
+        let mut t = alacritty_terminal::Term::new(Default::default(), &size, alacritty_terminal::event::VoidListener);
+        let mut p: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        p.advance(&mut t, text.as_bytes());
+        t
+    }
+
+    #[test]
+    fn find_is_case_insensitive_literal_and_crosses_wraps() {
+        let t = term_with(10, "Hello a.b\r\nhello axb\r\n0123456789abcHELLO\r\n");
+        assert_eq!(super::find_all(&t, "HeLLo").len(), 3);
+        assert_eq!(super::find_all(&t, "a.b").len(), 1);
+        // "89abc" sits across the soft wrap at column 10.
+        assert_eq!(super::find_all(&t, "89abc").len(), 1);
+        assert!(super::find_all(&t, "").is_empty());
+    }
+
+    #[test]
+    fn cmd_z_sends_undo() {
+        let mut m = Modifiers::MAC_CMD;
+        m.command = true;
+        assert_eq!(encode_key(Key::Z, m, TermMode::empty(), true), Some(vec![0x1f]));
     }
 }

@@ -277,6 +277,43 @@ struct WinUi {
     term_rect: Option<Rect>,
     /// Mods whose card is folded to its header.
     mods_folded: HashSet<String>,
+    /// Cmd+F bar, open while Some.
+    find: Option<Find>,
+}
+
+/// Search over the active terminal, with a lazy count in the window's other
+/// sessions (live ones by their scrollback, sleeping ones by their snapshot).
+struct Find {
+    query: String,
+    /// Grab keyboard focus for the field on the next frame.
+    focus: bool,
+    /// (session, query) the active session's hits were computed for, and when.
+    done_for: Option<(u64, String)>,
+    at: Instant,
+    edited: Instant,
+    /// Query the other sessions were queued for, when, and who is left.
+    scanned: String,
+    scanned_at: Instant,
+    queue: Vec<u64>,
+    /// Sessions with at least one hit, and how many.
+    hits: std::collections::HashMap<u64, usize>,
+}
+
+impl Find {
+    fn new() -> Self {
+        let now = Instant::now();
+        Find {
+            query: String::new(),
+            focus: true,
+            done_for: None,
+            at: now,
+            edited: now,
+            scanned: String::new(),
+            scanned_at: now,
+            queue: Vec::new(),
+            hits: Default::default(),
+        }
+    }
 }
 
 /// One native window. Id 0 is the main (root) window: closing it quits kip.
@@ -2045,7 +2082,14 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let mut acts = Vec::new();
         let active = self.w.active;
+        let mut open_find = false;
         ctx.input_mut(|i| {
+            // Plain Ctrl+F belongs to the shell and Claude off macOS.
+            open_find = if cfg!(target_os = "macos") {
+                consume_cmd(i, Key::F)
+            } else {
+                consume_mods(i, Modifiers::COMMAND | Modifiers::SHIFT, Key::F)
+            };
             if consume_cmd(i, Key::T) {
                 acts.push(Act::NewSame);
             }
@@ -2078,7 +2122,184 @@ impl App {
                 }
             }
         });
+        if open_find {
+            match &mut self.w.find {
+                Some(f) => f.focus = true,
+                None => self.w.find = Some(Find::new()),
+            }
+        }
         self.apply(acts, ctx);
+    }
+
+    /// The Cmd+F bar over the terminal's top-right corner, plus the search work
+    /// behind it. Returns whether the bar holds the keyboard this frame.
+    fn find_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(f) = self.w.find.as_mut() else { return false };
+        let ctx = ui.ctx().clone();
+        let area = ui.available_rect_before_wrap();
+        let field_id = egui::Id::new(("kip_find_field", self.cur_win));
+        let active = self.w.active.and_then(|id| self.sessions.iter().position(|s| s.id == id));
+        let now = Instant::now();
+
+        let mut step = 0i32;
+        let mut close = false;
+        if f.focus || ctx.memory(|m| m.has_focus(field_id)) {
+            ctx.input_mut(|i| {
+                close = consume_plain(i, Key::Escape);
+                if consume_mods(i, Modifiers::SHIFT, Key::Enter) || consume_plain(i, Key::ArrowDown) {
+                    step = 1;
+                }
+                // Enter walks up: the search starts at the newest hit, at the bottom.
+                if consume_plain(i, Key::Enter) || consume_plain(i, Key::ArrowUp) {
+                    step = -1;
+                }
+            });
+        }
+
+        let accent = palette::selection();
+        let (total, cur) = match active {
+            Some(i) => (self.sessions[i].find_hits.len(), self.sessions[i].find_cur),
+            None => (0, None),
+        };
+        let mut changed = false;
+        egui::Area::new(egui::Id::new(("kip_find", self.cur_win)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(Pos2::new(area.right() - 330.0, area.top() + 8.0))
+            .show(&ctx, |ui| {
+                egui::Frame::new()
+                    .fill(palette::popup_bg())
+                    .stroke(Stroke::new(1.5, accent))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(8, 5))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut f.query)
+                                    .id(field_id)
+                                    .desired_width(180.0)
+                                    .hint_text(tr("Поиск", "Find")),
+                            );
+                            if f.focus {
+                                r.request_focus();
+                                f.focus = false;
+                            }
+                            changed = r.changed();
+                            let label = if f.query.is_empty() {
+                                String::new()
+                            } else if total == 0 {
+                                tr("нет", "none").to_string()
+                            } else {
+                                format!("{}/{}", cur.map_or(0, |c| c + 1), total)
+                            };
+                            ui.add_sized(
+                                Vec2::new(54.0, 18.0),
+                                egui::Label::new(RichText::new(label).size(11.5).color(palette::text_dim())),
+                            );
+                            if find_btn(ui, 0).on_hover_text(tr("Выше (Enter)", "Up (Enter)")).clicked() {
+                                step = -1;
+                            }
+                            if find_btn(ui, 1).on_hover_text(tr("Ниже (Shift+Enter)", "Down (Shift+Enter)")).clicked() {
+                                step = 1;
+                            }
+                            if find_btn(ui, 2).on_hover_text(tr("Закрыть (Esc)", "Close (Esc)")).clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+            });
+
+        if close {
+            for s in &mut self.sessions {
+                s.find_hits.clear();
+                s.find_cur = None;
+            }
+            self.w.find = None;
+            return false;
+        }
+        if changed {
+            f.edited = now;
+            f.done_for = None;
+            f.hits.clear();
+            f.scanned.clear();
+            f.queue.clear();
+        }
+        let query = f.query.clone();
+
+        // Active session: recompute on a new query or session, and every 300ms
+        // so hits follow fresh output. Only a new query or session jumps.
+        if let Some(i) = active {
+            let s = &mut self.sessions[i];
+            let key = (s.id, query.clone());
+            let fresh = f.done_for.as_ref() != Some(&key);
+            if fresh || now.duration_since(f.at) >= Duration::from_millis(300) {
+                let n = match &s.phase {
+                    Phase::Live(l) => {
+                        let mut term = l.term.lock();
+                        s.find_hits = term_view::find_all(&term, &query);
+                        let len = s.find_hits.len();
+                        s.find_cur = if len == 0 {
+                            None
+                        } else if fresh {
+                            Some(len - 1)
+                        } else {
+                            Some(s.find_cur.unwrap_or(len - 1).min(len - 1))
+                        };
+                        if fresh {
+                            if let Some(c) = s.find_cur {
+                                term_view::reveal(&mut term, &s.find_hits[c]);
+                            }
+                        }
+                        len
+                    },
+                    _ => snapshot_hits(s.snapshot.as_deref(), &query),
+                };
+                if n > 0 {
+                    f.hits.insert(s.id, n);
+                } else {
+                    f.hits.remove(&s.id);
+                }
+                f.done_for = Some(key);
+                f.at = now;
+            }
+            if step != 0 && !s.find_hits.is_empty() {
+                let len = s.find_hits.len() as i32;
+                let c = (s.find_cur.unwrap_or(0) as i32 + step).rem_euclid(len) as usize;
+                s.find_cur = Some(c);
+                if let Phase::Live(l) = &s.phase {
+                    term_view::reveal(&mut l.term.lock(), &s.find_hits[c]);
+                }
+            }
+        }
+
+        // Other sessions: once typing pauses, count one per frame; recount every
+        // few seconds while the bar stays open.
+        let settled = now.duration_since(f.edited) >= Duration::from_millis(200);
+        if !query.is_empty()
+            && settled
+            && f.queue.is_empty()
+            && (f.scanned != query || now.duration_since(f.scanned_at) >= Duration::from_secs(3))
+        {
+            let skip = active.map(|i| self.sessions[i].id);
+            f.queue = self.sessions.iter().map(|s| s.id).filter(|id| Some(*id) != skip).collect();
+            f.scanned = query.clone();
+            f.scanned_at = now;
+        }
+        if let Some(id) = f.queue.pop() {
+            if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
+                let n = match &s.phase {
+                    Phase::Live(l) => term_view::find_all(&l.term.lock(), &query).len(),
+                    _ => snapshot_hits(s.snapshot.as_deref(), &query),
+                };
+                if n > 0 {
+                    f.hits.insert(id, n);
+                } else {
+                    f.hits.remove(&id);
+                }
+            }
+            ctx.request_repaint();
+        }
+        ctx.request_repaint_after(Duration::from_millis(if settled { 300 } else { 200 }));
+        f.focus || ctx.memory(|m| m.has_focus(field_id))
     }
 
     // ---- UI ----
@@ -2644,6 +2865,13 @@ impl App {
             };
             paint_pin(ui.painter(), pin_c + Vec2::new(dx, 0.0), pinned, col);
         }
+        // Cmd+F found something here too: an accent "!" left of the pin.
+        if let Some(n) = self.w.find.as_ref().and_then(|f| f.hits.get(&id).copied()) {
+            let c = Pos2::new(x0 + 6.0, pin_c.y);
+            ui.painter().text(c, Align2::CENTER_CENTER, "!", FontId::proportional(14.0), palette::selection());
+            ui.interact(Rect::from_center_size(c, Vec2::new(8.0, 16.0)), ui.id().with(("find", id)), Sense::hover())
+                .on_hover_text(format!("{} {n}", tr("Найдено:", "Found:")));
+        }
         pin_resp.on_hover_text(if pinned {
             tr("Открепить сессию", "Unpin session")
         } else {
@@ -3111,6 +3339,7 @@ impl App {
         }
         let Some(idx) = self.active_idx() else { return acts };
 
+        let finding = self.find_ui(ui);
         let is_live = matches!(self.sessions[idx].phase, Phase::Live(_));
         if is_live {
             let busy_now = {
@@ -3119,9 +3348,10 @@ impl App {
             };
             // Own command editor while the shell is at its prompt; a running
             // program (claude, vim, ...) gets the keyboard directly.
-            let submitted = if busy_now { None } else { self.cmd_panel(ui) };
+            let submitted = if busy_now { None } else { self.cmd_panel(ui, finding) };
             let settings = self.settings.clone();
             let accept = busy_now
+                && !finding
                 && !self.settings_open
                 && !self.w.dir_open
                 && self.w.renaming.is_none()
@@ -3185,10 +3415,11 @@ impl App {
 
     /// Command editor pinned under the terminal + filtered history popup.
     /// Returns a command to execute.
-    fn cmd_panel(&mut self, ui: &mut egui::Ui) -> Option<String> {
+    fn cmd_panel(&mut self, ui: &mut egui::Ui, finding: bool) -> Option<String> {
         let ctx = ui.ctx().clone();
         self.refresh_history(&ctx);
         let interactive = !self.settings_open
+            && !finding
             && !self.w.dir_open
             && self.w.renaming.is_none()
             && self.w.renaming_group.is_none()
@@ -5242,6 +5473,36 @@ fn fmt_mem(rss_kb: u64) -> String {
 
 /// Pushpin: a head and a needle, filled once the limit is pinned. Drawn rather
 /// than typed - the UI font has no pin glyph to rely on.
+/// Case-insensitive hit count in a sleeping session's screen snapshot.
+fn snapshot_hits(snap: Option<&str>, query: &str) -> usize {
+    match snap {
+        Some(t) if !query.is_empty() => t.to_lowercase().matches(&query.to_lowercase()).count(),
+        _ => 0,
+    }
+}
+
+/// Small icon button of the find bar: 0 = up, 1 = down, 2 = close.
+fn find_btn(ui: &mut egui::Ui, kind: u8) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+    let col = if resp.hovered() { palette::text_strong() } else { palette::text_dim() };
+    let st = Stroke::new(1.4, col);
+    let c = rect.center();
+    let p = ui.painter();
+    match kind {
+        0 => {
+            p.line(vec![c + Vec2::new(-4.0, 2.0), c + Vec2::new(0.0, -2.0), c + Vec2::new(4.0, 2.0)], st);
+        },
+        1 => {
+            p.line(vec![c + Vec2::new(-4.0, -2.0), c + Vec2::new(0.0, 2.0), c + Vec2::new(4.0, -2.0)], st);
+        },
+        _ => {
+            p.line_segment([c + Vec2::new(-3.5, -3.5), c + Vec2::new(3.5, 3.5)], st);
+            p.line_segment([c + Vec2::new(-3.5, 3.5), c + Vec2::new(3.5, -3.5)], st);
+        },
+    }
+    resp
+}
+
 fn paint_pin(p: &egui::Painter, c: Pos2, filled: bool, col: Color32) {
     let head = Pos2::new(c.x, c.y - 2.0);
     if filled {
