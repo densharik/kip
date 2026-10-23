@@ -1,100 +1,71 @@
 <div align="center">
   <img src="resources/icon_1024.png" width="104" alt="kip">
   <h1>kip</h1>
-  <p>A terminal for running Claude Code sessions side by side.</p>
+  <p><b>Run a dozen Claude Code agents without losing track of any.</b></p>
+  <p>
+    <a href="https://github.com/densharik/kip/releases/latest">Download for macOS / Windows</a>
+    &nbsp;·&nbsp; <a href="#install">Install</a>
+    &nbsp;·&nbsp; <a href="#mcp-claude-drives-kip">MCP</a>
+    &nbsp;·&nbsp; <a href="#faq">FAQ</a>
+  </p>
+  <img src="docs/media/hero.gif" width="880" alt="Several Claude Code sessions working in kip; one finishes and lights up">
 </div>
 
----
+- **See every agent at a glance.** Who is working, who is done and waiting for you, how full each context window is.
+- **Put idle sessions to sleep and get the RAM back.** The conversation is still there; one click brings it back.
+- **Find any past conversation** by what was said in it, across all your projects.
 
-kip is a terminal emulator built around Claude Code sessions. Every session is a
-row in a sidebar with a live context-window percentage. You can put a session to
-sleep to free its memory and resume the same conversation later, and every
-session survives quitting the app.
+kip is a real terminal, not a Claude client: it runs the `claude` CLI on a real
+PTY, so every Claude Code feature and flag works the day it ships, and so do
+`vim`, `ssh` and everything else. One native Rust binary, no Electron.
 
-kip is a terminal, not a Claude client. It runs the real `claude` binary on a
-real PTY, so `htop`, `vim`, `ssh` and everything else work exactly as they do in
-iTerm or Windows Terminal. Single native Rust binary (egui + alacritty_terminal),
-no runtime dependencies, no Electron.
+## At a glance
 
-## Why
+Every session is a row: name, folder, what it is doing, and a context badge
+(green under 50%, yellow to 70%, red above). When an agent finishes in the
+background, its row lights up and you get a system notification. Group sessions
+by dragging one onto another, or switch the list to sort itself by project (git
+root); pin the ones that must not be closed or put to sleep by accident. Your Claude
+subscription limits sit in the corner, the same numbers `/usage` shows.
 
-Run a few agents at once in a normal terminal and you get a wall of tabs: no idea
-which session is which, how close any of them is to filling its context, or which
-one is holding a gigabyte of RAM while it waits for you. Close the terminal and
-they are gone. kip fixes those three things and stays out of the way otherwise.
+## Sleep and wake
 
-## Features
+<img src="docs/media/sleep.gif" width="880" alt="A session is put to sleep, then resumed with its conversation intact">
 
-**Sessions**
+A sleeping session costs nothing: kip kills its whole process tree and keeps the
+screen as text. Resume brings the same conversation back with
+`claude --resume`. Idle sessions fall asleep on their own after 10 minutes (a
+running build never counts as idle), and every session survives quitting kip.
 
-- Each session is a row with its name, working directory, and a status dot:
-  running, idle at a prompt, suspended, or exited with an error.
-- A per-session badge shows context use: green under 50%, yellow 50-70%, red and
-  pulsing above 70%. It appears the moment you resume, before Claude boots.
-- Pin a session: it cannot be closed by a stray click, dragged, or auto-suspended.
-- Group sessions by dragging one onto another. Groups have colored headers,
-  collapse, and persist across restarts.
-- Or switch Settings to "sessions by projects": the list sorts itself by project
-  (git root, else folder), and a session that `cd`s into another project moves
-  there. Your manual groups stay saved for when you switch back.
-- Drag a group or project header to move it; right-click it to give it a color
-  (presets with a live preview, or any color), or to open its folder.
-- "Open" next to the path at the bottom opens the session's folder in Finder /
-  Explorer; the same is in every session's right-click menu.
-- Rename with a double click. Your name wins over the one Claude picked.
-- `Cmd+1`..`Cmd+9` jumps to a session. A pinned session keeps its number.
+## History
 
-**History**
+<img src="docs/media/history.gif" width="880" alt="Searching past Claude conversations across projects">
 
-- `Cmd+Y` (or "History" under the session list) browses every past Claude Code
-  conversation on disk: title, first prompt, folder, branch, age. The list starts
-  with the active session's folder; one click shows all projects.
-- Type to filter by title and folder and to search the conversations themselves
-  (user and Claude text, not tool output); each one gets its hit count. kip
-  keeps just that text in `~/.kip/history-text` (about 1% of what transcripts
-  weigh, refreshed only for changed ones), so a search over 3 GB of history
-  takes a fraction of a second.
-- The preview shows the conversation with matches highlighted; arrows walk them.
-- Enter or "Continue" brings it back: a new tab in its folder running
-  `claude --resume`, or a switch to the tab that already has it open.
+`Cmd+Y` lists every Claude Code conversation on disk. Type to search what you
+and Claude actually said (not tool output), across all projects, in a fraction
+of a second; matches are highlighted in the preview, and Enter continues the
+conversation in a new tab.
 
-**Memory**
+## Let Claude drive
 
-- Suspend a session to free its memory. kip kills the whole process tree and
-  keeps the screen as text; the session comes back with `claude --resume` wired
-  up and its scrollback intact.
-- Idle sessions suspend on their own after N minutes (10 by default, 0 disables
-  it). A Claude prompt sitting there waiting counts as idle; a running `make` or
-  `rsync` does not, so nothing gets killed mid-build.
-- Mark a session "keep awake" to exempt it from the idle timer.
-- Quit kip and every session is still there when you come back - same names,
-  groups, pins, last screen, and Claude conversation id.
+<img src="docs/media/mcp.gif" width="880" alt="Claude puts idle sessions to sleep and opens a new one through kip's MCP server">
 
-**Monitoring**
+kip ships an MCP server, so Claude in any session can open, close, rename,
+sleep and wake sessions, read their screens, and search history when you ask.
+See [MCP](#mcp-claude-drives-kip) for the tool list.
 
-- A resource panel shows RAM and CPU per session, plus kip's own footprint, so
-  you can see which agent to put to sleep.
-- Your Claude subscription limits (5-hour session, weekly, per-model) live in the
-  corner - the same numbers `/usage` shows inside Claude Code. Pin one and its
-  bar stays visible.
-- Git stats for the active session's directory in the status bar.
-- A system notification when an agent finishes, with how long it took.
+## Also
 
-**Terminal**
+<img src="docs/media/themes.png" width="880" alt="kip in six color themes">
 
-- Real PTY. Anything you run in a terminal runs here.
-- `Cmd+F` finds text in the screen and scrollback, case-insensitive; other
-  sessions with hits get an accent mark in the list.
-- `Cmd+Z` undoes the last edit in Claude's prompt (sends its own undo key).
-- File paths in the output are clickable: Open, or reveal in Finder/Explorer.
-- Drag a file in to insert its path; paste a screenshot to insert the path to it.
-- Command bar with history, `Shift+Enter` for a newline, and `cd` that follows.
-- Directory switcher with folder search and folder creation, plus a file explorer
-  panel.
-- Six color themes, an accent picker, nine terminal fonts, UI zoom.
-- macOS: "New kip Window Here" in Finder's Services menu.
-- English and Russian, switchable without a restart.
-- Updates itself from a button in settings. Every release is signed (ed25519) and kip installs only an update whose signature checks out.
+- Themes: One Dark, Dracula, Gruvbox, Solarized, Solarized Light, GitHub Light and more, plus your own accent color.
+- `Cmd+F` searches the screen and scrollback; other sessions with hits get marked in the list.
+- Clickable file paths, drag a file in to insert its path, paste a screenshot to insert a path to it.
+- Several windows; each session can move between them. `Cmd+1`..`Cmd+9` jumps to a session.
+- RAM and CPU per session, git status of the active folder.
+- Command bar with history, directory switcher, file explorer panel; `Cmd+Z` undoes the last edit in Claude's prompt.
+- macOS: "New kip Window Here" in Finder's Services menu. Claude Code mods can draw badges and cards in kip (see [Mods](#mods)).
+- English and Russian. Updates itself; every release is signed and verified before it installs.
 
 ## Install
 
