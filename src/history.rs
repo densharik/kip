@@ -2,7 +2,6 @@
 //! cached in ~/.kip/history.json, a full-text search over them, and the
 //! message list for the preview.
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -31,7 +30,7 @@ impl Entry {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".kip").join("history-1.json"))
+    Some(dirs::home_dir()?.join(".kip").join("history-2.json"))
 }
 
 /// The user's or Claude's text in one transcript line. None for tool calls and
@@ -72,39 +71,56 @@ fn is_tagged(text: &str) -> bool {
     tag.len() < 40 && tag.contains('-') && tag.chars().all(|c| c.is_ascii_lowercase() || c == '-')
 }
 
-/// cwd, branch and first prompt from the head of a transcript.
-fn read_head(path: &Path) -> (PathBuf, String, String) {
-    let mut buf = Vec::new();
-    if let Ok(f) = std::fs::File::open(path) {
-        let _ = f.take(512 * 1024).read_to_end(&mut buf);
-    }
-    let (mut cwd, mut branch, mut first) = (None, String::new(), String::new());
-    for line in String::from_utf8_lossy(&buf).lines() {
-        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+/// Plain conversation text per session, kept next to the index so a search
+/// reads ~1% of what the transcripts weigh (tool output and snapshots are the rest).
+fn text_dir() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".kip").join("history-text"))
+}
+
+/// One pass over a transcript: cwd, branch, first prompt, title, and the
+/// user/Claude text. Only lines that can hold one of those get parsed.
+fn scan(path: &Path) -> (PathBuf, String, String, Option<String>, String) {
+    let (mut cwd, mut branch, mut first, mut text) = (None, String::new(), String::new(), String::new());
+    let (mut custom, mut ai) = (None, None);
+    for_lines(path, |line| {
+        let has = |pat: &[u8]| line.windows(pat.len()).any(|w| w == pat);
+        let talk = has(b"\"type\":\"user\"") || has(b"\"type\":\"assistant\"");
+        let titled = has(b"-title\"");
+        if !talk && !titled && cwd.is_some() {
+            return;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(line) else { return };
         if cwd.is_none() {
             if let Some(c) = v["cwd"].as_str() {
                 cwd = Some(PathBuf::from(c));
                 branch = v["gitBranch"].as_str().unwrap_or_default().to_string();
             }
         }
-        if first.is_empty() {
-            if let Some((true, t)) = msg_text(&v) {
+        match v["type"].as_str() {
+            Some("custom-title") => custom = v["customTitle"].as_str().map(String::from),
+            Some("ai-title") => ai = v["aiTitle"].as_str().map(String::from),
+            _ => {},
+        }
+        if let Some((user, t)) = msg_text(&v) {
+            if user && first.is_empty() {
                 first = t.lines().next().unwrap_or_default().chars().take(200).collect();
             }
+            text.push_str(&t);
+            text.push_str("\n\n");
         }
-        if cwd.is_some() && !first.is_empty() {
-            break;
-        }
-    }
-    (cwd.unwrap_or_default(), branch, first)
+    });
+    let title = custom.or(ai).filter(|t| !t.trim().is_empty());
+    (cwd.unwrap_or_default(), branch, first, title, text)
 }
 
 fn read_entry(sid: String, path: PathBuf, mtime: u64, size: u64) -> Option<Entry> {
-    let (cwd, branch, first) = read_head(&path);
-    let title = crate::session::transcript_title(&path);
+    let (cwd, branch, first, title, text) = scan(&path);
     // A session that never got a prompt is noise in the list.
     if first.is_empty() && title.is_none() {
         return None;
+    }
+    if let Some(dir) = text_dir() {
+        let _ = std::fs::write(dir.join(format!("{sid}.txt")), text);
     }
     Some(Entry { sid, path, cwd, branch, title, first, mtime, size })
 }
@@ -121,12 +137,22 @@ pub fn load_index() -> Vec<Entry> {
         .collect();
     let mut todo = Vec::new();
     let mut out = Vec::new();
+    let texts = text_dir();
+    if let Some(d) = &texts {
+        let _ = std::fs::create_dir_all(d);
+    }
     for (sid, path) in crate::ctx_index::scan_projects() {
         let Ok(meta) = std::fs::metadata(&path) else { continue };
         let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
         let size = meta.len();
         match cached.get(&path) {
-            Some(e) if e.mtime == mtime && e.size == size => out.push(e.clone()),
+            Some(e)
+                if e.mtime == mtime
+                    && e.size == size
+                    && texts.as_ref().is_some_and(|d| d.join(format!("{sid}.txt")).exists()) =>
+            {
+                out.push(e.clone())
+            },
             _ => todo.push((sid, path, mtime, size)),
         }
     }
@@ -148,6 +174,15 @@ pub fn load_index() -> Vec<Entry> {
         }
     });
     out.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    // Text of transcripts that are gone.
+    if let Some(d) = &texts {
+        let keep: std::collections::HashSet<String> = out.iter().map(|e| format!("{}.txt", e.sid)).collect();
+        for f in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            if !keep.contains(f.file_name().to_string_lossy().as_ref()) {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+    }
     if let Some(p) = cache_path() {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -162,37 +197,16 @@ pub fn load_index() -> Vec<Entry> {
     out
 }
 
-/// Case-insensitive literal search for a query: `re` over plain text, `raw`
-/// over transcript lines, where JSON escapes quotes, backslashes and newlines.
-pub struct Matcher {
-    pub re: regex::Regex,
-    raw: regex::bytes::Regex,
+/// Case-insensitive literal matcher for `query`.
+pub fn matcher(query: &str) -> Option<regex::Regex> {
+    regex::RegexBuilder::new(&regex::escape(query)).case_insensitive(true).build().ok()
 }
 
-pub fn matcher(query: &str) -> Option<Matcher> {
-    let re = regex::RegexBuilder::new(&regex::escape(query)).case_insensitive(true).build().ok()?;
-    let json = serde_json::to_string(query).ok()?;
-    let raw = regex::bytes::RegexBuilder::new(&regex::escape(&json[1..json.len() - 1]))
-        .case_insensitive(true)
-        .build()
-        .ok()?;
-    Some(Matcher { re, raw })
-}
-
-/// How many times `query` occurs in the user/Claude text of a transcript.
-/// Only lines whose raw JSON contains it get parsed, so this is mostly a scan.
-pub fn count_hits(path: &Path, m: &Matcher) -> usize {
-    let mut n = 0;
-    for_lines(path, |line| {
-        if !m.raw.is_match(line) {
-            return;
-        }
-        let Ok(v) = serde_json::from_slice::<Value>(line) else { return };
-        if let Some((_, t)) = msg_text(&v) {
-            n += m.re.find_iter(&t).count();
-        }
-    });
-    n
+/// How many times the query occurs in a session's conversation text.
+pub fn count_hits(sid: &str, re: &regex::Regex) -> usize {
+    text_dir()
+        .and_then(|d| std::fs::read_to_string(d.join(format!("{sid}.txt"))).ok())
+        .map_or(0, |t| re.find_iter(&t).count())
 }
 
 /// Each line of a file, one at a time: transcripts run to tens of MB and the
@@ -212,6 +226,10 @@ fn for_lines(path: &Path, mut f: impl FnMut(&[u8])) {
 pub fn messages(path: &Path, max: usize) -> Vec<(bool, String)> {
     let mut out = Vec::new();
     for_lines(path, |l| {
+        let talk = |pat: &[u8]| l.windows(pat.len()).any(|w| w == pat);
+        if !talk(b"\"type\":\"user\"") && !talk(b"\"type\":\"assistant\"") {
+            return;
+        }
         if let Some(m) = serde_json::from_slice::<Value>(l).ok().and_then(|v| msg_text(&v)) {
             out.push(m);
         }
@@ -248,22 +266,24 @@ mod tests {
     }
 
     #[test]
-    fn count_hits_ignores_tool_output_and_case() {
+    fn scan_keeps_conversation_text_and_meta() {
         let dir = std::env::temp_dir().join(format!("kip-hist-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");
         let lines = [
-            json!({"type": "user", "message": {"content": "Найди Деплой"}}),
-            json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "деплой и ДЕПЛОЙ"}]}}),
+            json!({"type": "user", "cwd": "/w", "gitBranch": "dev", "message": {"content": "Найди Деплой"}}),
+            json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "деплой и \"use client\" C:\\work"}]}}),
             json!({"type": "user", "message": {"content": [{"type": "tool_result", "content": "деплой"}]}}),
+            json!({"type": "ai-title", "aiTitle": "Деплой"}),
         ];
         std::fs::write(&p, lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
-        assert_eq!(count_hits(&p, &matcher("деплой").unwrap()), 3);
-        assert_eq!(messages(&p, 1), vec![(false, "деплой и ДЕПЛОЙ".to_string())]);
-        assert_eq!(count_hits(&p, &matcher("a.b").unwrap()), 0);
-        std::fs::write(&p, json!({"type": "user", "message": {"content": "say \"use client\" in C:\\work"}}).to_string()).unwrap();
-        assert_eq!(count_hits(&p, &matcher("\"use client\"").unwrap()), 1);
-        assert_eq!(count_hits(&p, &matcher("c:\\work").unwrap()), 1);
+        let (cwd, branch, first, title, text) = scan(&p);
+        assert_eq!((cwd, branch.as_str(), first.as_str(), title.as_deref()), (PathBuf::from("/w"), "dev", "Найди Деплой", Some("Деплой")));
+        assert_eq!(matcher("деплой").unwrap().find_iter(&text).count(), 2);
+        assert_eq!(matcher("\"use client\"").unwrap().find_iter(&text).count(), 1);
+        assert_eq!(matcher("c:\\work").unwrap().find_iter(&text).count(), 1);
+        assert_eq!(matcher("a.b").unwrap().find_iter(&text).count(), 0);
+        assert_eq!(messages(&p, 1).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -83,14 +83,14 @@ impl App {
                 }
                 let mut hits = 0;
                 if let Some(re) = &re {
-                    let named = re.re.is_match(e.name()) || re.re.is_match(&e.first);
+                    let named = re.is_match(e.name()) || re.is_match(&e.first);
                     if Instant::now() > deadline {
                         partial = true;
                         if !named {
                             continue;
                         }
                     } else {
-                        hits = history::count_hits(&e.path, re);
+                        hits = history::count_hits(&e.sid, re);
                     }
                     if !named && hits == 0 {
                         continue;

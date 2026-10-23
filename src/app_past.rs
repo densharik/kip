@@ -77,7 +77,7 @@ impl App {
                 PastMsg::Progress(g, done) if g == epoch => self.past.done = self.past.done.max(done),
                 PastMsg::Preview(sid, msgs) => {
                     if self.past.sel.as_deref() == Some(sid.as_str()) {
-                        let re = history::matcher(&self.past.query).filter(|_| !self.past.query.is_empty()).map(|m| m.re);
+                        let re = history::matcher(&self.past.query).filter(|_| !self.past.query.is_empty());
                         self.past.jump = match &re {
                             Some(re) => msgs.iter().rposition(|(_, t)| re.is_match(t)),
                             None => None,
@@ -161,7 +161,7 @@ impl App {
                         if i >= files.len() || cancel.load(Ordering::Relaxed) != epoch {
                             return;
                         }
-                        let n = history::count_hits(&files[i].1, &re);
+                        let n = history::count_hits(&files[i].0, &re);
                         if n > 0 {
                             let _ = tx.send(PastMsg::Hit(epoch, files[i].0.clone(), n));
                         }
@@ -431,7 +431,7 @@ impl App {
             );
             return;
         };
-        let re = history::matcher(&q).filter(|_| !q.is_empty()).map(|m| m.re);
+        let re = history::matcher(&q).filter(|_| !q.is_empty());
         let msgs: &[(bool, String)] = match &self.past.preview {
             Some((sid, m)) if *sid == e.sid => m,
             _ => &[],

@@ -42,9 +42,11 @@ they are gone. kip fixes those three things and stays out of the way otherwise.
 - `Cmd+Y` (or "History" under the session list) browses every past Claude Code
   conversation on disk: title, first prompt, folder, branch, age. The list starts
   with the active session's folder; one click shows all projects.
-- Type to filter by title and folder at once, while a background search reads
-  the conversations themselves (user and Claude text, not tool output) and marks
-  each one with its hit count. About 2 seconds for 3 GB of transcripts.
+- Type to filter by title and folder and to search the conversations themselves
+  (user and Claude text, not tool output); each one gets its hit count. kip
+  keeps just that text in `~/.kip/history-text` (about 1% of what transcripts
+  weigh, refreshed only for changed ones), so a search over 3 GB of history
+  takes a fraction of a second.
 - The preview shows the conversation with matches highlighted; arrows walk them.
 - Enter or "Continue" brings it back: a new tab in its folder running
   `claude --resume`, or a switch to the tab that already has it open.
