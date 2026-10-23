@@ -392,6 +392,9 @@ struct Win {
     builder: Option<egui::ViewportBuilder>,
     /// Sessions were handed over from another window: restore display order.
     renorm: bool,
+    /// Title last given to the window: the active session's name, which is
+    /// what the Dock menu and the Window menu list it by.
+    title: String,
     /// Folder to open a terminal in on the window's next pass (a new window).
     pending_spawn: Option<PathBuf>,
     closing: bool,
@@ -410,6 +413,7 @@ impl Win {
             open_size: None,
             builder: None,
             renorm: false,
+            title: String::new(),
             pending_spawn: None,
             closing: false,
             drawn: false,
@@ -698,6 +702,7 @@ impl App {
         {
             mac_service::register(cc.egui_ctx.clone());
             mac_service::hook_paste();
+            mac_service::window_menu();
         }
         app
     }
@@ -756,6 +761,14 @@ impl App {
             self.wins[k].pos = pos;
             self.wins[k].size = size;
             self.geom_at = Some(Instant::now());
+        }
+        let title = match self.active_idx() {
+            Some(i) => format!("{} - kip", self.sessions[i].display_name()),
+            None => "kip".to_string(),
+        };
+        if self.wins[k].title != title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.wins[k].title = title;
         }
         if k > 0 && ctx.input(|i| i.viewport().close_requested()) {
             self.wins[k].closing = true;
@@ -5324,7 +5337,8 @@ impl eframe::App for App {
                     None => b,
                 }
             });
-            let b = b.clone().with_title(format!("kip {}", k + 1));
+            let title = if w.title.is_empty() { format!("kip {}", k + 1) } else { w.title.clone() };
+            let b = b.clone().with_title(title);
             let vid = w.viewport();
             ctx.show_viewport_immediate(vid, b, |ui, _| self.window_pass(k, ui));
             k += 1;

@@ -19,8 +19,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{define_class, msg_send, AnyThread, MainThreadMarker};
 use objc2_app_kit::{
-    NSApplication, NSEvent, NSEventMask, NSEventModifierFlags, NSPasteboard, NSPasteboardType,
-    NSPasteboardTypeString, NSUpdateDynamicServices,
+    NSApplication, NSEvent, NSEventMask, NSEventModifierFlags, NSMenu, NSMenuItem, NSPasteboard,
+    NSPasteboardType, NSPasteboardTypeString, NSUpdateDynamicServices,
 };
 use objc2_foundation::NSString;
 
@@ -121,6 +121,37 @@ pub fn register(ctx: egui::Context) {
     std::mem::forget(provider);
     // Pick up the Info.plist NSServices entry now instead of after a relogin.
     NSUpdateDynamicServices();
+}
+
+/// Add the standard Window menu. AppKit lists every open window in it and,
+/// from it, in the Dock icon's right-click menu; winit's default menu bar has
+/// no Window menu, so the Dock showed none of kip's windows. Main thread, once,
+/// after launch (winit builds the menu bar while launching).
+pub fn window_menu() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(bar) = app.mainMenu() else {
+        return;
+    };
+    let title = NSString::from_str(crate::i18n::tr("Окно", "Window"));
+    let menu = NSMenu::initWithTitle(mtm.alloc(), &title);
+    let item = |name: &str, action, key: &str| unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc(),
+            &NSString::from_str(name),
+            Some(action),
+            &NSString::from_str(key),
+        )
+    };
+    menu.addItem(&item(crate::i18n::tr("Свернуть", "Minimize"), objc2::sel!(performMiniaturize:), "m"));
+    menu.addItem(&item(crate::i18n::tr("Масштаб", "Zoom"), objc2::sel!(performZoom:), ""));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let top = NSMenuItem::new(mtm);
+    top.setSubmenu(Some(&menu));
+    bar.addItem(&top);
+    app.setWindowsMenu(Some(&menu));
 }
 
 /// Cmd+V seen since the last `take_paste`.

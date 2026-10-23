@@ -21,7 +21,7 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
 # Only the classes the Finder Services provider and the Cmd+V monitor touch; the
 # default feature set drags in Metal/CoreImage/etc. and bloats build time.
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSPasteboard", "NSEvent", "block2"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSPasteboard", "NSEvent", "NSMenu", "NSMenuItem", "block2"] }
 block2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
