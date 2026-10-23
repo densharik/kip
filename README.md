@@ -99,7 +99,7 @@ they are gone. kip fixes those three things and stays out of the way otherwise.
 - Six color themes, an accent picker, nine terminal fonts, UI zoom.
 - macOS: "New kip Window Here" in Finder's Services menu.
 - English and Russian, switchable without a restart.
-- Updates itself from a button in settings.
+- Updates itself from a button in settings. Every release is signed (ed25519) and kip installs only an update whose signature checks out.
 
 ## Install
 

@@ -4,7 +4,8 @@
 //! replaces the .app bundle in place (no password) and, when the app's folder
 //! is not writable, falls back to a single-password `osascript` swap that
 //! copies the already-downloaded bundle into place as root. Both relaunch on
-//! success.
+//! success. Nothing is installed unless its `.sig` asset verifies against
+//! SIGN_KEY: release.yml signs every asset with the key in the KIP_SIGN_KEY secret.
 
 use std::path::Path;
 use std::process::Command;
@@ -14,6 +15,12 @@ use crate::i18n::tr;
 
 const LATEST_API: &str = "https://api.github.com/repos/densharik/kip/releases/latest";
 const RELEASES_URL: &str = "https://github.com/densharik/kip/releases/latest";
+
+/// Raw ed25519 public key of the release signing key.
+const SIGN_KEY: [u8; 32] = [
+    0xa0, 0x01, 0x69, 0xef, 0xb6, 0xbb, 0x8a, 0x97, 0x79, 0x75, 0x6d, 0x6b, 0xe7, 0x1b, 0x09, 0xc3, 0xa1, 0xd1, 0x64, 0x35,
+    0xca, 0x9b, 0x66, 0xd3, 0xa0, 0xcd, 0x3a, 0xb3, 0x29, 0x7b, 0x95, 0x82,
+];
 
 #[cfg(windows)]
 const ASSET_NAME: &str = "kip.exe";
@@ -46,6 +53,7 @@ fn parse_ver(s: &str) -> (u32, u32, u32) {
 pub struct Release {
     pub display: String,
     pub asset_url: String,
+    pub sig_url: String,
 }
 
 pub enum UpdateMsg {
@@ -91,8 +99,10 @@ fn do_check() -> Result<Option<Release>, String> {
             .map(str::to_string)
     };
     let asset_url = find(ASSET_NAME).ok_or_else(|| format!("{} {tag} {} {ASSET_NAME}", tr("в релизе", "release"), tr("нет", "has no")))?;
+    let sig_url = find(&format!("{ASSET_NAME}.sig"))
+        .ok_or_else(|| format!("{} {tag} {}", tr("релиз", "release"), tr("не подписан", "is not signed")))?;
     let display = tag.trim_start_matches('v').to_string();
-    Ok(Some(Release { display, asset_url }))
+    Ok(Some(Release { display, asset_url, sig_url }))
 }
 
 pub fn check(tx: Sender<UpdateMsg>, egui: egui::Context) {
@@ -104,9 +114,37 @@ pub fn check(tx: Sender<UpdateMsg>, egui: egui::Context) {
     });
 }
 
+/// The signed message is "kip <version> <asset>\n" + the file, so an older
+/// signed file cannot pass for a newer release (see release.yml).
+fn verify(version: &str, data: &[u8], sig: &[u8]) -> bool {
+    let Ok(sig) = <[u8; 64]>::try_from(sig) else { return false };
+    let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(&SIGN_KEY) else { return false };
+    let mut msg = format!("kip {version} {ASSET_NAME}\n").into_bytes();
+    msg.extend_from_slice(data);
+    key.verify_strict(&msg, &ed25519_dalek::Signature::from_bytes(&sig)).is_ok()
+}
+
+/// Download the asset and check its signature; the file is removed unless it verifies.
+fn download_signed(rel: &Release, dest: &Path) -> Result<(), String> {
+    download(&rel.asset_url, dest)?;
+    let sig = Command::new("curl")
+        .args(["-fsL", "--max-time", "60"])
+        .arg(&rel.sig_url)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .ok_or_else(|| tr("скачивание не удалось", "download failed").to_string())?
+        .stdout;
+    if !std::fs::read(dest).is_ok_and(|d| verify(&rel.display, &d, &sig)) {
+        let _ = std::fs::remove_file(dest);
+        return Err(tr("подпись обновления не сходится - не устанавливаю", "update signature does not match - not installing").into());
+    }
+    Ok(())
+}
+
 fn download(url: &str, dest: &Path) -> Result<(), String> {
     let out = Command::new("curl")
-        .args(["-sL", "--max-time", "600", "-o"])
+        .args(["-fsL", "--max-time", "600", "-o"])
         .arg(dest)
         .arg(url)
         .output()
@@ -114,8 +152,7 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
     if !out.status.success() {
         return Err(tr("скачивание не удалось", "download failed").into());
     }
-    let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
-    if size < 100_000 {
+    if std::fs::metadata(dest).map_or(0, |m| m.len()) < 100_000 {
         return Err(tr("скачанный файл повреждён", "downloaded file is corrupt").into());
     }
     Ok(())
@@ -126,7 +163,7 @@ fn do_apply(rel: &Release) -> Result<(), String> {
     let cur = std::env::current_exe().map_err(|e| format!("{}: {e}", tr("нет пути к exe", "no path to exe")))?;
     let dir = cur.parent().ok_or(tr("нет каталога exe", "no exe directory"))?;
     let new = dir.join("kip.update.exe");
-    download(&rel.asset_url, &new)?;
+    download_signed(rel, &new)?;
     let old = dir.join("kip.old.exe");
     let _ = std::fs::remove_file(&old);
     std::fs::rename(&cur, &old).map_err(|e| format!("{}: {e}", tr("нет прав на замену", "no permission to replace")))?;
@@ -174,7 +211,7 @@ fn fetch_bundle(rel: &Release) -> Result<(std::path::PathBuf, std::path::PathBuf
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| format!("temp: {e}"))?;
     let zip = tmp.join("kip.zip");
-    if let Err(e) = download(&rel.asset_url, &zip) {
+    if let Err(e) = download_signed(rel, &zip) {
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(e);
     }
@@ -386,5 +423,11 @@ mod tests {
         assert!(parse_ver("0.1.17") == parse_ver("v0.1.17"));
         assert!(parse_ver("v0.2.0") > parse_ver("v0.1.99"));
         assert!(parse_ver("v0.1.5") <= parse_ver("0.1.5"));
+    }
+
+    #[test]
+    fn rejects_bad_signature() {
+        assert!(!verify("0.1.1", b"kip", &[0u8; 64]));
+        assert!(!verify("0.1.1", b"kip", b"short"));
     }
 }

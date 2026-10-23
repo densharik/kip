@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 alacritty_terminal = "0.26.0"
 dirs = "6.0.0"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 eframe = "=0.35.0" # pinned: vendor/eframe patches this exact version, see [patch.crates-io]
 egui = "0.35.0"
 regex = "1"

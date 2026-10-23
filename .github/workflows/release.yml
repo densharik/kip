@@ -146,6 +146,24 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+      - name: Sign assets for the in-app updater
+        env:
+          KIP_SIGN_KEY: ${{ secrets.KIP_SIGN_KEY }}
+        run: |
+          test -n "$KIP_SIGN_KEY"
+          umask 077
+          printf '%s\n' "$KIP_SIGN_KEY" > "$RUNNER_TEMP/key.pem"
+          # Must be the key whose public half is SIGN_KEY in src/update.rs,
+          # or no installed kip would accept this release.
+          pub=$(openssl pkey -in "$RUNNER_TEMP/key.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d " \n")
+          test "$pub" = a00169efb6bb8a9779756d6be71b09c3a1d16435ca9b66d3a0cd3ab3297b9582
+          # Signed message: "kip <version> <asset>\n" + file (see verify in update.rs).
+          for f in artifacts/kip-windows/kip.exe artifacts/kip-macos/kip-macos.zip; do
+            { printf 'kip %s %s\n' "${{ needs.meta.outputs.version }}" "$(basename "$f")"; cat "$f"; } > "$RUNNER_TEMP/msg"
+            openssl pkeyutl -sign -inkey "$RUNNER_TEMP/key.pem" -rawin -in "$RUNNER_TEMP/msg" -out "$f.sig"
+            test "$(wc -c < "$f.sig")" -eq 64
+          done
+          rm "$RUNNER_TEMP/key.pem" "$RUNNER_TEMP/msg"
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -154,6 +172,8 @@ jobs:
           target_commitish: ${{ github.sha }}
           files: |
             artifacts/kip-windows/kip.exe
+            artifacts/kip-windows/kip.exe.sig
             artifacts/kip-macos/kip-macos.zip
+            artifacts/kip-macos/kip-macos.zip.sig
             artifacts/kip-macos/kip-installer.pkg
           generate_release_notes: true
