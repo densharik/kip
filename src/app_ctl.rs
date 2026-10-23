@@ -145,6 +145,7 @@ impl App {
             "claude_title": s.claude_title,
             "cwd": s.cwd,
             "group": s.group,
+            "project": project_path(s),
             "state": state,
             "busy": s.busy,
             "done": s.done,
@@ -161,7 +162,14 @@ impl App {
     fn ctl(&mut self, op: &str, args: &Value, ctx: &egui::Context) -> Result<Value, String> {
         match op {
             "ping" => Ok(json!({"version": env!("CARGO_PKG_VERSION")})),
-            "list_sessions" => Ok(Value::Array(self.sessions.iter().map(|s| self.session_json(s)).collect())),
+            // In the order the sidebar draws them.
+            "list_sessions" => Ok(Value::Array(
+                self.sidebar_order()
+                    .into_iter()
+                    .filter_map(|slot| if let Slot::Row(id) = slot { self.idx_of(id) } else { None })
+                    .map(|i| self.session_json(&self.sessions[i]))
+                    .collect(),
+            )),
             "list_windows" => Ok(Value::Array(
                 self.wins
                     .iter()

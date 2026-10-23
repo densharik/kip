@@ -507,6 +507,10 @@ struct App {
     past: Past,
     past_tx: Sender<PastMsg>,
     past_rx: Receiver<PastMsg>,
+    /// Project roots worked out in the background: (session, cwd, root).
+    proj_tx: Sender<(u64, PathBuf, PathBuf)>,
+    proj_rx: Receiver<(u64, PathBuf, PathBuf)>,
+    proj_seq: u64,
 }
 
 impl App {
@@ -531,6 +535,7 @@ impl App {
         ctl::start(ctl_tx, cc.egui_ctx.clone());
         let (mcp_tx, mcp_rx) = mpsc::channel();
         let (past_tx, past_rx) = mpsc::channel();
+        let (proj_tx, proj_rx) = mpsc::channel();
         if !state.settings.mcp_offer_off {
             let (tx, ctx) = (mcp_tx.clone(), cc.egui_ctx.clone());
             std::thread::spawn(move || {
@@ -631,6 +636,9 @@ impl App {
             past: Past::default(),
             past_tx,
             past_rx,
+            proj_tx,
+            proj_rx,
+            proj_seq: 0,
         };
         for mut saved in state.sessions {
             if !app.wins.iter().any(|w| w.id == saved.window) {
@@ -908,7 +916,8 @@ impl App {
     fn save_now(&self) {
         self.dirty.set(false);
         // Only keep collapse state for groups that still exist.
-        let live: HashSet<&String> = self.sessions.iter().filter_map(|s| s.group.as_ref()).collect();
+        let mut live: HashSet<String> = self.sessions.iter().filter_map(|s| s.group.clone()).collect();
+        live.extend(self.sessions.iter().map(project_fold));
         let used: HashSet<u64> = self.sessions.iter().map(|s| s.window).collect();
         save_state(&AppState {
             settings: self.settings.clone(),
@@ -916,7 +925,7 @@ impl App {
             collapsed_groups: self
                 .collapsed_groups
                 .iter()
-                .filter(|g| live.contains(g))
+                .filter(|g| live.contains(*g))
                 .cloned()
                 .collect(),
             windows: self
@@ -2144,6 +2153,12 @@ impl App {
         let active = self.w.active;
         let mut open_find = false;
         let mut past = false;
+        // Numbers follow the rows as drawn (projects mode draws its own order).
+        let rows: Vec<u64> = self
+            .sidebar_order()
+            .into_iter()
+            .filter_map(|s| if let Slot::Row(id) = s { Some(id) } else { None })
+            .collect();
         ctx.input_mut(|i| {
             // Ctrl+Y is readline's yank off macOS.
             past = if cfg!(target_os = "macos") {
@@ -2183,8 +2198,8 @@ impl App {
             .enumerate()
             {
                 if consume_cmd(i, *key) {
-                    if let Some(s) = self.sessions.get(n) {
-                        acts.push(Act::Select(s.id));
+                    if let Some(id) = rows.get(n) {
+                        acts.push(Act::Select(*id));
                     }
                 }
             }
@@ -2382,8 +2397,10 @@ impl App {
         // then stops being drawn, so nothing commits or cancels it, and a stuck
         // renaming* flag freezes terminal input (accept/interactive gate on it).
         // Commit the orphan so input never dead-ends and the edit is not lost.
+        let by_project = self.settings.group_by_project;
         let orphan = self.w.renaming.is_some_and(|id| match self.idx_of(id) {
             None => true,
+            Some(i) if by_project => self.collapsed_groups.contains(&project_fold(&self.sessions[i])),
             Some(i) => self.sessions[i]
                 .group
                 .as_deref()
@@ -2458,6 +2475,11 @@ impl App {
             };
             for slot in self.sidebar_order() {
                 match slot {
+                    Slot::Header(name) if self.settings.group_by_project => {
+                        let collapsed = self.collapsed_groups.contains(&format!("project:{name}"));
+                        let rect = self.project_header(ui, &name, collapsed, &mut acts);
+                        rule(ui, rect, &mut first);
+                    },
                     Slot::Header(name) => {
                         let collapsed = self.collapsed_groups.contains(&name);
                         let (rect, rel) = self.group_header(ui, &name, collapsed, &mut acts);
@@ -2467,7 +2489,11 @@ impl App {
                     },
                     Slot::Row(id) => {
                         let idx = self.idx_of(id).unwrap();
-                        let group = self.sessions[idx].group.clone();
+                        let group = if self.settings.group_by_project {
+                            Some(project_fold(&self.sessions[idx]))
+                        } else {
+                            self.sessions[idx].group.clone()
+                        };
                         // Hide members of a collapsed group (header still shows).
                         if group.as_ref().is_some_and(|g| self.collapsed_groups.contains(g)) {
                             continue;
@@ -2475,6 +2501,11 @@ impl App {
                         // Members sit indented under their header.
                         let indent = if group.is_some() { 14.0 } else { 0.0 };
                         let (rect, rel) = self.session_row(ui, idx, indent, &mut acts);
+                        if self.settings.group_by_project {
+                            // A thin guide down the project's rows instead of a band.
+                            let x = rect.min.x + 9.0;
+                            ui.painter().vline(x, rect.y_range(), Stroke::new(1.0, palette::border()));
+                        }
                         rule(ui, rect, &mut first);
                         released |= rel;
                         items.push(DropItem { rect, id: Some(id), group, is_header: false });
@@ -2684,9 +2715,59 @@ impl App {
         Vec::new()
     }
 
+    /// Keep each session's project in step with its folder. In project mode a
+    /// session whose folder moved it to another project goes to that project's end.
+    fn sync_projects(&mut self) {
+        while let Ok((id, cwd, root)) = self.proj_rx.try_recv() {
+            let Some(s) = self.sessions.iter_mut().find(|s| s.id == id && s.cwd == cwd) else { continue };
+            if s.project.as_ref().is_some_and(|(_, old)| *old != root) {
+                self.proj_seq += 1;
+                s.proj_seq = self.proj_seq;
+            }
+            s.project = Some((cwd, root));
+        }
+        for s in &mut self.sessions {
+            let known = s.project.as_ref().is_some_and(|(cwd, _)| *cwd == s.cwd);
+            if known || s.proj_asked.as_ref() == Some(&s.cwd) {
+                continue;
+            }
+            s.proj_asked = Some(s.cwd.clone());
+            let (tx, id, cwd) = (self.proj_tx.clone(), s.id, s.cwd.clone());
+            std::thread::spawn(move || {
+                let root = project_root(&cwd);
+                let _ = tx.send((id, cwd, root));
+            });
+        }
+    }
+
     /// Sidebar display order: ungrouped rows first, then each group (header +
     /// its members) in first-appearance order.
     fn sidebar_order(&self) -> Vec<Slot> {
+        if !self.settings.group_by_project {
+            return self.group_order();
+        }
+        // Projects in first-appearance order; a row that changed project last
+        // sorts last in it. Only draws differently: the vec keeps the manual
+        // group order, so switching back finds it untouched.
+        let mut out = Vec::new();
+        let mut seen: Vec<&std::path::Path> = Vec::new();
+        for s in &self.sessions {
+            let p = project_path(s);
+            if seen.contains(&p) {
+                continue;
+            }
+            seen.push(p);
+            out.push(Slot::Header(p.to_string_lossy().into_owned()));
+            let mut members: Vec<(usize, &Session)> =
+                self.sessions.iter().enumerate().filter(|(_, m)| project_path(m) == p).collect();
+            members.sort_by_key(|(i, m)| (m.proj_seq, *i));
+            out.extend(members.into_iter().map(|(_, m)| Slot::Row(m.id)));
+        }
+        out
+    }
+
+    /// Manual-group order: ungrouped rows first, then each group's members.
+    fn group_order(&self) -> Vec<Slot> {
         let mut out = Vec::new();
         for s in &self.sessions {
             if s.group.is_none() {
@@ -2717,12 +2798,55 @@ impl App {
     /// change (and once on load) to keep that invariant.
     fn normalize_order(&mut self) {
         let order: Vec<u64> = self
-            .sidebar_order()
+            .group_order()
             .into_iter()
             .filter_map(|s| if let Slot::Row(id) = s { Some(id) } else { None })
             .collect();
         self.sessions
             .sort_by_key(|s| order.iter().position(|&id| id == s.id).unwrap_or(usize::MAX));
+    }
+
+    /// A project header: folder name, its parent path faint beside it, a rule
+    /// out to the count. Lighter than a group's band. Click folds it.
+    fn project_header(&mut self, ui: &mut egui::Ui, key: &str, collapsed: bool, acts: &mut Vec<Act>) -> Rect {
+        let count = self.sessions.iter().filter(|s| project_path(s) == std::path::Path::new(key)).count();
+        ui.add_space(6.0);
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::click());
+        if !ui.is_rect_visible(rect) {
+            return rect;
+        }
+        let path = std::path::Path::new(key);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| key.to_string());
+        let parent = path.parent().map(tilde).unwrap_or_default();
+        let hovered = resp.hovered();
+        let p = ui.painter();
+        draw_caret(p, Pos2::new(rect.min.x + 9.0, rect.center().y), collapsed, palette::accent_bar());
+        let g = p.layout_no_wrap(
+            truncate_end(&name, 22),
+            FontId::proportional(12.0),
+            if hovered { palette::text_strong() } else { palette::text() },
+        );
+        let name_x = rect.min.x + 18.0;
+        let name_w = g.size().x;
+        p.galley(Pos2::new(name_x, rect.center().y - g.size().y / 2.0), g, palette::text());
+        let count_g = p.layout_no_wrap(count.to_string(), FontId::proportional(10.0), palette::text_faint());
+        let count_x = rect.max.x - 12.0 - count_g.size().x;
+        let room = ((count_x - name_x - name_w - 20.0) / 5.6).max(0.0) as usize;
+        let mut end = name_x + name_w + 6.0;
+        if room > 4 && !parent.is_empty() {
+            let pg = p.layout_no_wrap(truncate_head(&parent, room), FontId::proportional(10.0), palette::text_faint());
+            end += pg.size().x + 6.0;
+            p.galley(Pos2::new(name_x + name_w + 6.0, rect.center().y - pg.size().y / 2.0), pg, palette::text_faint());
+        }
+        if count_x - 6.0 > end {
+            p.hline(egui::Rangef::new(end, count_x - 6.0), rect.center().y, Stroke::new(1.0, palette::border_dim()));
+        }
+        p.galley(Pos2::new(count_x, rect.center().y - count_g.size().y / 2.0), count_g, palette::text_faint());
+        if resp.clicked() {
+            acts.push(Act::ToggleGroup(format!("project:{key}")));
+        }
+        resp.on_hover_text(tilde(path));
+        rect
     }
 
     /// A group header: colored band, collapse triangle, name, member count.
@@ -3145,6 +3269,7 @@ impl App {
                 (w.id, name)
             })
             .collect();
+        let by_project = self.settings.group_by_project;
         resp.context_menu(|ui| {
             if ui.button(tr("Переименовать", "Rename")).clicked() {
                 acts.push(Act::BeginRename(sid));
@@ -3159,7 +3284,7 @@ impl App {
                 acts.push(Act::TogglePin(sid));
                 ui.close();
             }
-            ui.menu_button(tr("В группу", "Move to group"), |ui| {
+            ui.add_enabled_ui(!by_project, |ui| ui.menu_button(tr("В группу", "Move to group"), |ui| {
                 for g in &all_groups {
                     if cur_group.as_deref() != Some(g.as_str())
                         && ui.button(truncate_end(g, 24)).clicked()
@@ -3179,7 +3304,7 @@ impl App {
                     acts.push(Act::MoveSession { id: sid, group: None, before: None });
                     ui.close();
                 }
-            });
+            }));
             ui.menu_button(tr("В окно", "Move to window"), |ui| {
                 for (wid, name) in &other_wins {
                     if ui.button(name).clicked() {
@@ -3257,7 +3382,8 @@ impl App {
                 acts.push(Act::RenameCommit(id));
             }
         }
-        if drag_started {
+        // Projects follow the folder, so there is nothing to drag a session into.
+        if drag_started && !self.settings.group_by_project {
             if pinned {
                 self.w.pin_shake = Some((id, Instant::now()));
             } else {
@@ -4788,6 +4914,16 @@ impl App {
                     &mut self.settings.row_separators,
                     tr("Разделять сессии линией", "Separator line between sessions"),
                 );
+                ui.horizontal(|ui| {
+                    ui.label(tr("Сессии по", "Sessions by"));
+                    ui.selectable_value(&mut self.settings.group_by_project, false, tr("группам", "groups"))
+                        .on_hover_text(tr("Свои группы, перетаскиванием", "Your own groups, by dragging"));
+                    ui.selectable_value(&mut self.settings.group_by_project, true, tr("проектам", "projects"))
+                        .on_hover_text(tr(
+                            "Сами по папке проекта (корень git или папка). Сменил папку - сессия переехала. Ручные группы сохраняются.",
+                            "Automatic, by project folder (git root or folder). Change folder and the session moves. Manual groups are kept.",
+                        ));
+                });
                 ui.checkbox(
                     &mut self.settings.skip_permissions_default,
                     tr(
@@ -4978,6 +5114,7 @@ impl eframe::App for App {
         self.housekeeping(&ctx);
         self.drain_ctl(&ctx);
         self.drain_past(&ctx);
+        self.sync_projects();
 
         // Adopt zoom changed via Cmd+= / Cmd+- (egui built-in); while the
         // settings window is open the slider owns the value instead.
@@ -5470,6 +5607,29 @@ fn consume_mods(i: &mut egui::InputState, mods: Modifiers, target: Key) -> bool 
     hit
 }
 
+/// The project a folder belongs to: the nearest git root above it (but not
+/// the home folder itself, which is often a dotfiles repo), else the folder.
+fn project_root(cwd: &std::path::Path) -> PathBuf {
+    let home = dirs::home_dir();
+    cwd.ancestors()
+        .take_while(|a| Some(*a) != home.as_deref())
+        .find(|a| a.join(".git").exists())
+        .unwrap_or(cwd)
+        .to_path_buf()
+}
+
+fn project_path(s: &Session) -> &std::path::Path {
+    match &s.project {
+        Some((_, root)) => root,
+        None => &s.cwd,
+    }
+}
+
+/// Collapse key of a session's project; prefixed so it never meets a manual group name.
+fn project_fold(s: &Session) -> String {
+    format!("project:{}", project_path(s).display())
+}
+
 fn tilde(path: &std::path::Path) -> String {
     let p = path.to_string_lossy();
     if let Some(home) = dirs::home_dir() {
@@ -5798,5 +5958,22 @@ mod explorer_tests {
         assert_eq!(truncate_head("abcdefgh", 5), "...gh");
         assert_eq!(truncate_end("abc", 8), "abc");
         assert_eq!(truncate_end("привет", 5), "пр...");
+    }
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::project_root;
+
+    #[test]
+    fn project_is_the_git_root_or_the_folder() {
+        let base = std::env::temp_dir().join(format!("kip-proj-{}", std::process::id()));
+        let deep = base.join("repo/src/ui");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(base.join("repo/.git")).unwrap();
+        std::fs::create_dir_all(base.join("loose/x")).unwrap();
+        assert_eq!(project_root(&deep), base.join("repo"));
+        assert_eq!(project_root(&base.join("loose/x")), base.join("loose/x"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

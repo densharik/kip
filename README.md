@@ -34,6 +34,9 @@ they are gone. kip fixes those three things and stays out of the way otherwise.
 - Pin a session: it cannot be closed by a stray click, dragged, or auto-suspended.
 - Group sessions by dragging one onto another. Groups have colored headers,
   collapse, and persist across restarts.
+- Or switch Settings to "sessions by projects": the list sorts itself by project
+  (git root, else folder), and a session that `cd`s into another project moves
+  there. Your manual groups stay saved for when you switch back.
 - Rename with a double click. Your name wins over the one Claude picked.
 - `Cmd+1`..`Cmd+9` jumps to a session. A pinned session keeps its number.
 

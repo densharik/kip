@@ -125,6 +125,13 @@ pub struct Session {
     /// Ctrl+F matches in this terminal (grid points) and the one jumped to.
     pub find_hits: Vec<alacritty_terminal::term::search::Match>,
     pub find_cur: Option<usize>,
+    /// (cwd, project root) last worked out for it; see `project_root`. The
+    /// lookup stats folders, so it runs off the UI thread: `proj_asked` is the
+    /// cwd a lookup is out for, `proj_seq` sorts a row that changed project
+    /// after the ones already there.
+    pub project: Option<(PathBuf, PathBuf)>,
+    pub proj_asked: Option<PathBuf>,
+    pub proj_seq: u64,
     /// Auto-repeat streak of a held Backspace (drives word-wise erase).
     pub bs_repeat: u8,
     /// Name of the PTY foreground process while busy (e.g. "claude").
@@ -297,6 +304,9 @@ impl Session {
             sel_keep: None,
             find_hits: Vec::new(),
             find_cur: None,
+            project: None,
+            proj_asked: None,
+            proj_seq: 0,
             bs_repeat: 0,
             fg_name: None,
             fg_is_claude: false,

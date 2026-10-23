@@ -14,7 +14,7 @@ To summarize a session, read_transcript it and summarize the text yourself.";
 fn tools() -> Value {
     let id = json!({"type": "integer", "description": "kip session id (from list_sessions)"});
     json!([
-        {"name": "list_sessions", "description": "All kip sessions: id, window, name, folder, group, state (live/suspended/exited), busy, pinned, Claude session id, context %, idle time.",
+        {"name": "list_sessions", "description": "All kip sessions: id, window, name, folder, group, project, state (live/suspended/exited), busy, pinned, Claude session id, context %, idle time.",
          "inputSchema": {"type": "object", "properties": {}}},
         {"name": "list_windows", "description": "Open kip windows with their active session and session count.",
          "inputSchema": {"type": "object", "properties": {}}},
@@ -62,7 +62,7 @@ fn tools() -> Value {
             "limit": {"type": "integer", "description": "Default 20"}}}},
         {"name": "send_input", "description": "Type text into a live session (Enter appended by default). Off unless enabled in kip settings.",
          "inputSchema": {"type": "object", "properties": {"id": id, "text": {"type": "string"}, "enter": {"type": "boolean"}}, "required": ["id", "text"]}},
-        {"name": "get_settings", "description": "All kip settings (font, theme, notifications, finished-session glow, idle suspend...).",
+        {"name": "get_settings", "description": "All kip settings (font, theme, notifications, finished-session glow, idle suspend, group_by_project...).",
          "inputSchema": {"type": "object", "properties": {}}},
         {"name": "set_settings", "description": "Change kip settings: pass only the keys to change, names and value types as get_settings returns them.",
          "inputSchema": {"type": "object", "additionalProperties": true}},
