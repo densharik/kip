@@ -79,9 +79,30 @@ pub struct SharedState {
     viewport_from_window: HashMap<WindowId, ViewportId>,
     focused_viewport: Option<ViewportId>,
     resized_viewport: Option<ViewportId>,
+    /// kip patch: texture changes (new font glyphs) made by a pass whose window
+    /// was hidden or minimized, so nothing was painted. They used to be
+    /// dropped, leaving holes in the GPU font texture: letters vanished from
+    /// text drawn later. Uploaded with the next paint instead.
+    pending_textures: egui::TexturesDelta,
 }
 
 pub type Viewports = egui::OrderedViewportIdMap<Viewport>;
+
+/// kip patch: add a pass's texture changes to SharedState::pending_textures.
+/// A full image replaces whatever was queued for that texture, and a freed
+/// texture drops its queued uploads, so the queue stays small while hidden.
+fn queue_textures(pending: &mut egui::TexturesDelta, new: egui::TexturesDelta) {
+    for (id, delta) in new.set {
+        if delta.pos.is_none() {
+            pending.set.retain(|(i, _)| *i != id);
+        }
+        pending.set.push((id, delta));
+    }
+    for id in new.free {
+        pending.set.retain(|(i, _)| *i != id);
+        pending.free.push(id);
+    }
+}
 
 pub struct Viewport {
     ids: ViewportIdPair,
@@ -338,6 +359,7 @@ impl<'app> WgpuWinitApp<'app> {
             painter,
             focused_viewport: Some(ViewportId::ROOT),
             resized_viewport: None,
+            pending_textures: Default::default(),
         }));
 
         {
@@ -694,6 +716,7 @@ impl WgpuWinitRunning<'_> {
             viewports,
             painter,
             viewport_from_window,
+            pending_textures,
             ..
         } = &mut *shared_mut;
 
@@ -706,6 +729,9 @@ impl WgpuWinitRunning<'_> {
         } = full_output;
 
         remove_viewports_not_in(viewports, painter, viewport_from_window, &viewport_output);
+
+        // kip patch: see SharedState::pending_textures.
+        queue_textures(pending_textures, textures_delta);
 
         let Some(viewport) = viewports.get_mut(&viewport_id) else {
             return Ok(EventResult::Wait);
@@ -723,6 +749,12 @@ impl WgpuWinitRunning<'_> {
         };
 
         egui_winit.handle_platform_output_with_event_loop(window, event_loop, platform_output);
+
+        let textures_delta = if is_visible {
+            std::mem::take(pending_textures)
+        } else {
+            Default::default()
+        };
 
         let vsync_secs = if is_visible {
             let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
@@ -1135,8 +1167,13 @@ fn render_immediate_viewport(
         viewports,
         painter,
         viewport_from_window,
+        pending_textures,
         ..
     } = &mut *shared_mut;
+
+    // kip patch: this paint uploads whatever a hidden pass left waiting, and
+    // its own changes wait too if it returns before painting.
+    queue_textures(pending_textures, textures_delta);
 
     let Some(viewport) = viewports.get_mut(&ids.this) else {
         return;
@@ -1157,6 +1194,7 @@ fn render_immediate_viewport(
         }
     }
 
+    let textures_delta = std::mem::take(pending_textures);
     let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
     painter.paint_and_update_textures(
         ids.this,

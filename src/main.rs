@@ -480,6 +480,8 @@ struct App {
     upd_tx: Sender<update::UpdateMsg>,
     upd_rx: Receiver<update::UpdateMsg>,
     settings_open: bool,
+    /// Open tab of the settings window.
+    settings_tab: usize,
     last_tick: Instant,
     /// When the last background update check ran.
     last_update_check: Instant,
@@ -632,6 +634,7 @@ impl App {
             upd_rx,
             active_shared: Default::default(),
             settings_open: false,
+            settings_tab: 0,
             last_tick: Instant::now(),
             last_update_check: Instant::now(),
             collapsed_groups: state.collapsed_groups.into_iter().collect(),
@@ -5079,380 +5082,39 @@ impl App {
 
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.settings_open;
+        let tabs = [
+            tr("Вид", "Look"),
+            tr("Сессии", "Sessions"),
+            tr("Уведомления", "Alerts"),
+            "Claude",
+            tr("О kip", "About"),
+        ];
         egui::Window::new(tr("Настройки", "Settings"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .fixed_size(Vec2::new(500.0, 0.0))
+            // Pinned by the top: tabs differ in height and must not move under the cursor.
+            .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 60.0))
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, t) in tabs.iter().enumerate() {
+                        if ui.selectable_label(self.settings_tab == i, RichText::new(*t).size(13.0)).clicked() {
+                            self.settings_tab = i;
+                        }
+                    }
+                });
+                ui.separator();
+                ui.add_space(4.0);
                 ui.spacing_mut().item_spacing.y = 8.0;
-                egui::Grid::new("settings-grid").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                    ui.label(tr("Масштаб интерфейса", "UI scale"));
-                    let resp = ui.add(
-                        egui::Slider::new(&mut self.settings.ui_scale, 0.75..=1.75)
-                            .step_by(0.05)
-                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                    )
-                    .on_hover_text(tr("Также работает Cmd+= / Cmd+- / Cmd+0", "Also works: Cmd+= / Cmd+- / Cmd+0"));
-                    // Apply on release so the layout does not jump under the drag.
-                    if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
-                        ctx.set_zoom_factor(self.settings.ui_scale);
-                    }
-                    ui.end_row();
-
-                    ui.label(tr("Размер шрифта", "Font size"));
-                    ui.add(egui::Slider::new(&mut self.settings.font_size, 9.0..=20.0).step_by(0.5));
-                    ui.end_row();
-
-                    ui.label(tr("Шрифт", "Font"));
-                    let choices = available_fonts();
-                    let cur_font = choices
-                        .iter()
-                        .find(|(k, _)| *k == self.settings.font)
-                        .map(|(_, l)| *l)
-                        .unwrap_or("JetBrains Mono");
-                    egui::ComboBox::from_id_salt("term-font")
-                        .selected_text(cur_font)
-                        .width(160.0)
-                        .show_ui(ui, |ui| {
-                            for (k, label) in choices {
-                                if ui.selectable_label(self.settings.font == k, label).clicked()
-                                    && self.settings.font != k
-                                {
-                                    self.settings.font = k.to_string();
-                                    self.font_applied = install_fonts(ctx, k);
-                                }
-                            }
-                        });
-                    ui.end_row();
-
-                    // What is really on screen: the pick can fall back silently,
-                    // and the cell size in physical pixels shows whether the grid
-                    // came out pixel-aligned.
-                    let ppp = ctx.pixels_per_point();
-                    let fid = FontId::monospace(self.settings.font_size);
-                    let (cw, ch) =
-                        ctx.fonts_mut(|f| (f.glyph_width(&fid, '0'), f.row_height(&fid)));
-                    ui.label("");
-                    ui.label(
-                        RichText::new(format!(
-                            "{}: {} · {:.0}×{:.0} px · ppp {ppp:.2}",
-                            tr("рисуется", "rendering"),
-                            self.font_applied,
-                            (cw * ppp).round(),
-                            (ch * ppp).round(),
-                        ))
-                        .font(FontId::proportional(10.5))
-                        .color(palette::text_faint()),
-                    );
-                    ui.end_row();
-
-                    ui.label(tr("Скроллбэк (строк)", "Scrollback (lines)"));
-                    ui.add(
-                        egui::DragValue::new(&mut self.settings.scrollback)
-                            .range(200..=50_000)
-                            .speed(100),
-                    )
-                    .on_hover_text(tr("Применяется к новым терминалам", "Applies to new terminals"));
-                    ui.end_row();
-
-                    ui.label(tr("Будить сессии", "Wake sessions"));
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.settings.wake_on_start, tr("при запуске", "on launch")).on_hover_text(tr(
-                            "Запущенные при закрытии kip и открытые в окнах сессии поднимаются сами, в фоне",
-                            "Sessions that were running at quit, and the one each window shows, come back by themselves",
-                        ));
-                        ui.checkbox(&mut self.settings.wake_on_hover, tr("при наведении", "on hover")).on_hover_text(tr(
-                            "Спящая сессия начинает просыпаться, если задержать на ней мышь",
-                            "A sleeping session starts waking when the pointer rests on it",
-                        ));
-                    });
-                    ui.end_row();
-
-                    ui.label(tr("Усыплять после (мин)", "Suspend after (min)"));
-                    ui.add(egui::DragValue::new(&mut self.settings.idle_suspend_min).range(0..=240))
-                        .on_hover_text(tr("0 = не усыплять. Сессия без вывода дольше этого времени завершается с возможностью продолжить", "0 = never. A session idle longer than this is suspended and can be resumed"));
-                    ui.end_row();
-
-                    ui.label(tr("Команда Claude", "Claude command"));
-                    ui.add(egui::TextEdit::singleline(&mut self.settings.claude_cmd).desired_width(160.0));
-                    ui.end_row();
-
-                    ui.label(tr("Язык", "Language"));
-                    let langs = [
-                        ("auto", tr("Авто", "Auto")),
-                        ("ru", "Русский"),
-                        ("en", "English"),
-                    ];
-                    let cur_lang = langs
-                        .iter()
-                        .find(|(k, _)| *k == self.settings.lang)
-                        .map(|(_, l)| *l)
-                        .unwrap_or(tr("Авто", "Auto"));
-                    egui::ComboBox::from_id_salt("lang")
-                        .selected_text(cur_lang)
-                        .width(160.0)
-                        .show_ui(ui, |ui| {
-                            for (k, label) in langs {
-                                if ui.selectable_label(self.settings.lang == k, label).clicked()
-                                    && self.settings.lang != k
-                                {
-                                    self.settings.lang = k.to_string();
-                                    i18n::set(i18n::resolve(k));
-                                    ctx.request_repaint();
-                                }
-                            }
-                        });
-                    ui.end_row();
-
-                    ui.label(tr("Тема", "Theme"));
-                    let cur = palette::PRESETS
-                        .iter()
-                        .find(|p| p.key == self.settings.theme)
-                        .map(|p| p.label)
-                        .unwrap_or(palette::PRESETS[0].label);
-                    let mut theme_changed = false;
-                    egui::ComboBox::from_id_salt("theme-preset")
-                        .selected_text(cur)
-                        .width(160.0)
-                        .show_ui(ui, |ui| {
-                            for p in palette::PRESETS.iter() {
-                                if ui.selectable_label(self.settings.theme == p.key, p.label).clicked()
-                                    && self.settings.theme != p.key
-                                {
-                                    self.settings.theme = p.key.to_string();
-                                    // A fresh preset drops the custom accent so
-                                    // its native selection color shows.
-                                    self.settings.accent = None;
-                                    theme_changed = true;
-                                }
-                            }
-                        });
-                    ui.end_row();
-
-                    ui.label(tr("Акцент выделения", "Selection accent"));
-                    ui.horizontal(|ui| {
-                        let s = palette::selection();
-                        let mut acc = self.settings.accent.unwrap_or([s.r(), s.g(), s.b()]);
-                        if ui.color_edit_button_srgb(&mut acc).changed() {
-                            self.settings.accent = Some(acc);
-                            theme_changed = true;
-                        }
-                        if self.settings.accent.is_some()
-                            && ui.small_button(tr("сброс", "reset")).clicked()
-                        {
-                            self.settings.accent = None;
-                            theme_changed = true;
-                        }
-                    });
-                    ui.end_row();
-
-                    if theme_changed {
-                        palette::apply(&self.settings.theme, self.settings.accent.map(rgb32));
-                        apply_style(ctx);
-                        ctx.request_repaint();
-                    }
-                });
-                ui.separator();
-                ui.checkbox(&mut self.settings.notify_job_done, tr("Уведомлять, когда агент завершил работу", "Notify when the agent finishes"));
-                ui.checkbox(
-                    &mut self.settings.blink_done,
-                    tr("Подсвечивать сессию, где агент закончил", "Highlight a session whose agent finished"),
-                )
-                .on_hover_text(tr(
-                    "Строка сессии мигает выбранным цветом, пока вы её не откроете.",
-                    "The session row glows in the chosen color until you open it.",
-                ));
-                if self.settings.blink_done {
-                    ui.horizontal(|ui| {
-                        ui.add_space(22.0);
-                        ui.color_edit_button_srgb(&mut self.settings.blink_color);
-                        ui.add(
-                            egui::Slider::new(&mut self.settings.blink_period, 0.4..=4.0)
-                                .step_by(0.1)
-                                .suffix(tr(" с", " s")),
-                        )
-                        .on_hover_text(tr("Длина одного цикла мигания", "Length of one glow cycle"));
-                        ui.selectable_value(&mut self.settings.blink_smooth, true, tr("плавно", "smooth"));
-                        ui.selectable_value(&mut self.settings.blink_smooth, false, tr("мигание", "blink"));
-                    });
+                match self.settings_tab {
+                    0 => self.settings_look(ui, ctx),
+                    1 => self.settings_sessions(ui),
+                    2 => self.settings_alerts(ui),
+                    3 => self.settings_claude(ui, ctx),
+                    _ => self.settings_about(ui, ctx),
                 }
-                ui.checkbox(&mut self.settings.notify_bell, tr("Уведомлять по сигналу терминала (bell)", "Notify on terminal bell"));
-                ui.checkbox(&mut self.settings.notify_sound, tr("Звук уведомлений", "Notification sound"));
-                ui.checkbox(&mut self.settings.copy_on_select, tr("Копировать выделенное сразу в буфер", "Copy selection to clipboard immediately"));
-                ui.checkbox(
-                    &mut self.settings.show_last_msg,
-                    tr("Время последнего ответа Claude в списке сессий", "Time since Claude's last reply in the session list"),
-                )
-                .on_hover_text(tr(
-                    "В углу строки, под процентом контекста: сколько прошло с последнего ответа Claude \
-                     в этой сессии. Берётся из транскрипта, поэтому у вчерашней сессии там и будет вчера.",
-                    "In the row's corner, under the context %: how long since Claude last answered in \
-                     that session. Read from the transcript, so yesterday's session says yesterday.",
-                ));
-                ui.checkbox(
-                    &mut self.settings.row_separators,
-                    tr("Разделять сессии линией", "Separator line between sessions"),
-                );
-                ui.horizontal(|ui| {
-                    ui.label(tr("Сессии по", "Sessions by"));
-                    ui.selectable_value(&mut self.settings.group_by_project, false, tr("группам", "groups"))
-                        .on_hover_text(tr("Свои группы, перетаскиванием", "Your own groups, by dragging"));
-                    ui.selectable_value(&mut self.settings.group_by_project, true, tr("проектам", "projects"))
-                        .on_hover_text(tr(
-                            "Сами по папке проекта (корень git или папка). Сменил папку - сессия переехала. Ручные группы сохраняются.",
-                            "Automatic, by project folder (git root or folder). Change folder and the session moves. Manual groups are kept.",
-                        ));
-                });
-                ui.checkbox(
-                    &mut self.settings.skip_permissions_default,
-                    tr(
-                        "skip-permissions по умолчанию для новых сессий",
-                        "skip-permissions by default for new sessions",
-                    ),
-                );
-                // The exact-% statusline hook is a POSIX shell script; on
-                // Windows the badge falls back to the transcript estimate.
-                #[cfg(not(windows))]
-                {
-                    ui.separator();
-                    let mut hook_on = self.settings.ctx_hook;
-                    let resp = ui
-                        .checkbox(&mut hook_on, tr("Точный % контекста Claude (statusline-хук)", "Exact Claude context % (statusline hook)"))
-                        .on_hover_text(tr(
-                            "Ставит крошечный скрипт в ~/.kip/bin и подключает его statusline-хуком \
-                             Claude Code - % будет ровно тот, что видит сам Claude.\n\
-                             Уже настроенный statusline не ломается: он оборачивается и продолжает \
-                             работать. Снятие галочки отключает хук и возвращает прежний statusline; \
-                             сам скрипт остаётся в ~/.kip/bin.",
-                            "Installs a tiny script in ~/.kip/bin and wires it as a Claude Code \
-                             statusline hook - the % is exactly what Claude itself shows.\n\
-                             An existing statusline is not broken: it gets wrapped and keeps \
-                             working. Unchecking unwires the hook and restores the previous \
-                             statusline; the script itself stays in ~/.kip/bin.",
-                        ));
-                    if resp.changed() {
-                        let res = if hook_on {
-                            ctx_index::install_hook(&mut self.settings)
-                        } else {
-                            ctx_index::uninstall_hook(&mut self.settings)
-                        };
-                        match res {
-                            Ok(()) => {
-                                self.settings.ctx_hook = hook_on;
-                                self.hook_error = None;
-                            },
-                            Err(e) => self.hook_error = Some(e),
-                        }
-                    }
-                    if let Some(e) = &self.hook_error {
-                        ui.label(RichText::new(e).size(10.5).color(GIT_DEL));
-                    }
-                }
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(tr("MCP для Claude Code", "MCP for Claude Code"));
-                    if ui
-                        .add_enabled(!self.mcp.busy, egui::Button::new(tr("Установить / обновить", "Install / update")))
-                        .on_hover_text(tr(
-                            "Регистрирует kip как MCP-сервер Claude Code (claude mcp add -s user kip): \
-                             Claude сможет видеть, открывать, закрывать, переименовывать и чистить сессии kip.",
-                            "Registers kip as a Claude Code MCP server (claude mcp add -s user kip): \
-                             Claude can list, open, close, rename and clean up kip sessions.",
-                        ))
-                        .clicked()
-                    {
-                        self.start_mcp_install(ctx);
-                    }
-                });
-                self.mcp_status_ui(ui);
-                ui.checkbox(
-                    &mut self.settings.mcp_send_input,
-                    tr("MCP может печатать в сессии (send_input)", "MCP may type into sessions (send_input)"),
-                )
-                .on_hover_text(tr(
-                    "Разрешает Claude из одной сессии отправлять текст и команды в другие сессии kip.",
-                    "Lets Claude in one session send text and commands to other kip sessions.",
-                ));
-
-                // Updates. Flags are collected during the immutable borrow of
-                // update_state and acted on afterwards to avoid a borrow clash.
-                ui.separator();
-                let busy = matches!(
-                    self.update_state,
-                    UpdateState::Checking | UpdateState::Working
-                );
-                let mut do_check = false;
-                let mut do_update: Option<update::Release> = None;
-                let mut do_open = false;
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("{} {}", tr("Версия", "Version"), update::current_label()))
-                            .size(11.5)
-                            .color(palette::text_dim()),
-                    );
-                    if ui
-                        .add_enabled(
-                            !busy,
-                            egui::Button::new(RichText::new(tr("Проверить обновления", "Check for updates")).size(11.5)),
-                        )
-                        .clicked()
-                    {
-                        do_check = true;
-                    }
-                });
-                match &self.update_state {
-                    UpdateState::Checking => {
-                        ui.label(RichText::new(tr("проверяю...", "checking...")).size(10.5).color(palette::text_faint()));
-                    },
-                    UpdateState::UpToDate => {
-                        ui.label(
-                            RichText::new(tr("установлена последняя версия", "you're on the latest version")).size(10.5).color(palette::text_faint()),
-                        );
-                    },
-                    UpdateState::Working => {
-                        ui.label(
-                            RichText::new(tr("загружаю и устанавливаю, сейчас перезапущусь...", "downloading and installing, restarting soon..."))
-                                .size(10.5)
-                                .color(ORANGE),
-                        );
-                    },
-                    UpdateState::Failed(e) => {
-                        ui.label(RichText::new(e).size(10.5).color(GIT_DEL));
-                        if ui.button(RichText::new(tr("Открыть страницу загрузки", "Open download page")).size(11.0)).clicked() {
-                            do_open = true;
-                        }
-                    },
-                    UpdateState::Available(r) => {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("{} {}", tr("Доступна версия", "Update available:"), r.display))
-                                    .size(11.5)
-                                    .color(GIT_ADD),
-                            );
-                            if ui
-                                .button(RichText::new(tr("Обновить", "Update")).size(11.5).color(GIT_ADD))
-                                .clicked()
-                            {
-                                do_update = Some(r.clone());
-                            }
-                        });
-                    },
-                    UpdateState::Idle => {},
-                }
-                if do_check {
-                    self.update_state = UpdateState::Checking;
-                    update::check(self.upd_tx.clone(), ctx.clone());
-                }
-                if let Some(rel) = do_update {
-                    self.persist();
-                    self.update_state = UpdateState::Working;
-                    update::apply(rel, self.upd_tx.clone(), ctx.clone());
-                }
-                if do_open {
-                    update::open_releases();
-                }
+                ui.add_space(4.0);
             });
         // Settings apply live from memory; the file is written once, on close
         // (and again by on_exit), not on every slider-drag frame.
@@ -5461,6 +5123,342 @@ impl App {
             self.hook_error = None;
         }
         self.settings_open = open;
+    }
+
+    /// Two-column rows: a fixed-width label, the control after it.
+    fn settings_grid(ui: &mut egui::Ui, id: &str, body: impl FnOnce(&mut egui::Ui)) {
+        egui::Grid::new(id).num_columns(2).min_col_width(170.0).spacing([12.0, 10.0]).show(ui, body);
+    }
+
+    fn settings_look(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut theme_changed = false;
+        Self::settings_grid(ui, "set-look", |ui| {
+            ui.label(tr("Тема", "Theme"));
+            let cur = palette::PRESETS
+                .iter()
+                .find(|p| p.key == self.settings.theme)
+                .map(|p| p.label)
+                .unwrap_or(palette::PRESETS[0].label);
+            egui::ComboBox::from_id_salt("theme-preset").selected_text(cur).width(200.0).show_ui(ui, |ui| {
+                for p in palette::PRESETS.iter() {
+                    if ui.selectable_label(self.settings.theme == p.key, p.label).clicked() && self.settings.theme != p.key {
+                        self.settings.theme = p.key.to_string();
+                        // A fresh preset drops the custom accent so its native selection color shows.
+                        self.settings.accent = None;
+                        theme_changed = true;
+                    }
+                }
+            });
+            ui.end_row();
+
+            ui.label(tr("Цвет выделения", "Selection color"));
+            ui.horizontal(|ui| {
+                let s = palette::selection();
+                let mut acc = self.settings.accent.unwrap_or([s.r(), s.g(), s.b()]);
+                if ui.color_edit_button_srgb(&mut acc).changed() {
+                    self.settings.accent = Some(acc);
+                    theme_changed = true;
+                }
+                if self.settings.accent.is_some() && ui.small_button(tr("как в теме", "theme's own")).clicked() {
+                    self.settings.accent = None;
+                    theme_changed = true;
+                }
+            });
+            ui.end_row();
+
+            ui.label(tr("Шрифт терминала", "Terminal font"));
+            let choices = available_fonts();
+            let cur_font = choices.iter().find(|(k, _)| *k == self.settings.font).map(|(_, l)| *l).unwrap_or("JetBrains Mono");
+            egui::ComboBox::from_id_salt("term-font").selected_text(cur_font).width(200.0).show_ui(ui, |ui| {
+                for (k, label) in choices {
+                    if ui.selectable_label(self.settings.font == k, label).clicked() && self.settings.font != k {
+                        self.settings.font = k.to_string();
+                        self.font_applied = install_fonts(ctx, k);
+                    }
+                }
+            });
+            ui.end_row();
+
+            ui.label(tr("Размер шрифта", "Font size"));
+            ui.add(egui::Slider::new(&mut self.settings.font_size, 9.0..=20.0).step_by(0.5));
+            ui.end_row();
+
+            // What is really on screen: the pick can fall back silently, and the
+            // cell size in physical pixels shows whether the grid came out pixel-aligned.
+            let ppp = ctx.pixels_per_point();
+            let fid = FontId::monospace(self.settings.font_size);
+            let (cw, ch) = ctx.fonts_mut(|f| (f.glyph_width(&fid, '0'), f.row_height(&fid)));
+            ui.label("");
+            ui.label(
+                RichText::new(format!(
+                    "{} {}, {:.0}x{:.0} px, ppp {ppp:.2}",
+                    tr("рисуется", "rendering"),
+                    self.font_applied,
+                    (cw * ppp).round(),
+                    (ch * ppp).round(),
+                ))
+                .size(11.0)
+                .color(palette::text_faint()),
+            );
+            ui.end_row();
+
+            ui.label(tr("Масштаб интерфейса", "UI scale"));
+            let resp = ui
+                .add(
+                    egui::Slider::new(&mut self.settings.ui_scale, 0.75..=1.75)
+                        .step_by(0.05)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                )
+                .on_hover_text(tr("Также Cmd+= / Cmd+- / Cmd+0", "Also Cmd+= / Cmd+- / Cmd+0"));
+            // Apply on release so the layout does not jump under the drag.
+            if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+                ctx.set_zoom_factor(self.settings.ui_scale);
+            }
+            ui.end_row();
+
+            ui.label(tr("Язык", "Language"));
+            let langs = [("auto", tr("Как в системе", "System")), ("ru", "Русский"), ("en", "English")];
+            let cur_lang = langs.iter().find(|(k, _)| *k == self.settings.lang).map(|(_, l)| *l).unwrap_or(langs[0].1);
+            egui::ComboBox::from_id_salt("lang").selected_text(cur_lang).width(200.0).show_ui(ui, |ui| {
+                for (k, label) in langs {
+                    if ui.selectable_label(self.settings.lang == k, label).clicked() && self.settings.lang != k {
+                        self.settings.lang = k.to_string();
+                        i18n::set(i18n::resolve(k));
+                        ctx.request_repaint();
+                    }
+                }
+            });
+            ui.end_row();
+        });
+        if theme_changed {
+            palette::apply(&self.settings.theme, self.settings.accent.map(rgb32));
+            apply_style(ctx);
+            ctx.request_repaint();
+        }
+    }
+
+    fn settings_sessions(&mut self, ui: &mut egui::Ui) {
+        Self::settings_grid(ui, "set-sessions", |ui| {
+            ui.label(tr("Список сессий", "Session list"));
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.settings.group_by_project, false, tr("по группам", "by groups"))
+                    .on_hover_text(tr("Свои группы, перетаскиванием", "Your own groups, by dragging"));
+                ui.selectable_value(&mut self.settings.group_by_project, true, tr("по проектам", "by projects"))
+                    .on_hover_text(tr(
+                        "Сами по папке проекта (корень git или папка). Сменил папку - сессия переехала. Ручные группы сохраняются.",
+                        "Automatic, by project folder (git root or folder). Change folder and the session moves. Manual groups are kept.",
+                    ));
+            });
+            ui.end_row();
+
+            ui.label("");
+            ui.checkbox(&mut self.settings.row_separators, tr("Линия между сессиями", "Line between sessions"));
+            ui.end_row();
+
+            ui.label("");
+            ui.checkbox(&mut self.settings.show_last_msg, tr("Время последнего ответа Claude", "Time since Claude's last reply"))
+                .on_hover_text(tr(
+                    "В углу строки, под процентом контекста. Берётся из транскрипта, поэтому у вчерашней сессии там и будет вчера.",
+                    "In the row's corner, under the context %. Read from the transcript, so yesterday's session says yesterday.",
+                ));
+            ui.end_row();
+
+            ui.label(tr("Будить сессии", "Wake sessions"));
+            ui.vertical(|ui| {
+                ui.checkbox(&mut self.settings.wake_on_start, tr("при запуске kip", "when kip starts")).on_hover_text(tr(
+                    "Запущенные при закрытии kip и открытые в окнах сессии поднимаются сами, в фоне",
+                    "Sessions that were running at quit, and the one each window shows, come back by themselves",
+                ));
+                ui.checkbox(&mut self.settings.wake_on_hover, tr("при наведении мыши", "when the pointer rests on one")).on_hover_text(tr(
+                    "Спящая сессия начинает просыпаться, если задержать на ней мышь. Не открыл за минуту - уснёт обратно.",
+                    "A sleeping session starts waking when the pointer rests on it, and sleeps again if not opened within a minute.",
+                ));
+            });
+            ui.end_row();
+
+            ui.label(tr("Усыплять без дела через", "Suspend when idle after"));
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut self.settings.idle_suspend_min).range(0..=240));
+                ui.label(tr("мин (0 - никогда)", "min (0 = never)"));
+            });
+            ui.end_row();
+
+            ui.label(tr("История терминала", "Terminal history"));
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut self.settings.scrollback).range(200..=50_000).speed(100));
+                ui.label(tr("строк, для новых сессий", "lines, for new sessions"));
+            });
+            ui.end_row();
+
+            ui.label("");
+            ui.checkbox(&mut self.settings.copy_on_select, tr("Копировать выделенное сразу", "Copy selection right away"));
+            ui.end_row();
+        });
+    }
+
+    fn settings_alerts(&mut self, ui: &mut egui::Ui) {
+        Self::settings_grid(ui, "set-alerts", |ui| {
+            ui.label(tr("Агент закончил", "Agent finished"));
+            ui.vertical(|ui| {
+                ui.checkbox(&mut self.settings.notify_job_done, tr("системное уведомление", "system notification"));
+                ui.checkbox(&mut self.settings.blink_done, tr("подсветить сессию в списке", "highlight its row"))
+                    .on_hover_text(tr(
+                        "Строка мигает выбранным цветом, пока вы её не откроете.",
+                        "The row glows in the chosen color until you open it.",
+                    ));
+            });
+            ui.end_row();
+
+            if self.settings.blink_done {
+                ui.label(tr("Подсветка", "Highlight"));
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_srgb(&mut self.settings.blink_color);
+                    ui.selectable_value(&mut self.settings.blink_smooth, true, tr("плавно", "smooth"));
+                    ui.selectable_value(&mut self.settings.blink_smooth, false, tr("мигание", "blink"));
+                });
+                ui.end_row();
+
+                ui.label(tr("Цикл", "Cycle"));
+                ui.add(egui::Slider::new(&mut self.settings.blink_period, 0.4..=4.0).step_by(0.1).suffix(tr(" с", " s")));
+                ui.end_row();
+            }
+
+            ui.label(tr("Сигнал терминала", "Terminal bell"));
+            ui.checkbox(&mut self.settings.notify_bell, tr("системное уведомление", "system notification"));
+            ui.end_row();
+
+            ui.label(tr("Звук", "Sound"));
+            ui.checkbox(&mut self.settings.notify_sound, tr("со звуком", "play a sound"));
+            ui.end_row();
+        });
+    }
+
+    fn settings_claude(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        Self::settings_grid(ui, "set-claude", |ui| {
+            ui.label(tr("Команда запуска", "Launch command"));
+            ui.add(egui::TextEdit::singleline(&mut self.settings.claude_cmd).desired_width(260.0));
+            ui.end_row();
+
+            ui.label(tr("Новые сессии", "New sessions"));
+            ui.checkbox(&mut self.settings.skip_permissions_default, "--dangerously-skip-permissions");
+            ui.end_row();
+
+            // The exact-% statusline hook is a POSIX shell script; on Windows the
+            // badge falls back to the transcript estimate.
+            #[cfg(not(windows))]
+            {
+                ui.label(tr("% контекста", "Context %"));
+                let mut hook_on = self.settings.ctx_hook;
+                let resp = ui.checkbox(&mut hook_on, tr("точный, через statusline-хук", "exact, via a statusline hook")).on_hover_text(tr(
+                    "Ставит крошечный скрипт в ~/.kip/bin и подключает его statusline-хуком Claude Code: \
+                     % будет ровно тот, что видит сам Claude. Уже настроенный statusline оборачивается и \
+                     продолжает работать. Снятие галочки возвращает прежний.",
+                    "Installs a tiny script in ~/.kip/bin and wires it as a Claude Code statusline hook: \
+                     the % is exactly what Claude shows. An existing statusline is wrapped and keeps \
+                     working. Unchecking restores it.",
+                ));
+                if resp.changed() {
+                    let res = if hook_on {
+                        ctx_index::install_hook(&mut self.settings)
+                    } else {
+                        ctx_index::uninstall_hook(&mut self.settings)
+                    };
+                    match res {
+                        Ok(()) => {
+                            self.settings.ctx_hook = hook_on;
+                            self.hook_error = None;
+                        },
+                        Err(e) => self.hook_error = Some(e),
+                    }
+                }
+                ui.end_row();
+                if let Some(e) = &self.hook_error {
+                    ui.label("");
+                    ui.add(egui::Label::new(RichText::new(e).size(11.0).color(GIT_DEL)).wrap());
+                    ui.end_row();
+                }
+            }
+
+            ui.label(tr("MCP-сервер kip", "kip MCP server"));
+            if ui
+                .add_enabled(!self.mcp.busy, egui::Button::new(tr("Подключить к Claude Code", "Connect to Claude Code")))
+                .on_hover_text(tr(
+                    "claude mcp add -s user kip: Claude сможет видеть, открывать, закрывать, переименовывать и чистить сессии kip.",
+                    "claude mcp add -s user kip: Claude can list, open, close, rename and clean up kip sessions.",
+                ))
+                .clicked()
+            {
+                self.start_mcp_install(ctx);
+            }
+            ui.end_row();
+
+            ui.label("");
+            ui.checkbox(&mut self.settings.mcp_send_input, tr("MCP может печатать в сессии", "MCP may type into sessions"))
+                .on_hover_text(tr(
+                    "Разрешает Claude из одной сессии отправлять текст и команды в другие сессии kip (send_input).",
+                    "Lets Claude in one session send text and commands to other kip sessions (send_input).",
+                ));
+            ui.end_row();
+        });
+        self.mcp_status_ui(ui);
+    }
+
+    fn settings_about(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // Flags are collected during the immutable borrow of update_state and
+        // acted on afterwards to avoid a borrow clash.
+        let busy = matches!(self.update_state, UpdateState::Checking | UpdateState::Working);
+        let mut do_check = false;
+        let mut do_update: Option<update::Release> = None;
+        let mut do_open = false;
+        Self::settings_grid(ui, "set-about", |ui| {
+            ui.label(tr("Версия", "Version"));
+            ui.label(RichText::new(update::current_label()).strong());
+            ui.end_row();
+
+            ui.label(tr("Обновления", "Updates"));
+            ui.vertical(|ui| {
+                match &self.update_state {
+                    UpdateState::Available(r) => {
+                        ui.label(RichText::new(format!("{} {}", tr("Доступна версия", "Available:"), r.display)).color(GIT_ADD));
+                        if ui.button(RichText::new(tr("Обновить и перезапустить", "Update and restart")).color(GIT_ADD)).clicked() {
+                            do_update = Some(r.clone());
+                        }
+                    },
+                    UpdateState::Checking => {
+                        ui.label(RichText::new(tr("проверяю...", "checking...")).color(palette::text_dim()));
+                    },
+                    UpdateState::UpToDate => {
+                        ui.label(RichText::new(tr("стоит последняя версия", "you're on the latest")).color(palette::text_dim()));
+                    },
+                    UpdateState::Working => {
+                        ui.label(RichText::new(tr("скачиваю и ставлю, сейчас перезапущусь...", "downloading and installing, restarting soon...")).color(ORANGE));
+                    },
+                    UpdateState::Failed(e) => {
+                        ui.add(egui::Label::new(RichText::new(e).color(GIT_DEL)).wrap());
+                        if ui.button(tr("Открыть страницу загрузки", "Open download page")).clicked() {
+                            do_open = true;
+                        }
+                    },
+                    UpdateState::Idle => {},
+                }
+                if ui.add_enabled(!busy, egui::Button::new(tr("Проверить сейчас", "Check now"))).clicked() {
+                    do_check = true;
+                }
+            });
+            ui.end_row();
+        });
+        if do_check {
+            self.update_state = UpdateState::Checking;
+            update::check(self.upd_tx.clone(), ctx.clone());
+        }
+        if let Some(rel) = do_update {
+            self.persist();
+            self.update_state = UpdateState::Working;
+            update::apply(rel, self.upd_tx.clone(), ctx.clone());
+        }
+        if do_open {
+            update::open_releases();
+        }
     }
 }
 
