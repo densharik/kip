@@ -170,7 +170,7 @@ fn scan_projects_in(root: &Path) -> HashMap<String, PathBuf> {
     out.into_iter().map(|(k, (_, p))| (k, p)).collect()
 }
 
-fn scan_projects() -> HashMap<String, PathBuf> {
+pub(crate) fn scan_projects() -> HashMap<String, PathBuf> {
     match claude_dir() {
         Some(d) => scan_projects_in(&d.join("projects")),
         None => HashMap::new(),

@@ -3,9 +3,11 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app_ctl;
+mod app_past;
 mod config;
 mod ctl;
 mod ctx_index;
+mod history;
 mod i18n;
 mod mcp;
 mod mods;
@@ -114,6 +116,47 @@ struct McpUi {
     status: Option<Result<String, String>>,
 }
 
+/// Past Claude conversations (Cmd+Y): the index, the full-text search over
+/// it and the preview. Shared by all windows; each window only says if it is open.
+#[derive(Default)]
+struct Past {
+    entries: Vec<history::Entry>,
+    /// Lowercased name + first prompt + folder of each entry, for the instant filter.
+    hay: Vec<String>,
+    loading: bool,
+    loaded_at: Option<Instant>,
+    query: String,
+    edited: Option<Instant>,
+    /// Whole history instead of the active session's folder.
+    all: bool,
+    focus: bool,
+    sel: Option<String>,
+    /// Keyboard moved the selection: scroll the list to it.
+    reveal: bool,
+    /// The list's scroll offset and visible height last frame.
+    list_view: (f32, f32),
+    /// Query the content search ran for, its generation (bumping it cancels
+    /// the running one), files done, and sessions with hits.
+    searched: String,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+    done: usize,
+    hits: std::collections::HashMap<String, usize>,
+    preview: Option<(String, Vec<(bool, String)>)>,
+    /// Message to scroll the preview to on the next frame, and the one the
+    /// match arrows last went to.
+    jump: Option<usize>,
+    at: Option<usize>,
+    /// Session open in another window, to bring forward after the pass.
+    focus_session: Option<u64>,
+}
+
+enum PastMsg {
+    Index(Vec<history::Entry>),
+    Hit(u64, String, usize),
+    Progress(u64, usize),
+    Preview(String, Vec<(bool, String)>),
+}
+
 enum McpMsg {
     Installed(bool),
     Done(Result<String, String>),
@@ -132,6 +175,10 @@ enum Act {
     Select(u64),
     NewSame,
     NewPick,
+    /// Open or close the past-conversations browser.
+    TogglePast,
+    /// Continue a past Claude conversation by its session id.
+    PastResume(String),
     Suspend(u64),
     /// bool = resume the saved Claude session (vs plain shell). Either way the
     /// same session is revived in place - no new tab.
@@ -279,6 +326,8 @@ struct WinUi {
     mods_folded: HashSet<String>,
     /// Cmd+F bar, open while Some.
     find: Option<Find>,
+    /// The past-conversations browser covers the terminal (Cmd+Y).
+    past_open: bool,
 }
 
 /// Search over the active terminal, with a lazy count in the window's other
@@ -455,6 +504,9 @@ struct App {
     mcp: McpUi,
     mcp_tx: Sender<McpMsg>,
     mcp_rx: Receiver<McpMsg>,
+    past: Past,
+    past_tx: Sender<PastMsg>,
+    past_rx: Receiver<PastMsg>,
 }
 
 impl App {
@@ -478,6 +530,7 @@ impl App {
         let (ctl_tx, ctl_rx) = mpsc::channel();
         ctl::start(ctl_tx, cc.egui_ctx.clone());
         let (mcp_tx, mcp_rx) = mpsc::channel();
+        let (past_tx, past_rx) = mpsc::channel();
         if !state.settings.mcp_offer_off {
             let (tx, ctx) = (mcp_tx.clone(), cc.egui_ctx.clone());
             std::thread::spawn(move || {
@@ -575,6 +628,9 @@ impl App {
             mcp: McpUi::default(),
             mcp_tx,
             mcp_rx,
+            past: Past::default(),
+            past_tx,
+            past_rx,
         };
         for mut saved in state.sessions {
             if !app.wins.iter().any(|w| w.id == saved.window) {
@@ -1242,6 +1298,8 @@ impl App {
     fn set_active(&mut self, id: Option<u64>) {
         self.commit_rename();
         self.w.active = id;
+        // Picking or opening a session shows its terminal, not the history over it.
+        self.w.past_open = false;
         self.w.dir_open = false;
         self.w.cmd_input.clear();
         self.w.hist_query.clear();
@@ -1390,6 +1448,8 @@ impl App {
                     let cwd = self.active_cwd();
                     self.spawn(cwd, None, ctx);
                 },
+                Act::TogglePast => self.toggle_past(ctx),
+                Act::PastResume(sid) => self.past_resume(&sid, ctx),
                 Act::NewPick => {
                     let start = self.active_cwd();
                     if let Some(dir) = rfd::FileDialog::new().set_directory(&start).pick_folder() {
@@ -2083,7 +2143,14 @@ impl App {
         let mut acts = Vec::new();
         let active = self.w.active;
         let mut open_find = false;
+        let mut past = false;
         ctx.input_mut(|i| {
+            // Ctrl+Y is readline's yank off macOS.
+            past = if cfg!(target_os = "macos") {
+                consume_cmd(i, Key::Y)
+            } else {
+                consume_mods(i, Modifiers::COMMAND | Modifiers::SHIFT, Key::Y)
+            };
             // Plain Ctrl+F belongs to the shell and Claude off macOS.
             open_find = if cfg!(target_os = "macos") {
                 consume_cmd(i, Key::F)
@@ -2122,6 +2189,9 @@ impl App {
                 }
             }
         });
+        if past {
+            acts.push(Act::TogglePast);
+        }
         if open_find {
             match &mut self.w.find {
                 Some(f) => f.focus = true,
@@ -2347,6 +2417,14 @@ impl App {
                 .clicked()
             {
                 acts.push(Act::NewWindow);
+            }
+            ui.add_space(4.0);
+            if ui
+                .selectable_label(self.w.past_open, RichText::new(tr("История", "History")).size(12.5))
+                .on_hover_text(tr("Прошлые разговоры с Claude: поиск и продолжение (Cmd+Y)", "Past Claude conversations: search and continue (Cmd+Y)"))
+                .clicked()
+            {
+                acts.push(Act::TogglePast);
             }
             ui.add_space(4.0);
             let files = ui
@@ -3333,6 +3411,10 @@ impl App {
 
     fn central(&mut self, ui: &mut egui::Ui) -> Vec<Act> {
         let mut acts = Vec::new();
+        if self.w.past_open {
+            self.past_ui(ui, &mut acts);
+            return acts;
+        }
         if self.sessions.is_empty() {
             self.empty_state(ui, &mut acts);
             return acts;
@@ -4895,6 +4977,7 @@ impl eframe::App for App {
         }
         self.housekeeping(&ctx);
         self.drain_ctl(&ctx);
+        self.drain_past(&ctx);
 
         // Adopt zoom changed via Cmd+= / Cmd+- (egui built-in); while the
         // settings window is open the slider owns the value instead.

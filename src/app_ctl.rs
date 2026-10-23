@@ -26,26 +26,8 @@ fn transcript_text(path: &std::path::Path, max_chars: usize) -> Option<String> {
     let mut out = String::new();
     for line in String::from_utf8_lossy(&buf).lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
-        let who = match v["type"].as_str() {
-            Some("user") => "User",
-            Some("assistant") => "Claude",
-            _ => continue,
-        };
-        let content = &v["message"]["content"];
-        let text = match content {
-            Value::String(t) => t.clone(),
-            Value::Array(parts) => parts
-                .iter()
-                .filter(|p| p["type"] == "text")
-                .filter_map(|p| p["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => continue,
-        };
-        if text.trim().is_empty() {
-            continue;
-        }
-        out.push_str(&format!("{who}: {}\n\n", text.trim()));
+        let Some((user, text)) = history::msg_text(&v) else { continue };
+        out.push_str(&format!("{}: {text}\n\n", if user { "User" } else { "Claude" }));
     }
     if out.len() > max_chars {
         let cut = out.len() - max_chars;
@@ -58,6 +40,10 @@ fn transcript_text(path: &std::path::Path, max_chars: usize) -> Option<String> {
 impl App {
     pub(super) fn drain_ctl(&mut self, ctx: &egui::Context) {
         while let Ok(req) = self.ctl_rx.try_recv() {
+            if req.op == "list_history" {
+                self.list_history(req);
+                continue;
+            }
             let r = self.ctl(&req.op, &req.args, ctx);
             let _ = req.reply.send(r);
         }
@@ -72,6 +58,64 @@ impl App {
         }
     }
 
+    /// Past Claude conversations for MCP. Reading and searching them takes
+    /// seconds, so it runs off the UI thread and answers the request itself.
+    fn list_history(&self, req: ctl::Req) {
+        let open: std::collections::HashMap<String, u64> = self
+            .sessions
+            .iter()
+            .filter_map(|s| Some((s.claude_session_id.clone()?, s.id)))
+            .collect();
+        std::thread::spawn(move || {
+            // ctl gives up on a reply after 15s; the index read counts too.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let args = &req.args;
+            let entries = history::load_index();
+            let scope = args["cwd"].as_str().map(expand);
+            let q = args["query"].as_str().map(str::trim).filter(|q| !q.is_empty());
+            let re = q.and_then(history::matcher);
+            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            let mut out = Vec::new();
+            let mut partial = false;
+            for e in entries.iter().filter(|e| scope.as_ref().is_none_or(|d| e.cwd.starts_with(d))) {
+                if out.len() >= limit {
+                    break;
+                }
+                let mut hits = 0;
+                if let Some(re) = &re {
+                    let named = re.re.is_match(e.name()) || re.re.is_match(&e.first);
+                    if Instant::now() > deadline {
+                        partial = true;
+                        if !named {
+                            continue;
+                        }
+                    } else {
+                        hits = history::count_hits(&e.path, re);
+                    }
+                    if !named && hits == 0 {
+                        continue;
+                    }
+                }
+                let age = SystemTime::now()
+                    .duration_since(UNIX_EPOCH + Duration::from_secs(e.mtime))
+                    .map_or(0.0, |d| d.as_secs_f64() / 3600.0);
+                out.push(json!({
+                    "sid": e.sid,
+                    "title": e.title,
+                    "first_prompt": e.first,
+                    "cwd": e.cwd,
+                    "branch": e.branch,
+                    "age_hours": (age * 10.0).round() / 10.0,
+                    "size_kb": e.size / 1024,
+                    "hits": hits,
+                    "open_in_kip": open.get(&e.sid),
+                }));
+            }
+            let r = if partial { json!({"sessions": out, "partial": true}) } else { json!(out) };
+            let _ = req.reply.send(Ok(r));
+        });
+    }
+
     fn win_index(&self, wid: u64) -> Result<usize, String> {
         self.wins.iter().position(|w| w.id == wid).ok_or_else(|| format!("no window {wid}"))
     }
@@ -81,7 +125,7 @@ impl App {
     }
 
     /// Window index of session `id` (call outside a window pass).
-    fn win_of(&self, id: u64) -> Result<usize, String> {
+    pub(super) fn win_of(&self, id: u64) -> Result<usize, String> {
         let idx = self.session_index(id)?;
         self.win_index(self.sessions[idx].window)
     }
@@ -281,6 +325,27 @@ impl App {
                 let lines: Vec<&str> = text.lines().collect();
                 Ok(json!(lines[lines.len().saturating_sub(n)..].join("\n")))
             },
+            "show_history" => {
+                let k = self.win_index(args["window"].as_u64().unwrap_or(0))?;
+                if let Some(q) = args["query"].as_str() {
+                    self.past.query = q.to_string();
+                    self.past.edited = None;
+                }
+                let sid = args["sid"].as_str().map(String::from);
+                self.in_window(k, |a| {
+                    if !a.w.past_open {
+                        a.toggle_past(ctx);
+                    }
+                });
+                if let Some(sid) = sid {
+                    self.past_select(sid.clone());
+                    if self.past.sel.as_ref() != Some(&sid) {
+                        return Err(format!("no past conversation {sid}"));
+                    }
+                }
+                ctx.send_viewport_cmd_to(self.wins[k].viewport(), egui::ViewportCommand::Focus);
+                Ok(json!("shown"))
+            },
             "search" => {
                 use alacritty_terminal::grid::Dimensions;
                 use alacritty_terminal::index::{Column, Point};
@@ -318,9 +383,23 @@ impl App {
                 Ok(Value::Array(found))
             },
             "read_transcript" => {
-                let s = &self.sessions[self.session_index(arg_id(args)?)?];
-                let sid = s.claude_session_id.as_deref().ok_or("no Claude session in this terminal")?;
-                let path = ctx_index::resolve_jsonl(&self.jsonl_map, sid, Some(&s.cwd)).ok_or("transcript not found")?;
+                let path = match args["sid"].as_str() {
+                    // A sid from list_history may be newer than the jsonl map's last scan.
+                    Some(sid) => self
+                        .past
+                        .entries
+                        .iter()
+                        .find(|e| e.sid == sid)
+                        .map(|e| e.path.clone())
+                        .or_else(|| ctx_index::resolve_jsonl(&self.jsonl_map, sid, None))
+                        .or_else(|| ctx_index::scan_projects().remove(sid)),
+                    None => {
+                        let s = &self.sessions[self.session_index(arg_id(args)?)?];
+                        let sid = s.claude_session_id.as_deref().ok_or("no Claude session in this terminal")?;
+                        ctx_index::resolve_jsonl(&self.jsonl_map, sid, Some(&s.cwd))
+                    },
+                };
+                let path = path.ok_or("transcript not found")?;
                 let max = args["max_chars"].as_u64().unwrap_or(20_000) as usize;
                 transcript_text(&path, max).map(Value::String).ok_or_else(|| "cannot read transcript".into())
             },
@@ -472,8 +551,8 @@ impl App {
                 }
                 ui.label(
                     RichText::new(tr(
-                        "Компактно: 20 инструментов, около 1.7 тыс. токенов контекста. Ставится одной командой: claude mcp add -s user kip. Печатать в чужие сессии MCP не может, пока вы не разрешите это в настройках.",
-                        "Compact: 20 tools, about 1.7k tokens of context. Installs with one command: claude mcp add -s user kip. MCP cannot type into sessions unless you allow it in Settings.",
+                        "Компактно: 22 инструмента, около 1.9 тыс. токенов контекста. Ставится одной командой: claude mcp add -s user kip. Печатать в чужие сессии MCP не может, пока вы не разрешите это в настройках.",
+                        "Compact: 22 tools, about 1.9k tokens of context. Installs with one command: claude mcp add -s user kip. MCP cannot type into sessions unless you allow it in Settings.",
                     ))
                     .size(10.5)
                     .color(palette::text_faint()),

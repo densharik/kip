@@ -37,6 +37,18 @@ they are gone. kip fixes those three things and stays out of the way otherwise.
 - Rename with a double click. Your name wins over the one Claude picked.
 - `Cmd+1`..`Cmd+9` jumps to a session. A pinned session keeps its number.
 
+**History**
+
+- `Cmd+Y` (or "History" under the session list) browses every past Claude Code
+  conversation on disk: title, first prompt, folder, branch, age. The list starts
+  with the active session's folder; one click shows all projects.
+- Type to filter by title and folder at once, while a background search reads
+  the conversations themselves (user and Claude text, not tool output) and marks
+  each one with its hit count. About 2 seconds for 3 GB of transcripts.
+- The preview shows the conversation with matches highlighted; arrows walk them.
+- Enter or "Continue" brings it back: a new tab in its folder running
+  `claude --resume`, or a switch to the tab that already has it open.
+
 **Memory**
 
 - Suspend a session to free its memory. kip kills the whole process tree and
@@ -62,6 +74,9 @@ they are gone. kip fixes those three things and stays out of the way otherwise.
 **Terminal**
 
 - Real PTY. Anything you run in a terminal runs here.
+- `Cmd+F` finds text in the screen and scrollback, case-insensitive; other
+  sessions with hits get an accent mark in the list.
+- `Cmd+Z` undoes the last edit in Claude's prompt (sends its own undo key).
 - File paths in the output are clickable: Open, or reveal in Finder/Explorer.
 - Drag a file in to insert its path; paste a screenshot to insert the path to it.
 - Command bar with history, `Shift+Enter` for a newline, and `cd` that follows.
@@ -193,7 +208,7 @@ or by hand:
 claude mcp add -s user kip -- /Applications/kip.app/Contents/MacOS/kip mcp
 ```
 
-Small on context: 20 tools, about 6.1 KB of schema (~1.7k tokens) - and Claude
+Small on context: 22 tools, about 6.9 KB of schema (~1.9k tokens) - and Claude
 Code usually defers MCP tools, keeping only their names in context until one
 is used. If kip is not running, the first call starts it.
 
@@ -205,7 +220,8 @@ is used. If kip is not running, the first call starts it.
 | `focus_session`, `rename_session`, `set_group`, `pin_session` | |
 | `open_window`, `move_to_window` | |
 | `save_state` | write sessions and windows to disk now |
-| `read_screen`, `read_transcript` | terminal text and the Claude conversation, for summaries |
+| `read_screen`, `read_transcript` | terminal text and the Claude conversation (also a past one by `sid`), for summaries |
+| `list_history`, `show_history` | past Claude conversations on disk, searched by title and text; open kip's history browser |
 | `search` | case-insensitive text search across sessions' screen and scrollback |
 | `send_input` | type into a session - off until enabled in Settings |
 | `cleanup` | suspend or remove long-idle sessions; dry run by default |
