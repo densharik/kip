@@ -90,12 +90,11 @@ fn scan(path: &Path) -> (PathBuf, String, String, Option<String>, String) {
             return;
         }
         let Ok(v) = serde_json::from_slice::<Value>(line) else { return };
-        if cwd.is_none() {
-            if let Some(c) = v["cwd"].as_str() {
+        if cwd.is_none()
+            && let Some(c) = v["cwd"].as_str() {
                 cwd = Some(PathBuf::from(c));
                 branch = v["gitBranch"].as_str().unwrap_or_default().to_string();
             }
-        }
         match v["type"].as_str() {
             Some("custom-title") => custom = v["customTitle"].as_str().map(String::from),
             Some("ai-title") => ai = v["aiTitle"].as_str().map(String::from),
@@ -173,7 +172,7 @@ pub fn load_index() -> Vec<Entry> {
             out.extend(h.join().unwrap_or_default());
         }
     });
-    out.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    out.sort_by_key(|e| std::cmp::Reverse(e.mtime));
     // Text of transcripts that are gone.
     if let Some(d) = &texts {
         let keep: std::collections::HashSet<String> = out.iter().map(|e| format!("{}.txt", e.sid)).collect();

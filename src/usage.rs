@@ -117,13 +117,10 @@ fn token() -> Option<String> {
         if let Ok(out) = Command::new("security")
             .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
             .output()
-        {
-            if out.status.success() {
-                if let Some(t) = token_from_json(&out.stdout) {
+            && out.status.success()
+                && let Some(t) = token_from_json(&out.stdout) {
                     return Some(t);
                 }
-            }
-        }
     }
     let path = crate::session::claude_dir()?.join(".credentials.json");
     token_from_json(&std::fs::read(path).ok()?)

@@ -1,0 +1,8 @@
+# Workflow actions are pinned by commit hash; this keeps the hashes current.
+# Cargo crates are updated by hand: eframe is vendored and pinned (see Cargo.toml).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

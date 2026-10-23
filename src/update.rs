@@ -372,11 +372,10 @@ fn do_apply(_rel: &Release) -> Result<(), String> {
 pub fn apply(rel: Release, tx: Sender<UpdateMsg>, egui: egui::Context) {
     std::thread::spawn(move || {
         // On success do_apply relaunches and exits; only errors return here.
-        if let Err(err) = do_apply(&rel) {
-            if tx.send(UpdateMsg::Applied(Err(err))).is_ok() {
+        if let Err(err) = do_apply(&rel)
+            && tx.send(UpdateMsg::Applied(Err(err))).is_ok() {
                 egui.request_repaint();
             }
-        }
     });
 }
 

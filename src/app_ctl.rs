@@ -207,12 +207,11 @@ impl App {
                     if a.sessions[idx].group != g {
                         a.move_session(id, g, None);
                     }
-                    if let Some(sid) = resume {
-                        if let Some(idx) = a.idx_of(id) {
+                    if let Some(sid) = resume
+                        && let Some(idx) = a.idx_of(id) {
                             a.sessions[idx].claude_session_id = Some(sid);
                             a.resume(id, true, ctx);
                         }
-                    }
                     a.persist();
                     Some(id)
                 });

@@ -192,15 +192,13 @@ pub fn spawn_initial_scan(map: SharedMap) {
 /// Background-thread path resolution: map hit, then the cwd candidate (new
 /// bindings land here instantly), then a full rescan throttled to 1/30s.
 pub fn resolve_jsonl(map: &SharedMap, sid: &str, cwd_hint: Option<&Path>) -> Option<PathBuf> {
-    if let Ok(m) = map.lock() {
-        if let Some(p) = m.map.get(sid) {
-            if p.exists() {
+    if let Ok(m) = map.lock()
+        && let Some(p) = m.map.get(sid)
+            && p.exists() {
                 return Some(p.clone());
             }
-        }
-    }
-    if let Some(cwd) = cwd_hint {
-        if let Some(dir) = project_dir(cwd) {
+    if let Some(cwd) = cwd_hint
+        && let Some(dir) = project_dir(cwd) {
             let cand = dir.join(format!("{sid}.jsonl"));
             if cand.exists() {
                 if let Ok(mut m) = map.lock() {
@@ -209,7 +207,6 @@ pub fn resolve_jsonl(map: &SharedMap, sid: &str, cwd_hint: Option<&Path>) -> Opt
                 return Some(cand);
             }
         }
-    }
     let due = {
         let mut m = map.lock().ok()?;
         if m.last_scan.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
@@ -396,16 +393,14 @@ pub fn lookup(
 ) {
     std::thread::spawn(move || {
         let mut sent = false;
-        if let Some(u) = by_sid_path(&sid).as_deref().and_then(read_snapshot) {
-            if u.sid == sid {
+        if let Some(u) = by_sid_path(&sid).as_deref().and_then(read_snapshot)
+            && u.sid == sid {
                 sent |= tx.send(CtxMsg::Update(u)).is_ok();
             }
-        }
-        if let Some(path) = resolve_jsonl(&map, &sid, Some(&cwd)) {
-            if let Some(u) = estimate_from_jsonl(&path, &sid) {
+        if let Some(path) = resolve_jsonl(&map, &sid, Some(&cwd))
+            && let Some(u) = estimate_from_jsonl(&path, &sid) {
                 sent |= tx.send(CtxMsg::Update(u)).is_ok();
             }
-        }
         if sent {
             egui.request_repaint();
         }
@@ -471,11 +466,10 @@ pub fn sweep() {
                 return;
             };
             for e in rd.flatten() {
-                if let Some(pref) = prefix {
-                    if !e.file_name().to_string_lossy().starts_with(pref) {
+                if let Some(pref) = prefix
+                    && !e.file_name().to_string_lossy().starts_with(pref) {
                         continue;
                     }
-                }
                 let old = e
                     .metadata()
                     .and_then(|m| m.modified())
@@ -763,9 +757,7 @@ mod tests {
 
     #[test]
     fn scan_sidechain_and_no_usage_skipped() {
-        let side = format!(
-            "{{\"isSidechain\":true,\"message\":{{\"usage\":{{\"input_tokens\":5,\"cache_read_input_tokens\":900000}}}}}}"
-        );
+        let side = "{\"isSidechain\":true,\"message\":{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":900000}}}".to_string();
         let main = usage_line(1000, 99_000, "claude-fable-5", "2026-07-23T10:00:00.000Z");
         let text = format!("{main}\n{side}");
         let (pct, _) = scan_usage(&text, false).unwrap();

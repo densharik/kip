@@ -198,6 +198,20 @@ pub fn load_state() -> AppState {
     }
 }
 
+pub fn save_state(state: &AppState) {
+    let path = state_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Write-then-rename so a crash mid-write cannot truncate the existing state.
+    if let Ok(json) = serde_json::to_vec_pretty(state) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,19 +234,5 @@ mod tests {
         migrate(&mut s);
         assert_eq!(s.font, "menlo");
         assert_eq!(s.font_size, 15.0);
-    }
-}
-
-pub fn save_state(state: &AppState) {
-    let path = state_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    // Write-then-rename so a crash mid-write cannot truncate the existing state.
-    if let Ok(json) = serde_json::to_vec_pretty(state) {
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
     }
 }

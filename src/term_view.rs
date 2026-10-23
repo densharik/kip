@@ -159,11 +159,10 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     let mut out: Vec<u8> = Vec::new();
 
     let alt = mode.contains(TermMode::ALT_SCREEN);
-    if term.selection.is_none() {
-        if let Some((sel, _)) = session.sel_keep.as_ref().filter(|(_, a)| *a == alt) {
+    if term.selection.is_none()
+        && let Some((sel, _)) = session.sel_keep.as_ref().filter(|(_, a)| *a == alt) {
             term.selection = Some(sel.clone());
         }
-    }
 
     // A link popup swallows Escape (it closes the menu, see link_menu) instead of
     // letting it reach claude and cancel whatever it is doing.
@@ -219,11 +218,10 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                     }
                 },
                 Event::Copy => {
-                    if let Some(text) = term.selection_to_string() {
-                        if !text.is_empty() {
+                    if let Some(text) = term.selection_to_string()
+                        && !text.is_empty() {
                             ui.ctx().copy_text(text);
                         }
-                    }
                 },
                 _ => {},
             }
@@ -271,8 +269,8 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
 
     // Dragging a selection past the top or bottom edge scrolls the scrollback,
     // faster the farther the pointer is, and keeps going while it is held still.
-    if response.dragged_by(PointerButton::Primary) && term.selection.is_some() && !alt {
-        if let Some(pos) = response.interact_pointer_pos() {
+    if response.dragged_by(PointerButton::Primary) && term.selection.is_some() && !alt
+        && let Some(pos) = response.interact_pointer_pos() {
             let over = if pos.y < rect.top() {
                 pos.y - rect.top()
             } else if pos.y > rect.bottom() {
@@ -286,7 +284,6 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
             }
         }
-    }
 
     // Mouse selection.
     let display_offset = term.grid().display_offset();
@@ -400,13 +397,10 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         && (response.drag_stopped_by(PointerButton::Primary)
             || response.double_clicked()
             || response.triple_clicked())
-    {
-        if let Some(text) = term.selection_to_string() {
-            if !text.is_empty() {
+        && let Some(text) = term.selection_to_string()
+            && !text.is_empty() {
                 ui.ctx().copy_text(text);
             }
-        }
-    }
 
     if !out.is_empty() {
         term.scroll_display(Scroll::Bottom);
@@ -555,8 +549,8 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
             match shape {
                 CursorShape::Block => {
                     painter.rect_filled(cell_rect, 0.0, palette::cursor());
-                    if let Some((c, _)) = cursor_cell {
-                        if c != ' ' {
+                    if let Some((c, _)) = cursor_cell
+                        && c != ' ' {
                             painter.text(
                                 Pos2::new(x, y),
                                 Align2::LEFT_TOP,
@@ -565,7 +559,6 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                                 palette::term_bg(),
                             );
                         }
-                    }
                 },
                 CursorShape::Beam => {
                     painter.rect_filled(

@@ -73,11 +73,10 @@ fn handle(pboard: &NSPasteboard) {
         }
     }
     // Fallback: a plain-text selection that is itself a path.
-    if raw.is_empty() {
-        if let Some(s) = pboard.stringForType(unsafe { NSPasteboardTypeString }) {
+    if raw.is_empty()
+        && let Some(s) = pboard.stringForType(unsafe { NSPasteboardTypeString }) {
             raw.push(s.to_string());
         }
-    }
 
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen = HashSet::new();
@@ -88,11 +87,10 @@ fn handle(pboard: &NSPasteboard) {
         } else {
             p.parent().filter(|d| d.is_dir()).map(Path::to_path_buf)
         };
-        if let Some(d) = dir {
-            if seen.insert(d.clone()) {
+        if let Some(d) = dir
+            && seen.insert(d.clone()) {
                 dirs.push(d);
             }
-        }
     }
     if dirs.is_empty() {
         return;

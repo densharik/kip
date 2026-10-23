@@ -803,11 +803,9 @@ impl App {
         if focused
             && paste_shortcut()
             && ctx.input(|i| !i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))))
-        {
-            if let Some(p) = plat::clipboard_paths() {
+            && let Some(p) = plat::clipboard_paths() {
                 self.insert_paths(shell_escape(&p));
             }
-        }
         // Drag & drop of files from Finder.
         let dropped: Vec<String> = ctx.input(|i| {
             i.raw
@@ -1140,12 +1138,11 @@ impl App {
     fn move_session(&mut self, id: u64, group: Option<String>, before: Option<u64>) {
         if before == Some(id) {
             // Dropped onto itself; only the group might still need updating.
-            if let Some(i) = self.idx_of(id) {
-                if self.sessions[i].group != group {
+            if let Some(i) = self.idx_of(id)
+                && self.sessions[i].group != group {
                     self.sessions[i].group = group;
                     self.persist();
                 }
-            }
             return;
         }
         let anchors = self.pin_anchors();
@@ -1371,11 +1368,10 @@ impl App {
     fn active_cwd(&self) -> PathBuf {
         if let Some(idx) = self.active_idx() {
             let s = &self.sessions[idx];
-            if let Some(live) = s.live() {
-                if let Some(cwd) = plat::pid_cwd(live.shell_pid) {
+            if let Some(live) = s.live()
+                && let Some(cwd) = plat::pid_cwd(live.shell_pid) {
                     return cwd;
                 }
-            }
             return s.cwd.clone();
         }
         dirs::home_dir().unwrap_or_else(|| "/".into())
@@ -1518,11 +1514,10 @@ impl App {
                     self.persist();
                 },
                 Act::ResumeInPlace(id) => {
-                    if let Some(idx) = self.idx_of(id) {
-                        if let Some(cmd) = self.sessions[idx].resume_command(&self.settings) {
+                    if let Some(idx) = self.idx_of(id)
+                        && let Some(cmd) = self.sessions[idx].resume_command(&self.settings) {
                             self.send_command_to(idx, &cmd, ctx);
                         }
-                    }
                 },
                 Act::Close(id) => {
                     if let Some(idx) = self.idx_of(id) {
@@ -1539,11 +1534,10 @@ impl App {
                     }
                 },
                 Act::Remove(id) => {
-                    if let Some(idx) = self.idx_of(id) {
-                        if !self.refuse_pinned(idx) {
+                    if let Some(idx) = self.idx_of(id)
+                        && !self.refuse_pinned(idx) {
                             self.remove_session(idx);
                         }
-                    }
                 },
                 Act::ToggleAwake(id) => {
                     if let Some(idx) = self.idx_of(id) {
@@ -1583,11 +1577,10 @@ impl App {
                     self.w.renaming_group = None;
                 },
                 Act::MoveSession { id, group, before } => {
-                    if let Some(idx) = self.idx_of(id) {
-                        if !self.refuse_pinned(idx) {
+                    if let Some(idx) = self.idx_of(id)
+                        && !self.refuse_pinned(idx) {
                             self.move_session(id, group, before);
                         }
-                    }
                 },
                 Act::MoveGroup { name, before } if self.settings.group_by_project => self.move_project(name, before),
                 Act::MoveGroup { name, before } => self.move_group(name, before),
@@ -1822,6 +1815,8 @@ impl App {
                 // Claude stays the foreground process between turns, so the
                 // end of a turn is its own status leaving "busy" - also when
                 // it stops to ask for a permission.
+                // A guard on `Some(_)` would skip `take()` when seen.
+                #[allow(clippy::collapsible_match)]
                 match info.status.as_deref() {
                     Some("busy") => {
                         if s.turn_since.is_none() {
@@ -1832,33 +1827,29 @@ impl App {
                     Some(_) => {
                         // Any reply counts, even a 2-second one: you sent it
                         // and looked away, now it waits for you.
-                        if s.turn_since.take().is_some() {
-                            if !seen {
-                                s.done = true;
-                                s.unread = true;
-                            }
+                        if s.turn_since.take().is_some() && !seen {
+                            s.done = true;
+                            s.unread = true;
                         }
                     },
                     None => {},
                 }
                 // Claude found behind a wrapper: adopt right away, don't wait
                 // for the next housekeeping tick to re-validate.
-                if let Some(cp) = info.claude_pid {
-                    if s.claude_pid != Some(cp) {
+                if let Some(cp) = info.claude_pid
+                    && s.claude_pid != Some(cp) {
                         s.claude_pid = Some(cp);
                         s.fg_is_claude = true;
                         s.saw_claude = true;
                         s.burst_until = Some(Instant::now() + Duration::from_secs(3));
                     }
-                }
-                if let Some(sid) = info.session_id {
-                    if s.claude_session_id.as_deref() != Some(sid.as_str()) {
+                if let Some(sid) = info.session_id
+                    && s.claude_session_id.as_deref() != Some(sid.as_str()) {
                         s.claude_session_id = Some(sid.clone());
                         s.ctx_stat.jsonl_path = None;
                         s.ctx_stat.path_sid = None;
                         lookups.push((sid, s.cwd.clone()));
                     }
-                }
             }
         }
         // Write the new id down now: after a force quit there is no on_exit to
@@ -1898,11 +1889,10 @@ impl App {
         // Every session in the list: badges show on rows that are not open.
         let sids: Vec<String> = self.sessions.iter().filter_map(|s| s.claude_session_id.clone()).collect();
         self.mods.retain(|sid, _| sids.contains(sid));
-        if let Ok(mut w) = self.mods_watch.lock() {
-            if *w != sids {
+        if let Ok(mut w) = self.mods_watch.lock()
+            && *w != sids {
                 *w = sids;
             }
-        }
     }
 
     fn drain_git(&mut self) {
@@ -2008,13 +1998,12 @@ impl App {
                         }
                     }
                 }
-                if let Some(cwd) = plat::pid_cwd(shell_pid) {
-                    if cwd != s.cwd {
+                if let Some(cwd) = plat::pid_cwd(shell_pid)
+                    && cwd != s.cwd {
                         s.cwd = cwd;
                         s.git = None;
                         s.last_git_poll = None;
                     }
-                }
                 // Idle = no PTY output and no user interaction. An interactive claude
                 // stays foreground even while it sleeps at its prompt, so busy alone is
                 // not activity - but a silent non-claude job (make, rsync) must survive.
@@ -2092,8 +2081,8 @@ impl App {
             let fg = plat::foreground_pgid(master_fd, shell_pid).filter(|pg| *pg != shell_pid);
             // Busy but not (yet) claude: a wrapper (cchb etc) may be about to
             // spawn claude as a child - look for it in the background.
-            if fg.is_some() && !s.fg_is_claude {
-                if s.ctx_stat.last_finder.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(2)) {
+            if fg.is_some() && !s.fg_is_claude
+                && s.ctx_stat.last_finder.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(2)) {
                     s.ctx_stat.last_finder = Some(now);
                     session::poll_claude(
                         s.id,
@@ -2105,7 +2094,6 @@ impl App {
                         ctx.clone(),
                     );
                 }
-            }
             if !s.fg_is_claude && !bursting {
                 continue;
             }
@@ -2240,11 +2228,10 @@ impl App {
             if consume_cmd(i, Key::Comma) {
                 acts.push(Act::Settings);
             }
-            if let Some(id) = active {
-                if consume_cmd(i, Key::W) {
+            if let Some(id) = active
+                && consume_cmd(i, Key::W) {
                     acts.push(Act::Close(id));
                 }
-            }
             for (n, key) in [
                 Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5,
                 Key::Num6, Key::Num7, Key::Num8, Key::Num9,
@@ -2252,11 +2239,10 @@ impl App {
             .iter()
             .enumerate()
             {
-                if consume_cmd(i, *key) {
-                    if let Some(id) = rows.get(n) {
+                if consume_cmd(i, *key)
+                    && let Some(id) = rows.get(n) {
                         acts.push(Act::Select(*id));
                     }
-                }
             }
         });
         if past {
@@ -2384,11 +2370,10 @@ impl App {
                         } else {
                             Some(s.find_cur.unwrap_or(len - 1).min(len - 1))
                         };
-                        if fresh {
-                            if let Some(c) = s.find_cur {
+                        if fresh
+                            && let Some(c) = s.find_cur {
                                 term_view::reveal(&mut term, &s.find_hits[c]);
                             }
-                        }
                         len
                     },
                     _ => snapshot_hits(s.snapshot.as_deref(), &query),
@@ -2718,11 +2703,10 @@ impl App {
                     }
                 }
             } else {
-                if let Some(parent) = dir.parent() {
-                    if ex_row(ui, "..", true).clicked() {
+                if let Some(parent) = dir.parent()
+                    && ex_row(ui, "..", true).clicked() {
                         go_dir = Some(parent.to_path_buf());
                     }
-                }
                 for e in &self.w.explorer.list {
                     if ex_row(ui, &e.name, e.is_dir).clicked() {
                         let p = dir.join(&e.name);
@@ -2937,11 +2921,10 @@ impl App {
     /// Header color: a swatch hovered in its menu, else the one picked; a
     /// project falls back to its own stable color, a group to none.
     fn header_color(&self, key: &str, project: bool) -> Option<Color32> {
-        if let Some((k, col)) = &self.w.color_preview {
-            if k == key {
+        if let Some((k, col)) = &self.w.color_preview
+            && k == key {
                 return Some(*col);
             }
-        }
         match self.group_colors.get(key) {
             Some(rgb) => Some(palette::group_tint(*rgb)),
             None if project => Some(palette::group_tint(palette::auto_group_color(key))),
@@ -3089,12 +3072,11 @@ impl App {
                 ui.close();
             }
             let folder = common_dir(self.sessions.iter().filter(|s| s.group.as_deref() == Some(name)).map(|s| s.cwd.as_path()));
-            if let Some(dir) = &folder {
-                if ui.button(open_folder_label()).on_hover_text(tilde(dir)).clicked() {
+            if let Some(dir) = &folder
+                && ui.button(open_folder_label()).on_hover_text(tilde(dir)).clicked() {
                     acts.push(Act::OpenFolder(dir.clone()));
                     ui.close();
                 }
-            }
             self.color_menu(ui, name, false, acts);
         });
 
@@ -3352,7 +3334,7 @@ impl App {
         let ago = self
             .settings
             .show_last_msg
-            .then(|| s.claude_session_id.as_deref())
+            .then_some(s.claude_session_id.as_deref())
             .flatten()
             .and_then(|sid| self.ctx_index.last_msg(sid))
             .map(|t| {
@@ -3430,11 +3412,10 @@ impl App {
         let cur_group = s.group.clone();
         let mut all_groups: Vec<String> = Vec::new();
         for x in &self.sessions {
-            if let Some(g) = &x.group {
-                if !all_groups.contains(g) {
+            if let Some(g) = &x.group
+                && !all_groups.contains(g) {
                     all_groups.push(g.clone());
                 }
-            }
         }
         let other_wins: Vec<(u64, String)> = self
             .wins
@@ -3761,7 +3742,7 @@ impl App {
                 && self.w.renaming.is_none()
                 && self.w.renaming_group.is_none()
                 // Don't steal focus from the explorer's active text field.
-                && !(self.w.explorer.open && self.w.explorer.mode != ExMode::Browse);
+                && (!self.w.explorer.open || self.w.explorer.mode == ExMode::Browse);
             let term_rect = ui.available_rect_before_wrap();
             self.w.term_rect = Some(term_rect);
             let s = &mut self.sessions[idx];
@@ -3828,7 +3809,7 @@ impl App {
             && self.w.renaming.is_none()
             && self.w.renaming_group.is_none()
             // The explorer's search / new-file field owns the keyboard while open.
-            && !(self.w.explorer.open && self.w.explorer.mode != ExMode::Browse);
+            && (!self.w.explorer.open || self.w.explorer.mode == ExMode::Browse);
         let mut submit: Option<String> = None;
 
         // Multiline once the command has a newline (added with Shift+Enter, which
@@ -3988,13 +3969,12 @@ impl App {
                             },
                         );
                     });
-                    if caret_end {
-                        if let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), resp.id) {
+                    if caret_end
+                        && let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), resp.id) {
                             let end = egui::text::CCursor::new(self.w.cmd_input.chars().count());
                             state.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
                             state.store(ui.ctx(), resp.id);
                         }
-                    }
                     if resp.changed() {
                         self.w.hist_query = self.w.cmd_input.clone();
                         self.w.hist_dismissed = false;
@@ -4633,11 +4613,10 @@ impl App {
                     });
             });
 
-        if enter && nav.is_none() {
-            if let Some(first) = dirs.first() {
+        if enter && nav.is_none()
+            && let Some(first) = dirs.first() {
                 nav = Some(Some(first.clone()));
             }
-        }
         if let Some(step) = nav {
             self.dir_navigate(step, ctx);
         }
@@ -4781,11 +4760,10 @@ impl App {
                         });
                 }
             });
-        if let Some(name) = toggle {
-            if !self.w.mods_folded.remove(&name) {
+        if let Some(name) = toggle
+            && !self.w.mods_folded.remove(&name) {
                 self.w.mods_folded.insert(name);
             }
-        }
     }
 
     fn frozen_view(&mut self, ui: &mut egui::Ui, idx: usize, acts: &mut Vec<Act>) {
@@ -5397,7 +5375,9 @@ impl eframe::App for App {
 /// the bundled JetBrains Mono, "Hack" is egui's own default monospace. Which
 /// one looks right is a matter of taste (Menlo is thinner than Hack, SF Mono is
 /// wider), so this is a setting rather than a guess.
-const FONT_CHOICES: &[(&str, &str, Option<(&str, u32)>)] = &[
+/// (setting key, label, font file and face index; None = built in)
+type FontChoice = (&'static str, &'static str, Option<(&'static str, u32)>);
+const FONT_CHOICES: &[FontChoice] = &[
     // Index 1 of Menlo.ttc is Menlo Bold - a heavier terminal on displays where
     // egui's grayscale antialiasing renders Regular too thin.
     ("menlo", "Menlo", Some(("/System/Library/Fonts/Menlo.ttc", 0))),
@@ -5762,14 +5742,12 @@ fn truncate_end(s: &str, max: usize) -> String {
 fn consume_plain(i: &mut egui::InputState, target: Key) -> bool {
     let mut hit = false;
     i.events.retain(|e| {
-        if !hit {
-            if let egui::Event::Key { key, pressed: true, modifiers, .. } = e {
-                if modifiers.is_none() && *key == target {
+        if !hit
+            && let egui::Event::Key { key, pressed: true, modifiers, .. } = e
+                && modifiers.is_none() && *key == target {
                     hit = true;
                     return false;
                 }
-            }
-        }
         true
     });
     hit
@@ -5784,16 +5762,14 @@ fn consume_cmd(i: &mut egui::InputState, target: Key) -> bool {
 fn consume_mods(i: &mut egui::InputState, mods: Modifiers, target: Key) -> bool {
     let mut hit = false;
     i.events.retain(|e| {
-        if !hit {
-            if let egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } = e {
-                if modifiers.matches_logically(mods)
+        if !hit
+            && let egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } = e
+                && modifiers.matches_logically(mods)
                     && (*key == target || *physical_key == Some(target))
                 {
                     hit = true;
                     return false;
                 }
-            }
-        }
         true
     });
     hit

@@ -52,6 +52,7 @@ impl App {
     pub(super) fn drain_past(&mut self, ctx: &egui::Context) {
         let epoch = self.past.epoch.load(Ordering::Relaxed);
         while let Ok(msg) = self.past_rx.try_recv() {
+            #[allow(clippy::collapsible_match)]
             match msg {
                 PastMsg::Index(entries) => {
                     self.past.hay = entries
@@ -64,11 +65,10 @@ impl App {
                     // New or changed files: run the content search again.
                     self.past.searched.clear();
                     // A selection asked for before the index was there (show_history).
-                    if self.past.preview.is_none() {
-                        if let Some(sid) = self.past.sel.take() {
+                    if self.past.preview.is_none()
+                        && let Some(sid) = self.past.sel.take() {
                             self.past_select(sid);
                         }
-                    }
                 },
                 PastMsg::Hit(g, sid, n) if g == epoch => {
                     self.past.hits.insert(sid, n);
@@ -89,15 +89,14 @@ impl App {
                 _ => {},
             }
         }
-        if let Some(id) = self.past.focus_session.take() {
-            if let Ok(k) = self.win_of(id) {
+        if let Some(id) = self.past.focus_session.take()
+            && let Ok(k) = self.win_of(id) {
                 self.in_window(k, |a| {
                     a.w.past_open = false;
                     a.apply(vec![Act::Select(id)], ctx);
                 });
                 ctx.send_viewport_cmd_to(self.wins[k].viewport(), egui::ViewportCommand::Focus);
             }
-        }
     }
 
     /// Bring a past conversation back: switch to its tab if kip has it open,
@@ -116,13 +115,12 @@ impl App {
         }
         let cwd = if e.cwd.is_dir() { e.cwd.clone() } else { dirs::home_dir().unwrap_or_default() };
         self.spawn(cwd, None, ctx);
-        if let Some(id) = self.w.active {
-            if let Some(idx) = self.idx_of(id) {
+        if let Some(id) = self.w.active
+            && let Some(idx) = self.idx_of(id) {
                 self.sessions[idx].claude_session_id = Some(e.sid.clone());
                 self.sessions[idx].claude_title = e.title.clone();
                 self.resume(id, true, ctx);
             }
-        }
         self.persist();
     }
 
@@ -166,7 +164,7 @@ impl App {
                             let _ = tx.send(PastMsg::Hit(epoch, files[i].0.clone(), n));
                         }
                         let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n > 0 || d % 16 == 0 || d == files.len() {
+                        if n > 0 || d.is_multiple_of(16) || d == files.len() {
                             let _ = tx.send(PastMsg::Progress(epoch, d));
                             ctx.request_repaint();
                         }

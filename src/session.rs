@@ -332,6 +332,7 @@ pub(crate) fn grab_snapshot(term: &FairMutex<Term<EventProxy>>) -> String {
     text.trim_end().to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_live(
     id: u64,
     cwd: &Path,
@@ -368,11 +369,15 @@ pub fn spawn_live(
     env.insert("TERM_PROGRAM".into(), "kip".into());
 
     // Built via Default so the windows-only `escape_args` field is set too.
-    let mut opts = PtyOptions::default();
-    opts.shell = Some(shell);
-    opts.working_directory = Some(cwd.to_path_buf());
-    opts.drain_on_exit = false;
-    opts.env = env;
+    #[allow(clippy::field_reassign_with_default)]
+    let opts = {
+        let mut o = PtyOptions::default();
+        o.shell = Some(shell);
+        o.working_directory = Some(cwd.to_path_buf());
+        o.drain_on_exit = false;
+        o.env = env;
+        o
+    };
 
     let window_size = WindowSize {
         num_lines: rows,
@@ -413,7 +418,7 @@ pub fn spawn_live(
             unsafe {
                 libc::close(master_fd)
             };
-            return Err(e.into());
+            return Err(e);
         },
     };
     let notifier = Notifier(event_loop.channel());
@@ -602,11 +607,10 @@ pub fn spawn_meta_read(
         if meta.len() > 16 * 1024 {
             return;
         }
-        if let (Some(min), Ok(mt)) = (min_mtime, meta.modified()) {
-            if mt < min - Duration::from_secs(10) {
+        if let (Some(min), Ok(mt)) = (min_mtime, meta.modified())
+            && mt < min - Duration::from_secs(10) {
                 return;
             }
-        }
         let Ok(text) = std::fs::read_to_string(&path) else { return };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
         if v["pid"].as_i64() != Some(pid as i64) {
@@ -741,6 +745,31 @@ fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+fn git_stats(cwd: &Path) -> GitStats {
+    // `branch --show-current` fails outside a repo (doubles as the repo check)
+    // and works in repos without commits; empty output = detached HEAD.
+    let Some(raw_branch) = git(cwd, &["branch", "--show-current"]) else {
+        return GitStats::default();
+    };
+    let branch = Some(raw_branch)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| git(cwd, &["rev-parse", "--short", "HEAD"]).map(|s| s.trim().to_string()))
+        .unwrap_or_default();
+    let mut stats = GitStats { is_repo: true, branch, ..Default::default() };
+    let numstat = git(cwd, &["diff", "HEAD", "--numstat"])
+        .or_else(|| git(cwd, &["diff", "--numstat"]))
+        .unwrap_or_default();
+    for line in numstat.lines() {
+        let mut parts = line.split('\t');
+        let a = parts.next().unwrap_or("-");
+        let d = parts.next().unwrap_or("-");
+        stats.added += a.parse::<u32>().unwrap_or(0);
+        stats.deleted += d.parse::<u32>().unwrap_or(0);
+    }
+    stats
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,29 +870,4 @@ mod tests {
         let s = Session::from_saved(SavedSession { pinned: true, ..old }, 1);
         assert!(s.pinned && s.to_saved().pinned);
     }
-}
-
-fn git_stats(cwd: &Path) -> GitStats {
-    // `branch --show-current` fails outside a repo (doubles as the repo check)
-    // and works in repos without commits; empty output = detached HEAD.
-    let Some(raw_branch) = git(cwd, &["branch", "--show-current"]) else {
-        return GitStats::default();
-    };
-    let branch = Some(raw_branch)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| git(cwd, &["rev-parse", "--short", "HEAD"]).map(|s| s.trim().to_string()))
-        .unwrap_or_default();
-    let mut stats = GitStats { is_repo: true, branch, ..Default::default() };
-    let numstat = git(cwd, &["diff", "HEAD", "--numstat"])
-        .or_else(|| git(cwd, &["diff", "--numstat"]))
-        .unwrap_or_default();
-    for line in numstat.lines() {
-        let mut parts = line.split('\t');
-        let a = parts.next().unwrap_or("-");
-        let d = parts.next().unwrap_or("-");
-        stats.added += a.parse::<u32>().unwrap_or(0);
-        stats.deleted += d.parse::<u32>().unwrap_or(0);
-    }
-    stats
 }

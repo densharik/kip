@@ -63,11 +63,10 @@ fn detect_uncached() -> Lang {
         }
     }
     for key in ["LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"] {
-        if let Ok(v) = std::env::var(key) {
-            if !v.is_empty() {
+        if let Ok(v) = std::env::var(key)
+            && !v.is_empty() {
                 return from_locale(&v);
             }
-        }
     }
     Lang::En
 }

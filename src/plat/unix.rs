@@ -97,11 +97,10 @@ pub fn sample_stats(targets: &[(String, i32, bool)]) -> SysStats {
                     }
                     cpu += rows[i].3;
                 }
-                if *tree {
-                    if let Some(kids) = children.get(&pid) {
+                if *tree
+                    && let Some(kids) = children.get(&pid) {
                         stack.extend(kids.iter().map(|&i| rows[i].0));
                     }
-                }
             }
             (label.clone(), cpu, rss)
         })
