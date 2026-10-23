@@ -65,6 +65,9 @@ jobs:
           mkdir -p dist
           cp target/release/kip dist/kip
       - name: Bundle kip.app
+        env:
+          KIP_CODESIGN_P12: ${{ secrets.KIP_CODESIGN_P12 }}
+          KIP_CODESIGN_PASS: ${{ secrets.KIP_CODESIGN_PASS }}
         run: |
           APP=dist/kip.app
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -106,7 +109,21 @@ jobs:
           </dict>
           </plist>
           PLIST
-          codesign --force --deep -s - "$APP"
+          # A fixed self-signed certificate, not ad-hoc: macOS ties Screen
+          # Recording and other permissions to the signing identity, and an
+          # ad-hoc identity is the binary's hash, so every update asked again.
+          KC="$RUNNER_TEMP/kip.keychain-db"
+          security create-keychain -p kip "$KC"
+          security set-keychain-settings "$KC"
+          security unlock-keychain -p kip "$KC"
+          echo "$KIP_CODESIGN_P12" | base64 --decode > "$RUNNER_TEMP/kip.p12"
+          security import "$RUNNER_TEMP/kip.p12" -k "$KC" -P "$KIP_CODESIGN_PASS" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/kip.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k kip "$KC" > /dev/null
+          security list-keychains -d user -s "$KC"
+          codesign --force --deep --keychain "$KC" -s 0469D81EBBD12F26E281C6D14D396E3CB8A1F21F "$APP"
+          codesign -dr - "$APP" 2>&1 | grep -q 'certificate leaf = H"0469d81ebbd12f26e281c6d14d396e3cb8a1f21f"'
+          security delete-keychain "$KC"
       - name: Zip (for the in-app updater and manual install)
         run: ditto -c -k --keepParent dist/kip.app dist/kip-macos.zip
       - name: Build .pkg installer
