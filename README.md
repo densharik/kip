@@ -69,6 +69,11 @@ they are gone. kip fixes those three things and stays out of the way otherwise.
 - Mark a session "keep awake" to exempt it from the idle timer.
 - Quit kip and every session is still there when you come back - same names,
   groups, pins, last screen, and Claude conversation id.
+- On launch, sessions that were running at quit and the one each window was
+  showing come back by themselves, in the background. A sleeping session also
+  starts waking when the pointer rests on it. While a resumed Claude boots and
+  reprints its conversation (1-3 s, that is Claude Code itself), kip shows the
+  old screen instead of a blank, scrolling one.
 
 **Monitoring**
 
@@ -223,7 +228,7 @@ is used. If kip is not running, the first call starts it.
 
 | Tool | Does |
 |---|---|
-| `list_sessions`, `list_windows` | sessions with folder, group, window, state, busy, finished-unseen, pinned, context %, idle time |
+| `list_sessions`, `list_windows` | sessions with folder, group, project, window, state, busy, still starting, finished-unseen, pinned, context %, idle time |
 | `open_session` | new terminal in a folder: plain, with Claude, `--resume <id>`, or a command; window, group, name |
 | `close_session`, `suspend_session`, `wake_session` | pinned sessions refuse to close without `force` |
 | `focus_session`, `rename_session`, `set_group`, `pin_session` | |

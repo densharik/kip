@@ -39,6 +39,11 @@ pub struct Settings {
     /// Sidebar sections follow each session's project (git root or folder)
     /// instead of the manual groups, which stay saved for switching back.
     pub group_by_project: bool,
+    /// On launch, bring back the sessions that were running at quit and the one
+    /// each window was showing, in the background.
+    pub wake_on_start: bool,
+    /// Start waking a sleeping session when the pointer rests on its row.
+    pub wake_on_hover: bool,
     /// Key of the usage limit pinned to the corner chip (see usage::Limit::key).
     pub usage_pin: Option<String>,
     /// MCP may type into sessions (send_input). Off: one Claude must not drive another unasked.
@@ -86,6 +91,8 @@ impl Default for Settings {
             show_last_msg: true,
             row_separators: false,
             group_by_project: false,
+            wake_on_start: true,
+            wake_on_hover: true,
             usage_pin: None,
             mcp_send_input: false,
             mcp_offer_off: false,
@@ -132,6 +139,11 @@ pub struct SavedSession {
     pub snapshot: Option<String>,
     /// Window the session lives in (see `SavedWindow::id`, 0 = the main one).
     pub window: u64,
+    /// Running when kip quit: Some(true) with Claude in it, Some(false) a plain
+    /// shell. Such sessions come back up on the next launch.
+    pub live: Option<bool>,
+    /// The one its window was showing.
+    pub active: bool,
 }
 
 impl Default for SavedSession {
@@ -147,6 +159,8 @@ impl Default for SavedSession {
             pinned: false,
             snapshot: None,
             window: 0,
+            live: None,
+            active: false,
         }
     }
 }

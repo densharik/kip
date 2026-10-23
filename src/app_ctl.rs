@@ -149,6 +149,7 @@ impl App {
             "state": state,
             "busy": s.busy,
             "done": s.done,
+            "starting": s.cover.is_some(),
             "claude_running": s.fg_is_claude,
             "running_cmd": s.running_cmd,
             "pinned": s.pinned,
