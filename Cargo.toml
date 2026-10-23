@@ -35,3 +35,8 @@ windows-sys = { version = "0.60", features = [
 [profile.release]
 lto = "thin"
 strip = true
+
+# eframe with one fix: the UI stalled for good once every window had been
+# minimized (see vendor/eframe/src/native/wgpu_integration.rs, "kip patch").
+[patch.crates-io]
+eframe = { path = "vendor/eframe" }
