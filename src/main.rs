@@ -183,8 +183,6 @@ enum Act {
     OpenFolder(PathBuf),
     /// Continue a past Claude conversation by its session id.
     PastResume(String),
-    /// Bring a sleeping session back in the background (pointer rested on it).
-    Wake(u64),
     Suspend(u64),
     /// bool = resume the saved Claude session (vs plain shell). Either way the
     /// same session is revived in place - no new tab.
@@ -338,11 +336,6 @@ struct WinUi {
     /// frame, collected into `color_hover` while the menu draws.
     color_preview: Option<(String, Color32)>,
     color_hover: Option<(String, Color32)>,
-    /// Sleeping row under the pointer and since when (wake on hover).
-    hover_wake: Option<(u64, Instant, Instant)>,
-    /// Rows the hover-wake timer put back to sleep: not woken again by hover
-    /// until the pointer has left them.
-    hover_block: Vec<u64>,
 }
 
 /// Search over the active terminal, with a lazy count in the window's other
@@ -538,10 +531,6 @@ struct App {
     proj_tx: Sender<(u64, PathBuf, PathBuf)>,
     proj_rx: Receiver<(u64, PathBuf, PathBuf)>,
     proj_seq: u64,
-    /// Sessions to bring back in the background, one every WAKE_GAP, and when
-    /// the next one is due. bool = resume Claude in it.
-    wake_queue: std::collections::VecDeque<(u64, bool)>,
-    wake_at: Instant,
 }
 
 impl App {
@@ -674,19 +663,13 @@ impl App {
             proj_tx,
             proj_rx,
             proj_seq: 0,
-            wake_queue: Default::default(),
-            wake_at: Instant::now(),
         };
-        let mut active_ids: Vec<u64> = Vec::new();
         for mut saved in state.sessions {
             if !app.wins.iter().any(|w| w.id == saved.window) {
                 saved.window = 0;
             }
             let id = app.next_id;
             app.next_id += 1;
-            if saved.active {
-                active_ids.push(id);
-            }
             app.sessions.push(Session::from_saved(saved, id));
         }
         // An extra window with nothing in it is not worth reopening.
@@ -702,22 +685,12 @@ impl App {
             all = rest;
             app.sessions = mine;
             app.normalize_order();
-            app.wins[k].ui.active = app.sessions.iter().find(|s| active_ids.contains(&s.id)).or(app.sessions.first()).map(|s| s.id);
+            app.wins[k].ui.active = app.sessions.first().map(|s| s.id);
             app.parked.append(&mut app.sessions);
         }
         app.sessions = std::mem::take(&mut app.parked);
         if app.sessions.is_empty() {
             app.wins[0].pending_spawn = Some(dirs::home_dir().unwrap_or_else(|| "/".into()));
-        }
-        // Each window's shown session first, then the rest that were running at quit.
-        if app.settings.wake_on_start {
-            let shown: Vec<u64> = app.wins.iter().filter_map(|w| w.ui.active).collect();
-            for s in app.sessions.iter().filter(|s| shown.contains(&s.id)).chain(app.sessions.iter().filter(|s| s.was_live.is_some())) {
-                let claude = s.was_live.unwrap_or(true) && s.claude_session_id.is_some();
-                if !app.wake_queue.iter().any(|(id, _)| *id == s.id) {
-                    app.wake_queue.push_back((s.id, claude));
-                }
-            }
         }
         // Show saved sessions' context load right away, before claude ever runs.
         for s in &app.sessions {
@@ -981,14 +954,7 @@ impl App {
         let used: HashSet<u64> = self.sessions.iter().map(|s| s.window).collect();
         save_state(&AppState {
             settings: self.settings.clone(),
-            sessions: self
-                .sessions
-                .iter()
-                .map(|s| config::SavedSession {
-                    active: self.wins.iter().any(|w| w.ui.active == Some(s.id)),
-                    ..s.to_saved()
-                })
-                .collect(),
+            sessions: self.sessions.iter().map(|s| s.to_saved()).collect(),
             collapsed_groups: self
                 .collapsed_groups
                 .iter()
@@ -1433,8 +1399,6 @@ impl App {
                 pinned: false,
                 snapshot: None,
                 window: self.cur_win,
-                live: None,
-                active: false,
             },
             id,
         );
@@ -1489,15 +1453,7 @@ impl App {
     }
 
     fn resume(&mut self, id: u64, with_claude: bool, ctx: &egui::Context) {
-        if self.resume_bg(id, with_claude, ctx) {
-            self.set_active(Some(id));
-        }
-    }
-
-    /// Bring a sleeping session back without switching to it. A Claude resume
-    /// keeps showing the old screen until Claude has reprinted (see `cover`).
-    fn resume_bg(&mut self, id: u64, with_claude: bool, ctx: &egui::Context) -> bool {
-        let Some(idx) = self.idx_of(id) else { return false };
+        let Some(idx) = self.idx_of(id) else { return };
         let base = if with_claude { self.sessions[idx].resume_command(&self.settings) } else { None };
         let command = base.as_deref().map(keep_shell);
         let mut s = std::mem::replace(&mut self.sessions[idx], Session::from_saved(SavedSession::default(), 0));
@@ -1522,95 +1478,10 @@ impl App {
         s.pending_cmd = base.clone();
         if base.is_some() {
             s.burst_until = Some(Instant::now() + Duration::from_secs(3));
-            s.cover = s.snapshot.clone();
-            s.cover_at = Instant::now();
         }
         self.sessions[idx] = s;
+        self.set_active(Some(id));
         self.poll_ctx_now(&self.sessions[idx], ctx);
-        true
-    }
-
-    /// Work the launch wake queue, and lift each resume's cover once Claude has
-    /// drawn its prompt and gone quiet (or after a timeout, or if it died).
-    fn wake_and_uncover(&mut self, ctx: &egui::Context) {
-        const WAKE_GAP: Duration = Duration::from_millis(250);
-        if !self.wake_queue.is_empty() {
-            // Not before every window has drawn: the PTY takes its size from the
-            // last drawn grid, and a placeholder size makes Claude reprint twice.
-            if Instant::now() >= self.wake_at && self.wins.iter().all(|w| w.drawn) {
-                if let Some((id, claude)) = self.wake_queue.pop_front() {
-                    if self.idx_of(id).is_some_and(|i| matches!(self.sessions[i].phase, Phase::Suspended)) {
-                        self.resume_bg(id, claude, ctx);
-                    }
-                }
-                self.wake_at = Instant::now() + WAKE_GAP;
-                if self.wake_queue.is_empty() {
-                    self.persist();
-                }
-            }
-            ctx.request_repaint_after(WAKE_GAP);
-        }
-        // A hover wake nobody clicked goes back to sleep. Not one on screen,
-        // pinned, kept awake, or with Claude mid-turn.
-        // The quiet time counts from the last output too, so a session that
-        // started doing something is left alone.
-        const HOVER_WAKE_TTL: Duration = Duration::from_secs(60);
-        if self.sessions.iter().any(|s| s.hover_woke.is_some()) {
-            let mut kill_pids = Vec::new();
-            for i in 0..self.sessions.len() {
-                let Some(t) = self.sessions[i].hover_woke else { continue };
-                let shown = self.shown(self.sessions[i].id);
-                let s = &mut self.sessions[i];
-                if shown || s.pinned || s.keep_awake || !matches!(s.phase, Phase::Live(_)) {
-                    s.hover_woke = None;
-                } else if t.elapsed() >= HOVER_WAKE_TTL
-                    && s.last_activity.elapsed() >= HOVER_WAKE_TTL
-                    && s.turn_since.is_none()
-                {
-                    // Batched kill, as in the idle sweep: no `ps` per session on the UI thread.
-                    if let Phase::Live(l) = &mut s.phase {
-                        l.kill_on_drop = false;
-                        kill_pids.push(l.shell_pid);
-                    }
-                    s.suspend();
-                    s.hover_woke = None;
-                    let id = s.id;
-                    for w in &mut self.wins {
-                        w.ui.hover_block.push(id);
-                    }
-                }
-            }
-            if !kill_pids.is_empty() {
-                plat::kill_trees(&kill_pids);
-                self.persist();
-            }
-            ctx.request_repaint_after(Duration::from_secs(5));
-        }
-        let mut covered = false;
-        for s in &mut self.sessions {
-            if s.cover.is_none() {
-                continue;
-            }
-            let done = match &s.phase {
-                Phase::Live(l) => {
-                    let age = s.cover_at.elapsed();
-                    age > Duration::from_secs(12)
-                        || (age > Duration::from_millis(300)
-                            && s.fg_is_claude
-                            && s.last_output.elapsed() >= Duration::from_millis(200)
-                            && term_view::has_rule(&l.term.lock()))
-                },
-                _ => true,
-            };
-            if done {
-                s.cover = None;
-            } else {
-                covered = true;
-            }
-        }
-        if covered {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
     }
 
     fn apply(&mut self, acts: Vec<Act>, ctx: &egui::Context) {
@@ -1629,18 +1500,6 @@ impl App {
                     self.spawn(cwd, None, ctx);
                 },
                 Act::TogglePast => self.toggle_past(ctx),
-                Act::Wake(id) => {
-                    // A session saved as a plain shell comes back as one.
-                    let claude = self.idx_of(id).is_some_and(|i| {
-                        self.sessions[i].claude_session_id.is_some() && self.sessions[i].was_live != Some(false)
-                    });
-                    if self.resume_bg(id, claude, ctx) {
-                        if let Some(i) = self.idx_of(id) {
-                            self.sessions[i].hover_woke = Some(Instant::now());
-                        }
-                        self.persist();
-                    }
-                },
                 Act::PastResume(sid) => self.past_resume(&sid, ctx),
                 Act::NewPick => {
                     let start = self.active_cwd();
@@ -1870,7 +1729,6 @@ impl App {
             match ev {
                 TermEvent::Wakeup => {
                     s.last_activity = Instant::now();
-                    s.last_output = Instant::now();
                     if !is_active {
                         s.unread = true;
                     }
@@ -3300,32 +3158,6 @@ impl App {
         // Geometric hover: overlapping child widgets (close button, ctx corner)
         // must not make the row highlight and the button flicker.
         let hovered = ui.rect_contains_pointer(rect);
-        // Resting on a sleeping row starts waking it, so it is (nearly) up by the click.
-        if !hovered {
-            self.w.hover_block.retain(|b| *b != id);
-        }
-        if self.settings.wake_on_hover && !self.w.hover_block.contains(&id) && matches!(self.sessions[idx].phase, Phase::Suspended) {
-            // Armed only by the pointer moving onto the row: a pointer that was
-            // already resting there when the idle timer (or MCP) put the session
-            // to sleep must not wake it right back. A row that stopped being
-            // drawn and comes back starts over (`seen` too old).
-            let moving = ui.input(|i| i.pointer.is_moving());
-            let now = Instant::now();
-            match self.w.hover_wake {
-                Some((h, t, seen)) if h == id && hovered && now.duration_since(seen) < Duration::from_millis(150) => {
-                    if t.elapsed() >= Duration::from_millis(300) {
-                        acts.push(Act::Wake(id));
-                        self.w.hover_wake = None;
-                    } else {
-                        self.w.hover_wake = Some((h, t, now));
-                        ui.ctx().request_repaint_after(Duration::from_millis(100));
-                    }
-                },
-                Some((h, _, _)) if h == id && !hovered => self.w.hover_wake = None,
-                _ if hovered && moving => self.w.hover_wake = Some((id, now, now)),
-                _ => {},
-            }
-        }
         let painter = ui.painter();
 
         if selected {
@@ -3924,8 +3756,6 @@ impl App {
             let settings = self.settings.clone();
             let accept = busy_now
                 && !finding
-                // Keys typed into a terminal nobody can see yet would land blind.
-                && self.sessions[idx].cover.is_none()
                 && !self.settings_open
                 && !self.w.dir_open
                 && self.w.renaming.is_none()
@@ -3936,10 +3766,6 @@ impl App {
             self.w.term_rect = Some(term_rect);
             let s = &mut self.sessions[idx];
             let info = term_view::show(ui, s, &settings, accept);
-            if let Some(old) = &self.sessions[idx].cover {
-                paint_cover(ui, term_rect, old, settings.font_size);
-                ui.ctx().request_repaint_after(Duration::from_millis(100));
-            }
             self.cell = (info.cell_w.round().max(1.0) as u16, info.cell_h.round().max(1.0) as u16);
             self.grid = (info.cols, info.rows);
             if info.had_input || info.interacted {
@@ -5263,19 +5089,6 @@ impl App {
                 ));
             ui.end_row();
 
-            ui.label(tr("Будить сессии", "Wake sessions"));
-            ui.vertical(|ui| {
-                ui.checkbox(&mut self.settings.wake_on_start, tr("при запуске kip", "when kip starts")).on_hover_text(tr(
-                    "Запущенные при закрытии kip и открытые в окнах сессии поднимаются сами, в фоне",
-                    "Sessions that were running at quit, and the one each window shows, come back by themselves",
-                ));
-                ui.checkbox(&mut self.settings.wake_on_hover, tr("при наведении мыши", "when the pointer rests on one")).on_hover_text(tr(
-                    "Спящая сессия начинает просыпаться, если задержать на ней мышь. Не открыл за минуту - уснёт обратно.",
-                    "A sleeping session starts waking when the pointer rests on it, and sleeps again if not opened within a minute.",
-                ));
-            });
-            ui.end_row();
-
             ui.label(tr("Усыплять без дела через", "Suspend when idle after"));
             ui.horizontal(|ui| {
                 ui.add(egui::DragValue::new(&mut self.settings.idle_suspend_min).range(0..=240));
@@ -5493,7 +5306,6 @@ impl eframe::App for App {
         self.drain_ctl(&ctx);
         self.drain_past(&ctx);
         self.sync_projects();
-        self.wake_and_uncover(&ctx);
 
         // Adopt zoom changed via Cmd+= / Cmd+- (egui built-in); while the
         // settings window is open the slider owns the value instead.
@@ -6072,21 +5884,6 @@ fn folder_icon_image() -> egui::ColorImage {
 /// but `open` would launch it, so it is revealed instead.
 fn open_folder(dir: &std::path::Path) {
     plat::open_path(dir, dir.extension().is_some_and(|e| e == "app"));
-}
-
-/// The pre-sleep screen over a terminal whose Claude is still starting up:
-/// bottom-aligned like the terminal, with a quiet note in the corner.
-fn paint_cover(ui: &egui::Ui, rect: Rect, text: &str, font_size: f32) {
-    let p = ui.painter_at(rect);
-    p.rect_filled(rect, 0.0, palette::term_bg());
-    let g = p.layout_no_wrap(text.to_string(), FontId::monospace(font_size), palette::text());
-    let y = rect.bottom() - 6.0 - g.size().y;
-    p.galley(Pos2::new(rect.left() + 4.0, y), g, palette::text());
-    let note = tr("Claude загружается...", "Claude is starting...");
-    let ng = p.layout_no_wrap(note.to_string(), FontId::proportional(11.0), palette::text_dim());
-    let box_r = Rect::from_min_size(Pos2::new(rect.right() - ng.size().x - 26.0, rect.top() + 8.0), ng.size() + Vec2::new(14.0, 8.0));
-    p.rect_filled(box_r, CornerRadius::same(6), palette::popup_bg());
-    p.galley(box_r.min + Vec2::new(7.0, 4.0), ng, palette::text_dim());
 }
 
 /// "Open in Finder" in the platform's words.

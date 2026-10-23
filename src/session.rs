@@ -100,17 +100,6 @@ pub struct Session {
     /// Manual group (None = ungrouped). Reorder/move-between via drag & drop.
     pub group: Option<String>,
     pub last_activity: Instant,
-    /// Last PTY output (any bytes).
-    pub last_output: Instant,
-    /// While a resumed Claude boots and reprints its conversation, the old
-    /// screen is shown over the terminal instead of a blank, scrolling one.
-    pub cover: Option<String>,
-    pub cover_at: Instant,
-    /// Restored from a session that was running at quit (see SavedSession::live).
-    pub was_live: Option<bool>,
-    /// Woken by the pointer resting on its row and not opened since: it goes
-    /// back to sleep after HOVER_WAKE_TTL unless picked.
-    pub hover_woke: Option<Instant>,
     pub spawned_at: SystemTime,
     pub claude_session_id: Option<String>,
     pub skip_permissions: bool,
@@ -231,12 +220,8 @@ impl Session {
 
     /// Kill the child and free terminal memory, keeping a text snapshot.
     pub fn suspend(&mut self) {
-        // Put to sleep on purpose: no longer one to bring back at launch.
-        self.was_live = None;
         if let Phase::Live(live) = &self.phase {
-            // Still booting under its cover: the terminal is blank or half
-            // reprinted, the pre-sleep screen is the real one.
-            self.snapshot = Some(self.cover.take().unwrap_or_else(|| grab_snapshot(&live.term)));
+            self.snapshot = Some(grab_snapshot(&live.term));
             self.save_claude_session();
             self.phase = Phase::Suspended;
         }
@@ -262,7 +247,7 @@ impl Session {
     pub fn to_saved(&self) -> SavedSession {
         let mut snapshot = self.snapshot.clone();
         if let Phase::Live(live) = &self.phase {
-            snapshot = Some(self.cover.clone().unwrap_or_else(|| grab_snapshot(&live.term)));
+            snapshot = Some(grab_snapshot(&live.term));
         }
         SavedSession {
             cwd: self.cwd.clone(),
@@ -274,15 +259,6 @@ impl Session {
             keep_awake: self.keep_awake,
             pinned: self.pinned,
             window: self.window,
-            // A session still waiting in the launch queue keeps its flag; one
-            // whose resumed Claude is still booting counts as Claude.
-            live: match &self.phase {
-                // Only up because the pointer passed over it: asleep next launch.
-                Phase::Live(_) if self.hover_woke.is_some() => None,
-                Phase::Live(_) => Some(self.fg_is_claude || self.cover.is_some()),
-                _ => self.was_live,
-            },
-            active: false,
             snapshot: snapshot.map(|mut s| {
                 if s.len() > 32 * 1024 {
                     let cut = s.len() - 32 * 1024;
@@ -310,11 +286,6 @@ impl Session {
             custom_name: saved.custom_name,
             group: saved.group,
             last_activity: Instant::now(),
-            last_output: Instant::now(),
-            cover: None,
-            cover_at: Instant::now(),
-            was_live: saved.live,
-            hover_woke: None,
             spawned_at: SystemTime::now(),
             claude_session_id: saved.claude_session_id,
             skip_permissions: saved.skip_permissions,

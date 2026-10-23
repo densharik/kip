@@ -14,7 +14,7 @@ To summarize a session, read_transcript it and summarize the text yourself.";
 fn tools() -> Value {
     let id = json!({"type": "integer", "description": "kip session id (from list_sessions)"});
     json!([
-        {"name": "list_sessions", "description": "All kip sessions: id, window, name, folder, group, project, starting (Claude still booting), state (live/suspended/exited), busy, pinned, Claude session id, context %, idle time.",
+        {"name": "list_sessions", "description": "All kip sessions: id, window, name, folder, group, project, state (live/suspended/exited), busy, pinned, Claude session id, context %, idle time.",
          "inputSchema": {"type": "object", "properties": {}}},
         {"name": "list_windows", "description": "Open kip windows with their active session and session count.",
          "inputSchema": {"type": "object", "properties": {}}},

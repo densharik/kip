@@ -50,21 +50,6 @@ pub fn find_all<T>(term: &Term<T>, query: &str) -> Vec<Match> {
     RegexIter::new(start, end, alacritty_terminal::index::Direction::Right, term, &mut re).take(MAX).collect()
 }
 
-/// Claude has drawn its prompt: a horizontal rule (the input box's border)
-/// is on screen. Used to tell when a resumed Claude finished reprinting.
-pub fn has_rule<T>(term: &Term<T>) -> bool {
-    let grid = term.grid();
-    // The input box sits at the bottom; a box drawn higher up is conversation.
-    let rows = grid.screen_lines() as i32;
-    ((rows - 8).max(0)..rows).any(|l| {
-        let mut run = 0;
-        grid[Line(l)].into_iter().any(|cell| {
-            run = if cell.c == '\u{2500}' { run + 1 } else { 0 };
-            run >= 8
-        })
-    })
-}
-
 /// Scroll so the match is in view (centered), unless it already is.
 pub fn reveal<T: alacritty_terminal::event::EventListener>(term: &mut Term<T>, m: &Match) {
     let rows = term.screen_lines() as i32;
