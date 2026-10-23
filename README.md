@@ -37,6 +37,10 @@ they are gone. kip fixes those three things and stays out of the way otherwise.
 - Or switch Settings to "sessions by projects": the list sorts itself by project
   (git root, else folder), and a session that `cd`s into another project moves
   there. Your manual groups stay saved for when you switch back.
+- Drag a group or project header to move it; right-click it to give it a color
+  (presets with a live preview, or any color), or to open its folder.
+- "Open" next to the path at the bottom opens the session's folder in Finder /
+  Explorer; the same is in every session's right-click menu.
 - Rename with a double click. Your name wins over the one Claude picked.
 - `Cmd+1`..`Cmd+9` jumps to a session. A pinned session keeps its number.
 
@@ -213,7 +217,7 @@ or by hand:
 claude mcp add -s user kip -- /Applications/kip.app/Contents/MacOS/kip mcp
 ```
 
-Small on context: 22 tools, about 6.9 KB of schema (~1.9k tokens) - and Claude
+Small on context: 24 tools, about 7.6 KB of schema (~2.1k tokens) - and Claude
 Code usually defers MCP tools, keeping only their names in context until one
 is used. If kip is not running, the first call starts it.
 
@@ -223,6 +227,8 @@ is used. If kip is not running, the first call starts it.
 | `open_session` | new terminal in a folder: plain, with Claude, `--resume <id>`, or a command; window, group, name |
 | `close_session`, `suspend_session`, `wake_session` | pinned sessions refuse to close without `force` |
 | `focus_session`, `rename_session`, `set_group`, `pin_session` | |
+| `style_group` | color a group or project section, move it up or down |
+| `open_folder` | open a session's folder in Finder / Explorer |
 | `open_window`, `move_to_window` | |
 | `save_state` | write sessions and windows to disk now |
 | `read_screen`, `read_transcript` | terminal text and the Claude conversation (also a past one by `sid`), for summaries |

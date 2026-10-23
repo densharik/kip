@@ -39,6 +39,12 @@ fn tools() -> Value {
          "inputSchema": {"type": "object", "properties": {"id": id, "name": {"type": "string"}}, "required": ["id", "name"]}},
         {"name": "set_group", "description": "Move a session into a named group (created on demand); null or empty = ungrouped.",
          "inputSchema": {"type": "object", "properties": {"id": id, "group": {"type": ["string", "null"]}}, "required": ["id"]}},
+        {"name": "style_group", "description": "Color a manual group or a project (sidebar section) and/or move it before another one. color: #rrggbb, empty resets; before: null = to the end.",
+         "inputSchema": {"type": "object", "properties": {
+            "group": {"type": "string"}, "project": {"type": "string", "description": "Project folder"},
+            "color": {"type": "string"}, "before": {"type": ["string", "null"]}}}},
+        {"name": "open_folder", "description": "Open a session's folder (or a path) in Finder / Explorer.",
+         "inputSchema": {"type": "object", "properties": {"id": id, "path": {"type": "string"}}}},
         {"name": "pin_session", "description": "Pin (protect) or unpin a session.",
          "inputSchema": {"type": "object", "properties": {"id": id, "pinned": {"type": "boolean"}}, "required": ["id", "pinned"]}},
         {"name": "open_window", "description": "Open a new kip window with a terminal in a folder.",

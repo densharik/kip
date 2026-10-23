@@ -158,6 +158,10 @@ pub struct AppState {
     pub sessions: Vec<SavedSession>,
     /// Names of collapsed session groups (persisted across restarts).
     pub collapsed_groups: Vec<String>,
+    /// Color picked for a manual group (by name) or a project ("project:<path>").
+    pub group_colors: std::collections::BTreeMap<String, [u8; 3]>,
+    /// Project folders in the order they were dragged into.
+    pub project_order: Vec<String>,
     /// Open windows and where they were; the main window has id 0.
     pub windows: Vec<SavedWindow>,
 }

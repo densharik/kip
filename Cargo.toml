@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 alacritty_terminal = "0.26.0"
 dirs = "6.0.0"
-eframe = "0.35.0"
+eframe = "=0.35.0" # pinned: vendor/eframe patches this exact version, see [patch.crates-io]
 egui = "0.35.0"
 regex = "1"
 rfd = "0.17.2"
@@ -38,5 +38,8 @@ strip = true
 
 # eframe with one fix: the UI stalled for good once every window had been
 # minimized (see vendor/eframe/src/native/wgpu_integration.rs, "kip patch").
+# Cargo silently ignores this patch once eframe's version moves on. Before
+# bumping egui/eframe: check upstream fixed it, or carry the "kip patch"
+# lines into a fresh vendor copy of the new version.
 [patch.crates-io]
 eframe = { path = "vendor/eframe" }

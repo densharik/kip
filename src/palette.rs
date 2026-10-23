@@ -242,21 +242,38 @@ pub fn light() -> bool {
     is_light(term_bg())
 }
 
-// Chrome tokens. Every one returns the exact original dark literal when the
-// theme is dark (so dark themes are byte-identical to before) and a light
-// counterpart when the background is light.
+// Chrome tokens. Surfaces, rows and borders are steps off the theme's own
+// background, so a lighter dark theme (One Dark, Nord, Dracula) keeps the
+// same contrast as the near-black default instead of sharing its fixed grays.
+// Text keeps a floor: never dimmer than the default's grays.
 fn tok(dark: Color32, light_c: Color32) -> Color32 {
     if light() { light_c } else { dark }
+}
+
+/// `d` steps off the terminal background: lighter on a dark theme, darker on a light one.
+fn off_bg(d: u8) -> Color32 {
+    let b = term_bg();
+    if is_light(b) { darken(b, d) } else { lighten(b, d) }
+}
+
+/// `d` steps off the sidebar.
+fn off_side(d: u8) -> Color32 {
+    let b = chrome_sidebar();
+    if is_light(term_bg()) { darken(b, d) } else { lighten(b, d) }
+}
+
+fn at_least(a: Color32, b: Color32) -> Color32 {
+    c(a.r().max(b.r()), a.g().max(b.g()), a.b().max(b.b()))
 }
 
 pub fn text() -> Color32 {
     tok(c(0xc4, 0xc4, 0xc4), c(0x2b, 0x2b, 0x2b))
 }
 pub fn text_dim() -> Color32 {
-    tok(c(0x7a, 0x7a, 0x7a), c(0x5f, 0x5f, 0x5f))
+    tok(at_least(c(0x7a, 0x7a, 0x7a), off_side(0x62)), c(0x5f, 0x5f, 0x5f))
 }
 pub fn text_faint() -> Color32 {
-    tok(c(0x5a, 0x5a, 0x5a), c(0x90, 0x90, 0x90))
+    tok(at_least(c(0x5a, 0x5a, 0x5a), off_side(0x46)), c(0x90, 0x90, 0x90))
 }
 pub fn text_strong() -> Color32 {
     tok(c(0xde, 0xde, 0xde), c(0x14, 0x14, 0x14))
@@ -271,42 +288,42 @@ pub fn chrome_sidebar() -> Color32 {
 }
 
 pub fn chrome_bar() -> Color32 {
-    let b = term_bg();
-    if is_light(b) { darken(b, 18) } else { lighten(b, 8) }
+    off_bg(if light() { 18 } else { 8 })
 }
 
 /// Window/base fill (settings window, chip inactive bg).
 pub fn surface() -> Color32 {
-    tok(c(0x20, 0x20, 0x20), c(0xf1, 0xf1, 0xf1))
+    off_bg(0x0c)
 }
 /// Raised chip / active-control fill.
 pub fn surface_hi() -> Color32 {
-    tok(c(0x2c, 0x2c, 0x2c), c(0xe1, 0xe1, 0xe1))
+    off_bg(if light() { 0x1e } else { 0x18 })
 }
 /// Floating popups and cards (history, dir, stats, frozen card).
 pub fn popup_bg() -> Color32 {
-    tok(c(0x1f, 0x1f, 0x1f), c(0xff, 0xff, 0xff))
+    off_bg(if light() { 0 } else { 0x0b })
 }
 /// Text-edit / extreme background.
 pub fn field_bg() -> Color32 {
-    tok(c(0x14, 0x14, 0x14), c(0xff, 0xff, 0xff))
+    term_bg()
 }
 /// Selected session row.
 pub fn row_sel_bg() -> Color32 {
-    tok(c(0x24, 0x24, 0x24), c(0xdf, 0xe3, 0xea))
+    off_side(if light() { 0x16 } else { 0x0d })
 }
 /// Hovered session row.
 pub fn row_hover_bg() -> Color32 {
-    tok(c(0x1f, 0x1f, 0x1f), c(0xec, 0xec, 0xec))
+    off_side(if light() { 0x09 } else { 0x06 })
 }
 /// Left accent strip on the selected row.
 pub fn accent_bar() -> Color32 {
-    tok(c(0x9a, 0x9a, 0x9a), c(0x70, 0x70, 0x70))
+    tok(at_least(c(0x9a, 0x9a, 0x9a), off_side(0x81)), c(0x70, 0x70, 0x70))
 }
 /// Group header band: subtly raised and faintly tinted so it does not merge
 /// into the sidebar on either theme.
 pub fn group_header_bg() -> Color32 {
-    tok(c(0x26, 0x28, 0x2f), c(0xe3, 0xe7, 0xef))
+    let b = off_side(if light() { 0x12 } else { 0x0d });
+    if light() { b } else { c(b.r(), b.g().saturating_add(2), b.b().saturating_add(6)) }
 }
 /// A hint of color on the group header (caret + edge), any theme.
 pub fn group_accent() -> Color32 {
@@ -314,24 +331,50 @@ pub fn group_accent() -> Color32 {
 }
 /// Standard border/stroke.
 pub fn border() -> Color32 {
-    tok(c(0x35, 0x35, 0x35), c(0xd2, 0xd2, 0xd2))
+    off_side(if light() { 0x23 } else { 0x1c })
 }
 /// Dim separators / tracks (scrollbar track, hairline separators).
 pub fn border_dim() -> Color32 {
-    tok(c(0x2a, 0x2a, 0x2a), c(0xe4, 0xe4, 0xe4))
+    off_side(0x11)
 }
 // Interactive widget fills for apply_style.
 pub fn ui_bg() -> Color32 {
-    tok(c(0x26, 0x26, 0x26), c(0xe8, 0xe8, 0xe8))
+    off_bg(if light() { 0x17 } else { 0x12 })
 }
 pub fn ui_bg_hover() -> Color32 {
-    tok(c(0x30, 0x30, 0x30), c(0xdc, 0xdc, 0xdc))
+    off_bg(if light() { 0x23 } else { 0x1c })
 }
 pub fn ui_bg_active() -> Color32 {
-    tok(c(0x3a, 0x3a, 0x3a), c(0xd0, 0xd0, 0xd0))
+    off_bg(if light() { 0x2f } else { 0x26 })
 }
 pub fn ui_stroke_hover() -> Color32 {
-    tok(c(0x45, 0x45, 0x45), c(0xbc, 0xbc, 0xbc))
+    off_bg(if light() { 0x43 } else { 0x31 })
+}
+
+/// Colors a group or project can wear (right-click > Color). Picked to read on
+/// dark and light themes alike; `group_tint` deepens them on light ones.
+pub const GROUP_COLORS: [[u8; 3]; 10] = [
+    [0xe0, 0x6c, 0x75],
+    [0xe5, 0x9a, 0x55],
+    [0xe5, 0xc0, 0x7b],
+    [0x98, 0xc3, 0x79],
+    [0x56, 0xb6, 0xc2],
+    [0x61, 0xaf, 0xef],
+    [0x82, 0x8c, 0xf0],
+    [0xc6, 0x78, 0xdd],
+    [0xe2, 0x77, 0xb4],
+    [0xa0, 0xa6, 0xae],
+];
+
+pub fn group_tint(rgb: [u8; 3]) -> Color32 {
+    let col = c(rgb[0], rgb[1], rgb[2]);
+    if light() { darken(col, 0x30) } else { col }
+}
+
+/// A project's own color until the user picks one: stable per folder.
+pub fn auto_group_color(key: &str) -> [u8; 3] {
+    let h = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    GROUP_COLORS[(h % 9) as usize]
 }
 
 fn indexed(idx: u8, th: &Theme) -> Color32 {

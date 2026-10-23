@@ -177,6 +177,10 @@ enum Act {
     NewPick,
     /// Open or close the past-conversations browser.
     TogglePast,
+    /// Color of a manual group (by name) or a project ("project:<path>"); None resets.
+    SetColor(String, Option<[u8; 3]>),
+    /// Show a folder in Finder / Explorer / the file manager.
+    OpenFolder(PathBuf),
     /// Continue a past Claude conversation by its session id.
     PastResume(String),
     Suspend(u64),
@@ -328,6 +332,10 @@ struct WinUi {
     find: Option<Find>,
     /// The past-conversations browser covers the terminal (Cmd+Y).
     past_open: bool,
+    /// Swatch hovered in a header's color menu: shown on that header next
+    /// frame, collected into `color_hover` while the menu draws.
+    color_preview: Option<(String, Color32)>,
+    color_hover: Option<(String, Color32)>,
 }
 
 /// Search over the active terminal, with a lazy count in the window's other
@@ -466,6 +474,9 @@ struct App {
     last_update_check: Instant,
     /// Collapsed group names.
     collapsed_groups: HashSet<String>,
+    /// See AppState::group_colors / project_order.
+    group_colors: std::collections::BTreeMap<String, [u8; 3]>,
+    project_order: Vec<String>,
     /// Shell history (from $HISTFILE) merged with commands sent this run, oldest first.
     history: Vec<String>,
     /// Lowercased mirror of `history`, so per-frame filtering does not allocate.
@@ -505,6 +516,9 @@ struct App {
     mcp_tx: Sender<McpMsg>,
     mcp_rx: Receiver<McpMsg>,
     past: Past,
+    /// Icon of the "Open" button, and whether it is final (Finder's own icon
+    /// loads in the background; a drawn folder stands in until then).
+    finder_icon: Option<(egui::TextureHandle, bool)>,
     past_tx: Sender<PastMsg>,
     past_rx: Receiver<PastMsg>,
     /// Project roots worked out in the background: (session, cwd, root).
@@ -606,6 +620,8 @@ impl App {
             last_tick: Instant::now(),
             last_update_check: Instant::now(),
             collapsed_groups: state.collapsed_groups.into_iter().collect(),
+            group_colors: state.group_colors,
+            project_order: state.project_order,
             history: Vec::new(),
             history_lc: Vec::new(),
             session_cmds: Vec::new(),
@@ -634,6 +650,7 @@ impl App {
             mcp_tx,
             mcp_rx,
             past: Past::default(),
+            finder_icon: None,
             past_tx,
             past_rx,
             proj_tx,
@@ -928,6 +945,15 @@ impl App {
                 .filter(|g| live.contains(*g))
                 .cloned()
                 .collect(),
+            // A project's color outlives its sessions (it comes back with the folder);
+            // a manual group's goes with the group.
+            group_colors: self
+                .group_colors
+                .iter()
+                .filter(|(k, _)| k.starts_with("project:") || live.contains(*k))
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+            project_order: self.project_order.clone(),
             windows: self
                 .wins
                 .iter()
@@ -1547,7 +1573,16 @@ impl App {
                         }
                     }
                 },
+                Act::MoveGroup { name, before } if self.settings.group_by_project => self.move_project(name, before),
                 Act::MoveGroup { name, before } => self.move_group(name, before),
+                Act::SetColor(key, rgb) => {
+                    match rgb {
+                        Some(c) => self.group_colors.insert(key, c),
+                        None => self.group_colors.remove(&key),
+                    };
+                    self.persist();
+                },
+                Act::OpenFolder(dir) => open_folder(&dir),
                 Act::NewGroup(id) => {
                     let name = self.unique_group_name();
                     self.move_session(id, Some(name.clone()), None);
@@ -1580,7 +1615,10 @@ impl App {
                                 }
                             }
                             if self.collapsed_groups.remove(&old) {
-                                self.collapsed_groups.insert(new);
+                                self.collapsed_groups.insert(new.clone());
+                            }
+                            if let Some(c) = self.group_colors.remove(&old) {
+                                self.group_colors.insert(new, c);
                             }
                             self.persist();
                         }
@@ -1594,6 +1632,7 @@ impl App {
                         }
                     }
                     self.collapsed_groups.remove(&name);
+                    self.group_colors.remove(&name);
                     // Ex-members were ungrouped in place, mid-vec; pull them back
                     // into the ungrouped block so ordering stays contiguous.
                     self.normalize_order();
@@ -2453,6 +2492,7 @@ impl App {
         });
         ui.add_space(8.0);
 
+        self.w.color_preview = self.w.color_hover.take();
         let mut items: Vec<DropItem> = Vec::new();
         let mut released = false;
         let mut group_released = false;
@@ -2477,8 +2517,10 @@ impl App {
                 match slot {
                     Slot::Header(name) if self.settings.group_by_project => {
                         let collapsed = self.collapsed_groups.contains(&format!("project:{name}"));
-                        let rect = self.project_header(ui, &name, collapsed, &mut acts);
+                        let (rect, rel) = self.project_header(ui, &name, collapsed, &mut acts);
                         rule(ui, rect, &mut first);
+                        group_released |= rel;
+                        items.push(DropItem { rect, id: None, group: Some(name), is_header: true });
                     },
                     Slot::Header(name) => {
                         let collapsed = self.collapsed_groups.contains(&name);
@@ -2501,10 +2543,11 @@ impl App {
                         // Members sit indented under their header.
                         let indent = if group.is_some() { 14.0 } else { 0.0 };
                         let (rect, rel) = self.session_row(ui, idx, indent, &mut acts);
-                        if self.settings.group_by_project {
-                            // A thin guide down the project's rows instead of a band.
-                            let x = rect.min.x + 9.0;
-                            ui.painter().vline(x, rect.y_range(), Stroke::new(1.0, palette::border()));
+                        if let Some(fold) = group.as_deref().filter(|_| self.settings.group_by_project) {
+                            // A guide in the project's color down its rows.
+                            let col = self.header_color(fold, true).unwrap_or_else(palette::group_accent);
+                            let x = rect.min.x + 6.5;
+                            ui.painter().vline(x, rect.y_range(), Stroke::new(2.0, col.gamma_multiply(0.55)));
                         }
                         rule(ui, rect, &mut first);
                         released |= rel;
@@ -2763,7 +2806,20 @@ impl App {
             members.sort_by_key(|(i, m)| (m.proj_seq, *i));
             out.extend(members.into_iter().map(|(_, m)| Slot::Row(m.id)));
         }
-        out
+        // Dragged order first; projects never dragged keep first-appearance order after.
+        let rank = |h: &str| self.project_order.iter().position(|p| p == h).unwrap_or(usize::MAX);
+        let mut blocks: Vec<Vec<Slot>> = Vec::new();
+        for slot in out {
+            match slot {
+                Slot::Header(_) => blocks.push(vec![slot]),
+                row => blocks.last_mut().unwrap().push(row),
+            }
+        }
+        blocks.sort_by_key(|b| match &b[0] {
+            Slot::Header(h) => rank(h),
+            Slot::Row(_) => usize::MAX,
+        });
+        blocks.into_iter().flatten().collect()
     }
 
     /// Manual-group order: ungrouped rows first, then each group's members.
@@ -2806,47 +2862,143 @@ impl App {
             .sort_by_key(|s| order.iter().position(|&id| id == s.id).unwrap_or(usize::MAX));
     }
 
-    /// A project header: folder name, its parent path faint beside it, a rule
-    /// out to the count. Lighter than a group's band. Click folds it.
-    fn project_header(&mut self, ui: &mut egui::Ui, key: &str, collapsed: bool, acts: &mut Vec<Act>) -> Rect {
+    /// A project header: a soft band in the project's color, the folder name,
+    /// its parent path faint beside it and the count. Click folds it, drag
+    /// moves the project up or down, right-click picks its color.
+    fn project_header(&mut self, ui: &mut egui::Ui, key: &str, collapsed: bool, acts: &mut Vec<Act>) -> (Rect, bool) {
+        let fold = format!("project:{key}");
+        let is_dragging = self.w.dragging_group.as_deref() == Some(key);
         let count = self.sessions.iter().filter(|s| project_path(s) == std::path::Path::new(key)).count();
+        let color = self.header_color(&fold, true).unwrap_or_else(palette::group_accent);
         ui.add_space(6.0);
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::click_and_drag());
         if !ui.is_rect_visible(rect) {
-            return rect;
+            return (rect, false);
         }
+        let released = is_dragging && resp.drag_stopped();
         let path = std::path::Path::new(key);
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| key.to_string());
         let parent = path.parent().map(tilde).unwrap_or_default();
         let hovered = resp.hovered();
         let p = ui.painter();
-        draw_caret(p, Pos2::new(rect.min.x + 9.0, rect.center().y), collapsed, palette::accent_bar());
-        let g = p.layout_no_wrap(
-            truncate_end(&name, 22),
-            FontId::proportional(12.0),
-            if hovered { palette::text_strong() } else { palette::text() },
+        let band = Rect::from_min_max(Pos2::new(rect.min.x + 4.0, rect.min.y + 1.0), Pos2::new(rect.max.x - 6.0, rect.max.y - 1.0));
+        p.rect_filled(band, CornerRadius::same(5), color.gamma_multiply(if hovered { 0.22 } else { 0.14 }));
+        p.rect_filled(
+            Rect::from_min_size(band.min + Vec2::new(0.0, 3.0), Vec2::new(3.0, band.height() - 6.0)),
+            CornerRadius::same(2),
+            color,
         );
-        let name_x = rect.min.x + 18.0;
+        draw_caret(p, Pos2::new(rect.min.x + 15.0, rect.center().y), collapsed, color);
+        let g = p.layout_no_wrap(truncate_end(&name, 22), FontId::proportional(12.5), palette::text_strong());
+        let name_x = rect.min.x + 25.0;
         let name_w = g.size().x;
-        p.galley(Pos2::new(name_x, rect.center().y - g.size().y / 2.0), g, palette::text());
-        let count_g = p.layout_no_wrap(count.to_string(), FontId::proportional(10.0), palette::text_faint());
-        let count_x = rect.max.x - 12.0 - count_g.size().x;
-        let room = ((count_x - name_x - name_w - 20.0) / 5.6).max(0.0) as usize;
-        let mut end = name_x + name_w + 6.0;
+        p.galley(Pos2::new(name_x, rect.center().y - g.size().y / 2.0), g, palette::text_strong());
+        let count_g = p.layout_no_wrap(count.to_string(), FontId::proportional(10.5), palette::text_dim());
+        let count_x = rect.max.x - 14.0 - count_g.size().x;
+        let room = ((count_x - name_x - name_w - 14.0) / 5.6).max(0.0) as usize;
         if room > 4 && !parent.is_empty() {
-            let pg = p.layout_no_wrap(truncate_head(&parent, room), FontId::proportional(10.0), palette::text_faint());
-            end += pg.size().x + 6.0;
-            p.galley(Pos2::new(name_x + name_w + 6.0, rect.center().y - pg.size().y / 2.0), pg, palette::text_faint());
+            let pg = p.layout_no_wrap(truncate_head(&parent, room), FontId::proportional(10.0), palette::text_dim());
+            p.galley(Pos2::new(name_x + name_w + 6.0, rect.center().y - pg.size().y / 2.0), pg, palette::text_dim());
         }
-        if count_x - 6.0 > end {
-            p.hline(egui::Rangef::new(end, count_x - 6.0), rect.center().y, Stroke::new(1.0, palette::border_dim()));
-        }
-        p.galley(Pos2::new(count_x, rect.center().y - count_g.size().y / 2.0), count_g, palette::text_faint());
+        p.galley(Pos2::new(count_x, rect.center().y - count_g.size().y / 2.0), count_g, palette::text_dim());
         if resp.clicked() {
-            acts.push(Act::ToggleGroup(format!("project:{key}")));
+            acts.push(Act::ToggleGroup(fold.clone()));
         }
-        resp.on_hover_text(tilde(path));
-        rect
+        if resp.drag_started() {
+            self.w.dragging_group = Some(key.to_string());
+        }
+        let resp = resp.on_hover_text(tilde(path));
+        resp.context_menu(|ui| {
+            if ui.button(open_folder_label()).clicked() {
+                acts.push(Act::OpenFolder(path.to_path_buf()));
+                ui.close();
+            }
+            self.color_menu(ui, &fold, true, acts);
+        });
+        (rect, released)
+    }
+
+    /// Header color: a swatch hovered in its menu, else the one picked; a
+    /// project falls back to its own stable color, a group to none.
+    fn header_color(&self, key: &str, project: bool) -> Option<Color32> {
+        if let Some((k, col)) = &self.w.color_preview {
+            if k == key {
+                return Some(*col);
+            }
+        }
+        match self.group_colors.get(key) {
+            Some(rgb) => Some(palette::group_tint(*rgb)),
+            None if project => Some(palette::group_tint(palette::auto_group_color(key))),
+            None => None,
+        }
+    }
+
+    /// "Color" submenu: preset swatches (hover previews on the header), a full
+    /// picker, and a reset.
+    fn color_menu(&mut self, ui: &mut egui::Ui, key: &str, project: bool, acts: &mut Vec<Act>) {
+        ui.menu_button(tr("Цвет", "Color"), |ui| {
+            let cur = self.group_colors.get(key).copied();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for rgb in palette::GROUP_COLORS {
+                    let (r, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+                    let col = palette::group_tint(rgb);
+                    ui.painter().rect_filled(r.shrink(1.0), CornerRadius::same(4), col);
+                    if resp.hovered() || cur == Some(rgb) {
+                        ui.painter().rect_stroke(r, CornerRadius::same(5), Stroke::new(1.5, palette::text_strong()), StrokeKind::Inside);
+                    }
+                    if resp.hovered() {
+                        self.w.color_hover = Some((key.to_string(), col));
+                    }
+                    if resp.clicked() {
+                        acts.push(Act::SetColor(key.to_string(), Some(rgb)));
+                        ui.close();
+                    }
+                }
+            });
+            ui.separator();
+            let mut pick = cur
+                .or_else(|| project.then(|| palette::auto_group_color(key)))
+                .map(|c| Color32::from_rgb(c[0], c[1], c[2]))
+                .unwrap_or_else(palette::group_accent);
+            if egui::widgets::color_picker::color_picker_color32(ui, &mut pick, egui::widgets::color_picker::Alpha::Opaque) {
+                // Changes every frame of a drag: saved once it settles, not per frame.
+                self.group_colors.insert(key.to_string(), [pick.r(), pick.g(), pick.b()]);
+                self.geom_at = Some(Instant::now());
+            }
+            if cur.is_some() && ui.button(tr("Сбросить цвет", "Reset color")).clicked() {
+                acts.push(Act::SetColor(key.to_string(), None));
+                ui.close();
+            }
+        });
+    }
+
+    /// Move a project before another one (None = to the end); the order sticks.
+    fn move_project(&mut self, key: String, before: Option<String>) {
+        if before.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        let mut order = self.project_keys();
+        order.retain(|h| *h != key);
+        let at = before.and_then(|b| order.iter().position(|h| *h == b)).unwrap_or(order.len());
+        order.insert(at, key);
+        self.project_order = order;
+        self.persist();
+    }
+
+    /// Every project with a session, in any window, in sidebar order. Also what
+    /// `project_order` is rebuilt from, so projects with nothing open drop out.
+    fn project_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = Vec::new();
+        for s in self.sessions.iter().chain(self.parked.iter()) {
+            let k = project_path(s).to_string_lossy().into_owned();
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        let rank = |h: &String| self.project_order.iter().position(|p| p == h).unwrap_or(usize::MAX);
+        keys.sort_by_key(rank);
+        keys
     }
 
     /// A group header: colored band, collapse triangle, name, member count.
@@ -2868,6 +3020,7 @@ impl App {
         let hovered = ui.rect_contains_pointer(rect);
         let painter = ui.painter();
 
+        let tint = self.header_color(name, false);
         // Tinted band + a colored left edge so the header stands out and does
         // not merge into the sidebar on either theme.
         let band = Rect::from_min_max(
@@ -2875,14 +3028,18 @@ impl App {
             Pos2::new(rect.max.x - 6.0, rect.max.y - 1.0),
         );
         painter.rect_filled(band, CornerRadius::same(5), palette::group_header_bg());
+        if let Some(t) = tint {
+            painter.rect_filled(band, CornerRadius::same(5), t.gamma_multiply(0.16));
+        }
+        let accent = tint.unwrap_or_else(palette::group_accent);
         painter.rect_filled(
             Rect::from_min_size(band.min + Vec2::new(0.0, 2.0), Vec2::new(2.5, band.height() - 4.0)),
             CornerRadius::same(2),
-            palette::group_accent(),
+            accent,
         );
 
         let tri_c = Pos2::new(rect.min.x + 16.0, rect.center().y);
-        draw_caret(painter, tri_c, collapsed, palette::group_accent());
+        draw_caret(painter, tri_c, collapsed, accent);
         if !editing {
             painter.text(
                 Pos2::new(rect.min.x + 27.0, rect.center().y),
@@ -2915,6 +3072,14 @@ impl App {
                 acts.push(Act::DeleteGroup(name.to_string()));
                 ui.close();
             }
+            let folder = common_dir(self.sessions.iter().filter(|s| s.group.as_deref() == Some(name)).map(|s| s.cwd.as_path()));
+            if let Some(dir) = &folder {
+                if ui.button(open_folder_label()).on_hover_text(tilde(dir)).clicked() {
+                    acts.push(Act::OpenFolder(dir.clone()));
+                    ui.close();
+                }
+            }
+            self.color_menu(ui, name, false, acts);
         });
 
         if editing {
@@ -3271,8 +3436,13 @@ impl App {
             .collect();
         let by_project = self.settings.group_by_project;
         resp.context_menu(|ui| {
+            let cwd = self.sessions[idx].cwd.clone();
             if ui.button(tr("Переименовать", "Rename")).clicked() {
                 acts.push(Act::BeginRename(sid));
+                ui.close();
+            }
+            if ui.button(open_folder_label()).on_hover_text(tilde(&cwd)).clicked() {
+                acts.push(Act::OpenFolder(cwd.clone()));
                 ui.close();
             }
             let pin_label = if pinned {
@@ -3432,6 +3602,16 @@ impl App {
                     chip_clicked = true;
                 }
                 chip_rect = chip.rect;
+                ui.add_space(2.0);
+                let open = ui
+                    .add(egui::Button::image_and_text(
+                        open_icon(&mut self.finder_icon, ui.ctx()),
+                        RichText::new(tr("Открыть", "Open")).size(11.5),
+                    ))
+                    .on_hover_text(format!("{}\n{path_full}", open_folder_label()));
+                if open.clicked() {
+                    acts.push(Act::OpenFolder(s.cwd.clone()));
+                }
 
                 match &git {
                     Some(g) if g.is_repo => {
@@ -5616,6 +5796,105 @@ fn project_root(cwd: &std::path::Path) -> PathBuf {
         .find(|a| a.join(".git").exists())
         .unwrap_or(cwd)
         .to_path_buf()
+}
+
+/// Icon of the system file manager for the "Open" button: Finder's real icon
+/// on macOS (converted from the system bundle once), a drawn folder elsewhere
+/// or if that fails.
+fn open_icon(cache: &mut Option<(egui::TextureHandle, bool)>, ctx: &egui::Context) -> egui::Image<'static> {
+    static FINDER: std::sync::OnceLock<Option<egui::ColorImage>> = std::sync::OnceLock::new();
+    static ASKED: std::sync::Once = std::sync::Once::new();
+    ASKED.call_once(|| {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = FINDER.set(finder_icon_image());
+            ctx.request_repaint();
+        });
+    });
+    if !cache.as_ref().is_some_and(|(_, done)| *done) {
+        let done = FINDER.get();
+        if cache.is_none() || done.is_some() {
+            let img = done.cloned().flatten().unwrap_or_else(folder_icon_image);
+            *cache = Some((ctx.load_texture("kip-open-icon", img, egui::TextureOptions::LINEAR), done.is_some()));
+        }
+    }
+    let tex = &cache.as_ref().unwrap().0;
+    egui::Image::new((tex.id(), Vec2::splat(14.0)))
+}
+
+#[cfg(target_os = "macos")]
+fn finder_icon_image() -> Option<egui::ColorImage> {
+    let out = std::env::temp_dir().join(format!("kip-finder-icon-{}.png", std::process::id()));
+    let ok = std::process::Command::new("sips")
+        .args(["-s", "format", "png", "-Z", "64", "/System/Library/CoreServices/Finder.app/Contents/Resources/Finder.icns", "--out"])
+        .arg(&out)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?
+        .success();
+    let bytes = std::fs::read(&out).ok();
+    let _ = std::fs::remove_file(&out);
+    let img = eframe::icon_data::from_png_bytes(&bytes.filter(|_| ok)?).ok()?;
+    Some(egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.rgba))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn finder_icon_image() -> Option<egui::ColorImage> {
+    None
+}
+
+/// A small folder: yellow like Explorer's on Windows, blue-gray elsewhere.
+fn folder_icon_image() -> egui::ColorImage {
+    let (body, tab) = if cfg!(windows) {
+        (Color32::from_rgb(0xf4, 0xc4, 0x4e), Color32::from_rgb(0xe0, 0xa8, 0x2e))
+    } else {
+        (Color32::from_rgb(0x8f, 0xa8, 0xc8), Color32::from_rgb(0x6f, 0x8a, 0xae))
+    };
+    let n = 32;
+    let mut img = egui::ColorImage::filled([n, n], Color32::TRANSPARENT);
+    for y in 0..n {
+        for x in 0..n {
+            let px = if (6..10).contains(&y) && (2..14).contains(&x) {
+                tab
+            } else if (9..28).contains(&y) && (2..30).contains(&x) {
+                body
+            } else {
+                continue;
+            };
+            img.pixels[y * n + x] = px;
+        }
+    }
+    img
+}
+
+/// Show a folder in the file manager. A macOS bundle (.app) is a folder too,
+/// but `open` would launch it, so it is revealed instead.
+fn open_folder(dir: &std::path::Path) {
+    plat::open_path(dir, dir.extension().is_some_and(|e| e == "app"));
+}
+
+/// "Open in Finder" in the platform's words.
+fn open_folder_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        tr("Открыть в Finder", "Open in Finder")
+    } else if cfg!(windows) {
+        tr("Открыть в Проводнике", "Open in Explorer")
+    } else {
+        tr("Открыть папку", "Open folder")
+    }
+}
+
+/// Deepest folder all of `dirs` sit in; None for no dirs or only "/" in common.
+fn common_dir<'a>(dirs: impl Iterator<Item = &'a std::path::Path>) -> Option<PathBuf> {
+    let mut acc: Option<PathBuf> = None;
+    for d in dirs {
+        acc = Some(match acc {
+            None => d.to_path_buf(),
+            Some(a) => a.ancestors().find(|x| d.starts_with(x))?.to_path_buf(),
+        });
+    }
+    acc.filter(|a| a.parent().is_some())
 }
 
 fn project_path(s: &Session) -> &std::path::Path {

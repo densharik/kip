@@ -333,6 +333,62 @@ impl App {
                 let lines: Vec<&str> = text.lines().collect();
                 Ok(json!(lines[lines.len().saturating_sub(n)..].join("\n")))
             },
+            "style_group" => {
+                // A manual group by name, or a project by its folder.
+                let (key, name, project) = match (args["group"].as_str(), args["project"].as_str()) {
+                    (Some(g), _) => {
+                        if !self.sessions.iter().any(|s| s.group.as_deref() == Some(g)) {
+                            return Err(format!("no group {g}"));
+                        }
+                        (g.to_string(), g.to_string(), false)
+                    },
+                    (None, Some(p)) => {
+                        // Same spelling as the sidebar's key: no trailing slash, and an open project.
+                        let p: PathBuf = expand(p).components().collect();
+                        if !self.sessions.iter().any(|s| project_path(s) == p) {
+                            return Err(format!("no open session in project {}", p.display()));
+                        }
+                        let p = p.to_string_lossy().into_owned();
+                        (format!("project:{p}"), p, true)
+                    },
+                    _ => return Err("pass group or project".into()),
+                };
+                match &args["color"] {
+                    Value::Null => {},
+                    Value::String(c) if c.is_empty() => {
+                        self.group_colors.remove(&key);
+                    },
+                    Value::String(c) => {
+                        let c = c.trim_start_matches('#');
+                        let hex = u32::from_str_radix(c, 16).ok().filter(|_| c.len() == 6).ok_or("color is #rrggbb")?;
+                        self.group_colors.insert(key, [(hex >> 16) as u8, (hex >> 8) as u8, hex as u8]);
+                    },
+                    _ => return Err("color is #rrggbb".into()),
+                }
+                if args.get("before").is_some() {
+                    let before = args["before"].as_str().map(|b| {
+                        if project { expand(b).components().collect::<PathBuf>().to_string_lossy().into_owned() } else { b.to_string() }
+                    });
+                    if project {
+                        self.move_project(name, before);
+                    } else {
+                        self.move_group(name, before);
+                    }
+                }
+                self.persist();
+                Ok(json!("done"))
+            },
+            "open_folder" => {
+                let dir = match args["path"].as_str() {
+                    Some(p) => expand(p),
+                    None => self.sessions[self.session_index(arg_id(args)?)?].cwd.clone(),
+                };
+                if !dir.is_dir() {
+                    return Err(format!("not a folder: {}", dir.display()));
+                }
+                open_folder(&dir);
+                Ok(json!("opened"))
+            },
             "show_history" => {
                 let k = self.win_index(args["window"].as_u64().unwrap_or(0))?;
                 if let Some(q) = args["query"].as_str() {
@@ -559,8 +615,8 @@ impl App {
                 }
                 ui.label(
                     RichText::new(tr(
-                        "Компактно: 22 инструмента, около 1.9 тыс. токенов контекста. Ставится одной командой: claude mcp add -s user kip. Печатать в чужие сессии MCP не может, пока вы не разрешите это в настройках.",
-                        "Compact: 22 tools, about 1.9k tokens of context. Installs with one command: claude mcp add -s user kip. MCP cannot type into sessions unless you allow it in Settings.",
+                        "Компактно: 24 инструмента, около 2.1 тыс. токенов контекста. Ставится одной командой: claude mcp add -s user kip. Печатать в чужие сессии MCP не может, пока вы не разрешите это в настройках.",
+                        "Compact: 24 tools, about 2.1k tokens of context. Installs with one command: claude mcp add -s user kip. MCP cannot type into sessions unless you allow it in Settings.",
                     ))
                     .size(10.5)
                     .color(palette::text_faint()),
