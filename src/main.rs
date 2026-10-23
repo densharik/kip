@@ -340,6 +340,9 @@ struct WinUi {
     color_hover: Option<(String, Color32)>,
     /// Sleeping row under the pointer and since when (wake on hover).
     hover_wake: Option<(u64, Instant, Instant)>,
+    /// Rows the hover-wake timer put back to sleep: not woken again by hover
+    /// until the pointer has left them.
+    hover_block: Vec<u64>,
 }
 
 /// Search over the active terminal, with a lazy count in the window's other
@@ -1544,6 +1547,42 @@ impl App {
             }
             ctx.request_repaint_after(WAKE_GAP);
         }
+        // A hover wake nobody clicked goes back to sleep. Not one on screen,
+        // pinned, kept awake, or with Claude mid-turn.
+        // The quiet time counts from the last output too, so a session that
+        // started doing something is left alone.
+        const HOVER_WAKE_TTL: Duration = Duration::from_secs(60);
+        if self.sessions.iter().any(|s| s.hover_woke.is_some()) {
+            let mut kill_pids = Vec::new();
+            for i in 0..self.sessions.len() {
+                let Some(t) = self.sessions[i].hover_woke else { continue };
+                let shown = self.shown(self.sessions[i].id);
+                let s = &mut self.sessions[i];
+                if shown || s.pinned || s.keep_awake || !matches!(s.phase, Phase::Live(_)) {
+                    s.hover_woke = None;
+                } else if t.elapsed() >= HOVER_WAKE_TTL
+                    && s.last_activity.elapsed() >= HOVER_WAKE_TTL
+                    && s.turn_since.is_none()
+                {
+                    // Batched kill, as in the idle sweep: no `ps` per session on the UI thread.
+                    if let Phase::Live(l) = &mut s.phase {
+                        l.kill_on_drop = false;
+                        kill_pids.push(l.shell_pid);
+                    }
+                    s.suspend();
+                    s.hover_woke = None;
+                    let id = s.id;
+                    for w in &mut self.wins {
+                        w.ui.hover_block.push(id);
+                    }
+                }
+            }
+            if !kill_pids.is_empty() {
+                plat::kill_trees(&kill_pids);
+                self.persist();
+            }
+            ctx.request_repaint_after(Duration::from_secs(5));
+        }
         let mut covered = false;
         for s in &mut self.sessions {
             if s.cover.is_none() {
@@ -1593,6 +1632,9 @@ impl App {
                         self.sessions[i].claude_session_id.is_some() && self.sessions[i].was_live != Some(false)
                     });
                     if self.resume_bg(id, claude, ctx) {
+                        if let Some(i) = self.idx_of(id) {
+                            self.sessions[i].hover_woke = Some(Instant::now());
+                        }
                         self.persist();
                     }
                 },
@@ -3256,7 +3298,10 @@ impl App {
         // must not make the row highlight and the button flicker.
         let hovered = ui.rect_contains_pointer(rect);
         // Resting on a sleeping row starts waking it, so it is (nearly) up by the click.
-        if self.settings.wake_on_hover && matches!(self.sessions[idx].phase, Phase::Suspended) {
+        if !hovered {
+            self.w.hover_block.retain(|b| *b != id);
+        }
+        if self.settings.wake_on_hover && !self.w.hover_block.contains(&id) && matches!(self.sessions[idx].phase, Phase::Suspended) {
             // Armed only by the pointer moving onto the row: a pointer that was
             // already resting there when the idle timer (or MCP) put the session
             // to sleep must not wake it right back. A row that stopped being

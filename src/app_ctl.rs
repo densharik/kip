@@ -248,7 +248,9 @@ impl App {
                 let id = arg_id(args)?;
                 let idx = self.session_index(id)?;
                 if matches!(self.sessions[idx].phase, Phase::Live(_)) {
-                    return Err("session is already running".into());
+                    // Asked for on purpose: a hover wake's sleep timer no longer applies.
+                    self.sessions[idx].hover_woke = None;
+                    return Ok(json!("already running"));
                 }
                 let claude = args["claude"].as_bool() != Some(false) && self.sessions[idx].claude_session_id.is_some();
                 let k = self.win_of(id)?;
@@ -478,6 +480,8 @@ impl App {
                 if self.sessions[idx].live().is_none() {
                     return Err("session is not running; wake_session it first".into());
                 }
+                // Put to work: keep it up even if only a hover woke it.
+                self.sessions[idx].hover_woke = None;
                 if args["enter"].as_bool() == Some(false) {
                     if let Some(l) = self.sessions[idx].live() {
                         l.notifier.notify(text.into_bytes());

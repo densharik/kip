@@ -108,6 +108,9 @@ pub struct Session {
     pub cover_at: Instant,
     /// Restored from a session that was running at quit (see SavedSession::live).
     pub was_live: Option<bool>,
+    /// Woken by the pointer resting on its row and not opened since: it goes
+    /// back to sleep after HOVER_WAKE_TTL unless picked.
+    pub hover_woke: Option<Instant>,
     pub spawned_at: SystemTime,
     pub claude_session_id: Option<String>,
     pub skip_permissions: bool,
@@ -274,6 +277,8 @@ impl Session {
             // A session still waiting in the launch queue keeps its flag; one
             // whose resumed Claude is still booting counts as Claude.
             live: match &self.phase {
+                // Only up because the pointer passed over it: asleep next launch.
+                Phase::Live(_) if self.hover_woke.is_some() => None,
                 Phase::Live(_) => Some(self.fg_is_claude || self.cover.is_some()),
                 _ => self.was_live,
             },
@@ -309,6 +314,7 @@ impl Session {
             cover: None,
             cover_at: Instant::now(),
             was_live: saved.live,
+            hover_woke: None,
             spawned_at: SystemTime::now(),
             claude_session_id: saved.claude_session_id,
             skip_permissions: saved.skip_permissions,
