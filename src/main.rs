@@ -3256,21 +3256,12 @@ impl App {
         if let Some(e) = ctx_entry {
             let pct = e.pct.clamp(1.0, 100.0);
             let lt = palette::light();
+            // Static on purpose: a pulse kept an idle kip redrawing at 10fps.
             let (bg, fg) = if pct >= 70.0 {
-                // Pulse at ~10fps while visible.
-                let t = ui.input(|i| i.time);
-                let a = ((t * 4.0).sin() * 0.5 + 0.5) as f32;
-                let lerp = |lo: u8, hi: u8| (lo as f32 + (hi as f32 - lo as f32) * a) as u8;
                 if lt {
-                    (
-                        Color32::from_rgb(0xf4, lerp(0xce, 0xbc), lerp(0xce, 0xbc)),
-                        Color32::from_rgb(0xb0, 0x2b, 0x2b),
-                    )
+                    (Color32::from_rgb(0xf4, 0xbc, 0xbc), Color32::from_rgb(0xb0, 0x2b, 0x2b))
                 } else {
-                    (
-                        Color32::from_rgb(lerp(0x38, 0x5c), lerp(0x1e, 0x22), lerp(0x1e, 0x22)),
-                        Color32::from_rgb(0xe2, 0x8f, 0x8f),
-                    )
+                    (Color32::from_rgb(0x5c, 0x22, 0x22), Color32::from_rgb(0xe2, 0x8f, 0x8f))
                 }
             } else if pct >= 50.0 {
                 if lt {
@@ -3294,9 +3285,6 @@ impl App {
             painter.rect_filled(pill, CornerRadius::same(7), bg);
             painter.galley(pill.min + pad, galley, fg);
             right = pill.min.x - 4.0;
-            if pct >= 70.0 {
-                ui.ctx().request_repaint_after(Duration::from_millis(100));
-            }
             // The badge eats into the name's line.
             name_max = name_max.saturating_sub(5);
         }
