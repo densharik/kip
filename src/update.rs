@@ -14,6 +14,7 @@ use std::sync::mpsc::Sender;
 use crate::i18n::tr;
 
 const LATEST_API: &str = "https://api.github.com/repos/densharik/kip/releases/latest";
+const COMPARE_API: &str = "https://api.github.com/repos/densharik/kip/compare";
 const RELEASES_URL: &str = "https://github.com/densharik/kip/releases/latest";
 
 /// Raw ed25519 public key of the release signing key.
@@ -54,6 +55,13 @@ pub struct Release {
     pub display: String,
     pub asset_url: String,
     pub sig_url: String,
+    /// What changed since the running version, as (ru, en) points.
+    pub notes: Vec<(String, String)>,
+}
+
+/// A change note in the active language.
+pub fn note(n: &(String, String)) -> &str {
+    if crate::i18n::lang() == crate::i18n::Lang::En { &n.1 } else { &n.0 }
 }
 
 pub enum UpdateMsg {
@@ -63,10 +71,7 @@ pub enum UpdateMsg {
     Applied(Result<(), String>),
 }
 
-fn do_check() -> Result<Option<Release>, String> {
-    if ASSET_NAME.is_empty() {
-        return Err(tr("автообновление доступно только на macOS и Windows", "auto-update is only on macOS and Windows").into());
-    }
+fn github(url: &str) -> Result<serde_json::Value, String> {
     let out = Command::new("curl")
         .args([
             "-sL",
@@ -76,15 +81,54 @@ fn do_check() -> Result<Option<Release>, String> {
             "Accept: application/vnd.github+json",
             "-H",
             "User-Agent: kip-updater",
-            LATEST_API,
+            url,
         ])
         .output()
         .map_err(|e| format!("{}: {e}", tr("curl не запустился", "curl failed to start")))?;
     if !out.status.success() {
         return Err(tr("не удалось связаться с GitHub", "could not reach GitHub").into());
     }
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|_| tr("неожиданный ответ GitHub", "unexpected GitHub response").to_string())?;
+    serde_json::from_slice(&out.stdout).map_err(|_| tr("неожиданный ответ GitHub", "unexpected GitHub response").to_string())
+}
+
+/// Change notes from the commit messages between two tags, newest first.
+/// A commit lists its points as `Change-ru:` / `Change-en:` trailer pairs;
+/// one without them contributes its subject line in both languages.
+fn notes_between(from: &str, to: &str) -> Vec<(String, String)> {
+    let Ok(v) = github(&format!("{COMPARE_API}/v{from}...{to}")) else { return Vec::new() };
+    let Some(commits) = v["commits"].as_array() else { return Vec::new() };
+    let mut notes = Vec::new();
+    for c in commits.iter().rev() {
+        let msg = c["commit"]["message"].as_str().unwrap_or("");
+        let (mut ru, mut en) = (Vec::new(), Vec::new());
+        for line in msg.lines() {
+            if let Some(t) = line.strip_prefix("Change-ru:") {
+                ru.push(t.trim().to_string());
+            } else if let Some(t) = line.strip_prefix("Change-en:") {
+                en.push(t.trim().to_string());
+            }
+        }
+        if ru.is_empty() && en.is_empty() {
+            let subj = msg.lines().next().unwrap_or("").trim();
+            if !subj.is_empty() {
+                notes.push((subj.to_string(), subj.to_string()));
+            }
+            continue;
+        }
+        for i in 0..ru.len().max(en.len()) {
+            let r = ru.get(i).or(en.get(i)).cloned().unwrap_or_default();
+            let e = en.get(i).or(ru.get(i)).cloned().unwrap_or_default();
+            notes.push((r, e));
+        }
+    }
+    notes
+}
+
+fn do_check() -> Result<Option<Release>, String> {
+    if ASSET_NAME.is_empty() {
+        return Err(tr("автообновление доступно только на macOS и Windows", "auto-update is only on macOS and Windows").into());
+    }
+    let v = github(LATEST_API)?;
     let tag = v["tag_name"].as_str().ok_or(tr("нет tag_name в ответе", "no tag_name in response"))?;
     // Not newer than what is running -> nothing to do.
     if parse_ver(tag) <= parse_ver(current_version()) {
@@ -102,7 +146,8 @@ fn do_check() -> Result<Option<Release>, String> {
     let sig_url = find(&format!("{ASSET_NAME}.sig"))
         .ok_or_else(|| format!("{} {tag} {}", tr("релиз", "release"), tr("не подписан", "is not signed")))?;
     let display = tag.trim_start_matches('v').to_string();
-    Ok(Some(Release { display, asset_url, sig_url }))
+    let notes = notes_between(current_version(), tag);
+    Ok(Some(Release { display, asset_url, sig_url, notes }))
 }
 
 pub fn check(tx: Sender<UpdateMsg>, egui: egui::Context) {

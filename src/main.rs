@@ -173,6 +173,8 @@ enum UpdateState {
 
 enum Act {
     Select(u64),
+    /// Open Settings on the About tab, where the update is offered.
+    ShowUpdate,
     NewSame,
     NewPick,
     /// Open or close the past-conversations browser.
@@ -907,6 +909,9 @@ impl App {
                 update::UpdateMsg::Checked(Ok(Some(r))) => {
                     self.update_state = UpdateState::Available(r)
                 },
+                // A failed background recheck must not hide an update already offered.
+                update::UpdateMsg::Checked(Ok(None) | Err(_))
+                    if matches!(self.update_state, UpdateState::Available(_)) => {},
                 update::UpdateMsg::Checked(Ok(None)) => self.update_state = UpdateState::UpToDate,
                 update::UpdateMsg::Checked(Err(e)) | update::UpdateMsg::Applied(Err(e)) => {
                     self.update_state = UpdateState::Failed(e)
@@ -1647,6 +1652,13 @@ impl App {
                     self.normalize_order();
                     self.persist();
                 },
+                Act::ShowUpdate => {
+                    self.settings_open = true;
+                    self.settings_tab = 4;
+                    if self.cur_win != 0 {
+                        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+                    }
+                },
                 Act::Settings => {
                     self.settings_open = !self.settings_open;
                     if self.settings_open && self.cur_win != 0 {
@@ -1913,17 +1925,15 @@ impl App {
 
         if now.duration_since(self.last_tick) >= TICK {
             self.last_tick = now;
-            // Background update check a couple of times a day, on top of the
-            // one at launch. Skip while a check/update is already in flight or
-            // an update is already offered.
-            if self.last_update_check.elapsed() >= Duration::from_secs(12 * 3600)
-                && matches!(
-                    self.update_state,
-                    UpdateState::Idle | UpdateState::UpToDate | UpdateState::Failed(_)
-                )
+            // Background update check every hour, on top of the one at launch.
+            // An offered update stays on screen while a newer one is looked for.
+            if self.last_update_check.elapsed() >= Duration::from_secs(3600)
+                && !matches!(self.update_state, UpdateState::Checking | UpdateState::Working)
             {
                 self.last_update_check = now;
-                self.update_state = UpdateState::Checking;
+                if !matches!(self.update_state, UpdateState::Available(_)) {
+                    self.update_state = UpdateState::Checking;
+                }
                 update::check(self.upd_tx.clone(), ctx.clone());
             }
             let seen: Vec<u64> = self.focused_wins(ctx).filter_map(|w| w.ui.active).collect();
@@ -3637,6 +3647,7 @@ impl App {
                     }
                     ui.add_space(4.0);
 
+                    let mut show_update = false;
                     match &s.phase {
                         Phase::Live(_) => {
                             // skip-permissions only matters when (re)launching claude,
@@ -3685,6 +3696,30 @@ impl App {
                                 ui.label(RichText::new(tr("усыплена", "suspended")).size(11.0).color(palette::text_faint()));
                             }
                         },
+                    }
+
+                    if let UpdateState::Available(r) = &self.update_state {
+                        ui.add_space(8.0);
+                        let btn = ui
+                            .button(
+                                RichText::new(format!("{} {}", tr("Доступно обновление", "Update available:"), r.display))
+                                    .size(11.5)
+                                    .color(GIT_ADD),
+                            )
+                            .on_hover_ui(|ui| {
+                                ui.set_max_width(420.0);
+                                ui.label(RichText::new(tr("Что нового:", "What's new:")).strong());
+                                for n in r.notes.iter().take(12) {
+                                    ui.label(format!("- {}", update::note(n)));
+                                }
+                                if r.notes.len() > 12 {
+                                    ui.label(RichText::new(format!("{} {}", tr("и ещё", "and"), r.notes.len() - 12)).color(palette::text_dim()));
+                                }
+                            });
+                        show_update = btn.clicked();
+                    }
+                    if show_update {
+                        acts.push(Act::ShowUpdate);
                     }
                 });
             });
@@ -5199,6 +5234,9 @@ impl App {
                 match &self.update_state {
                     UpdateState::Available(r) => {
                         ui.label(RichText::new(format!("{} {}", tr("Доступна версия", "Available:"), r.display)).color(GIT_ADD));
+                        for n in r.notes.iter().take(12) {
+                            ui.add(egui::Label::new(RichText::new(format!("- {}", update::note(n))).size(12.0)).wrap());
+                        }
                         if ui.button(RichText::new(tr("Обновить и перезапустить", "Update and restart")).color(GIT_ADD)).clicked() {
                             do_update = Some(r.clone());
                         }
