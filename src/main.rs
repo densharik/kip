@@ -2500,6 +2500,19 @@ impl App {
             if files.clicked() {
                 acts.push(Act::ToggleExplorer);
             }
+            ui.add_space(4.0);
+            let asleep = self.sessions.iter().filter(|s| !matches!(s.phase, Phase::Live(_))).count();
+            let live = ui
+                .selectable_label(self.settings.only_live, RichText::new(tr("Активные", "Active")).size(12.5))
+                .on_hover_text(format!(
+                    "{}\n{} {asleep}",
+                    tr("Только запущенные сессии: усыплённые и завершённые скрыты", "Only running sessions: sleeping and finished ones are hidden"),
+                    tr("Неактивных:", "Inactive:"),
+                ));
+            if live.clicked() {
+                self.settings.only_live = !self.settings.only_live;
+                self.persist();
+            }
         });
         ui.add_space(8.0);
 
@@ -2512,6 +2525,27 @@ impl App {
         // first line drawn would be a stray rule under the toolbar.
         let sep = self.settings.row_separators;
         let mut first = true;
+        // "Active" filter: sleeping and finished rows drop out, and so do
+        // headers left with nothing to show. The selected row always stays.
+        let selected = self.active_idx().map(|i| self.sessions[i].id);
+        let shown: Vec<u64> = self
+            .sessions
+            .iter()
+            .filter(|s| !self.settings.only_live || matches!(s.phase, Phase::Live(_)) || Some(s.id) == selected)
+            .map(|s| s.id)
+            .collect();
+        let shown_headers: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|s| shown.contains(&s.id))
+            .filter_map(|s| {
+                if self.settings.group_by_project {
+                    Some(project_path(s).to_string_lossy().into_owned())
+                } else {
+                    s.group.clone()
+                }
+            })
+            .collect();
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let rule = |ui: &egui::Ui, rect: Rect, first: &mut bool| {
                 if sep && !*first {
@@ -2525,6 +2559,13 @@ impl App {
                 *first = false;
             };
             for slot in self.sidebar_order() {
+                let hidden = match &slot {
+                    Slot::Header(name) => !shown_headers.contains(name),
+                    Slot::Row(id) => !shown.contains(id),
+                };
+                if hidden {
+                    continue;
+                }
                 match slot {
                     Slot::Header(name) if self.settings.group_by_project => {
                         let collapsed = self.collapsed_groups.contains(&format!("project:{name}"));

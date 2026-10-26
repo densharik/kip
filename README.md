@@ -130,7 +130,8 @@ exactly, straight from Claude, if you turn on the statusline hook in settings.
 That is what the sidebar is for. Each session is its own shell in its own
 directory with its own Claude conversation, and the badges tell you which agent
 is about to run out of context and which one is idle waiting for you. Sessions
-you are not using can sleep so they cost nothing.
+you are not using can sleep so they cost nothing, and the "Active" toggle above
+the list hides them until you need them again.
 
 ### How much memory does kip use?
 

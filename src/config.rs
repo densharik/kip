@@ -39,6 +39,8 @@ pub struct Settings {
     /// Sidebar sections follow each session's project (git root or folder)
     /// instead of the manual groups, which stay saved for switching back.
     pub group_by_project: bool,
+    /// Sidebar lists only running sessions (plus the selected one).
+    pub only_live: bool,
     /// Key of the usage limit pinned to the corner chip (see usage::Limit::key).
     pub usage_pin: Option<String>,
     /// MCP may type into sessions (send_input). Off: one Claude must not drive another unasked.
@@ -86,6 +88,7 @@ impl Default for Settings {
             show_last_msg: true,
             row_separators: false,
             group_by_project: false,
+            only_live: false,
             usage_pin: None,
             mcp_send_input: false,
             mcp_offer_off: false,
