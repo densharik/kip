@@ -44,6 +44,8 @@ pub struct LiveTerm {
     pub shell_pid: i32,
     pub cols: u16,
     pub rows: u16,
+    /// Size the widget wants and since when; applied once it stops changing.
+    pub pending_size: Option<((u16, u16), Instant)>,
     /// Kill the shell tree when this LiveTerm drops. True for intentional
     /// teardown (suspend, close, quit) where the shell is still alive; cleared
     /// by `finalize_exit`, where the shell already exited and its pid may have
@@ -424,7 +426,7 @@ pub fn spawn_live(
     let notifier = Notifier(event_loop.channel());
     event_loop.spawn();
 
-    Ok(LiveTerm { term, notifier, master_fd, shell_pid, cols, rows, kill_on_drop: true })
+    Ok(LiveTerm { term, notifier, master_fd, shell_pid, cols, rows, pending_size: None, kill_on_drop: true })
 }
 
 /// Claude session ids are UUIDs. Everything else (filenames, external JSON)

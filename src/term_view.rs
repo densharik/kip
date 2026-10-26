@@ -17,6 +17,8 @@ use crate::config::Settings;
 use crate::palette;
 use crate::session::Session;
 
+const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(120);
+
 pub struct GridInfo {
     pub cols: u16,
     pub rows: u16,
@@ -122,18 +124,36 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     let term_arc = live.term.clone();
     let mut term = term_arc.lock();
 
-    // Resize PTY and terminal to fit the widget.
-    if cols != live.cols || rows != live.rows {
-        term.resize(TermSize::new(cols as usize, rows as usize));
-        let _ = live.notifier.0.send(Msg::Resize(alacritty_terminal::event::WindowSize {
-            num_lines: rows,
-            num_cols: cols,
-            cell_width: cell_w.round() as u16,
-            cell_height: cell_h.round() as u16,
-        }));
-        live.cols = cols;
-        live.rows = rows;
+    // Resize PTY and terminal to fit the widget, but only once the size has held
+    // still. Claude redraws its live region by moving the cursor up as many lines
+    // as it printed at the old width; a resize per frame of a window drag reflows
+    // those lines under it dozens of times and leaves torn, duplicated text.
+    // Until then the old grid is drawn as is, clipped to the widget.
+    let want = (cols, rows);
+    if want == (live.cols, live.rows) {
+        live.pending_size = None;
+    } else {
+        let since = match live.pending_size {
+            Some((size, since)) if size == want => since,
+            _ => live.pending_size.insert((want, std::time::Instant::now())).1,
+        };
+        let left = RESIZE_SETTLE.saturating_sub(since.elapsed());
+        if left.is_zero() {
+            term.resize(TermSize::new(cols as usize, rows as usize));
+            let _ = live.notifier.0.send(Msg::Resize(alacritty_terminal::event::WindowSize {
+                num_lines: rows,
+                num_cols: cols,
+                cell_width: cell_w.round() as u16,
+                cell_height: cell_h.round() as u16,
+            }));
+            live.cols = cols;
+            live.rows = rows;
+            live.pending_size = None;
+        } else {
+            ui.ctx().request_repaint_after(left);
+        }
     }
+    let (cols, rows) = (live.cols, live.rows);
 
     // Bottom-anchor content that has not yet outgrown the viewport (Warp-style):
     // empty space stays above, the prompt and fresh output sit near the input.
