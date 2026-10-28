@@ -79,10 +79,11 @@ way it launches with no Gatekeeper warning.
 **Windows** - download `kip.exe` and run it. Single portable binary, put it
 anywhere.
 
-**From source** - needs a stable Rust toolchain (edition 2024):
+**From source** - needs a stable Rust toolchain (edition 2024) and Zig 0.17
+(the terminal core, libghostty-vt, is built from the `vendor/ghostty` submodule):
 
 ```
-git clone https://github.com/densharik/kip
+git clone --recursive https://github.com/densharik/kip
 cd kip
 cargo build --release
 ```

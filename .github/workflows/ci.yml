@@ -1,8 +1,11 @@
 name: CI
 
-# Push to main is handled by release.yml (which also tests); CI covers PRs.
+# Push to main is handled by release.yml (which also tests); CI covers PRs
+# and pushes to other branches.
 on:
   pull_request:
+  push:
+    branches-ignore: [main]
 
 permissions:
   contents: read
@@ -13,12 +16,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # libghostty-vt (vendor/ghostty) is built by build.rs with zig.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            vendor/ghostty/zig-pkg
+            vendor/ghostty/.zig-cache
+          key: ghostty-${{ runner.os }}-${{ hashFiles('.gitmodules') }}-${{ github.sha }}
+          restore-keys: ghostty-${{ runner.os }}-
       - name: Clippy
         if: runner.os == 'macOS'
         run: cargo clippy --release --all-targets -- -D warnings

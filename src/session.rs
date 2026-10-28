@@ -1,33 +1,38 @@
-use std::collections::HashMap;
-#[cfg(not(windows))]
-use std::os::fd::AsRawFd;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
-use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config as TermConfig, Term};
-use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
+use portable_pty::{CommandBuilder, MasterPty, PtySize};
 
 use crate::config::{SavedSession, Settings};
+use crate::vt;
+
+/// What a session's terminal reports to the UI thread.
+pub enum TermEvent {
+    /// New output was parsed.
+    Wakeup,
+    Bell,
+    Title(String),
+    /// OSC 52: the program put text on the clipboard.
+    Clipboard(String),
+    /// The shell exited (None: killed by a signal).
+    ChildExit(Option<i32>),
+}
 
 #[derive(Clone)]
 pub struct EventProxy {
     pub id: u64,
-    pub tx: Sender<(u64, Event)>,
+    pub tx: Sender<(u64, TermEvent)>,
     pub ctx: egui::Context,
     /// Sessions on screen (one per window); output of the others coalesces repaints.
     pub active: Arc<Mutex<Vec<u64>>>,
 }
 
-impl EventListener for EventProxy {
-    fn send_event(&self, event: Event) {
+impl EventProxy {
+    pub fn send_event(&self, event: TermEvent) {
         let _ = self.tx.send((self.id, event));
         if self.active.lock().is_ok_and(|a| a.contains(&self.id)) {
             self.ctx.request_repaint();
@@ -37,9 +42,31 @@ impl EventListener for EventProxy {
     }
 }
 
+/// The terminal core shared by the PTY reader thread and the UI thread.
+pub struct TermLock(Mutex<vt::Term>);
+
+impl TermLock {
+    pub fn lock(&self) -> MutexGuard<'_, vt::Term> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Bytes for the PTY, written by a thread of its own so a program that stops
+/// reading its input never blocks the UI.
+pub struct Notifier(Sender<Vec<u8>>);
+
+impl Notifier {
+    pub fn notify(&self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            let _ = self.0.send(bytes);
+        }
+    }
+}
+
 pub struct LiveTerm {
-    pub term: Arc<FairMutex<Term<EventProxy>>>,
+    pub term: Arc<TermLock>,
     pub notifier: Notifier,
+    master: Box<dyn MasterPty>,
     pub master_fd: i32,
     pub shell_pid: i32,
     pub cols: u16,
@@ -51,6 +78,35 @@ pub struct LiveTerm {
     /// by `finalize_exit`, where the shell already exited and its pid may have
     /// been reused - killing it then would target an unrelated process.
     pub kill_on_drop: bool,
+    /// Set on drop: the reader stops, the exit watcher stays quiet.
+    closed: Arc<AtomicBool>,
+    /// Theme last handed to the terminal core (palette, default colors).
+    pub theme: Option<crate::palette::Theme>,
+}
+
+impl LiveTerm {
+    pub fn resize(&mut self, cols: u16, rows: u16, cell_w: u16, cell_h: u16) {
+        self.term.lock().resize(cols, rows, cell_w as u32, cell_h as u32);
+        let _ = self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: cols.saturating_mul(cell_w),
+            pixel_height: rows.saturating_mul(cell_h),
+        });
+        self.cols = cols;
+        self.rows = rows;
+    }
+
+    /// Follow the app theme: palette colors and OSC 10/11 answers.
+    pub fn sync_theme(&mut self) {
+        let th = crate::palette::theme();
+        if self.theme.as_ref() == Some(&th) {
+            return;
+        }
+        let c = |c: egui::Color32| [c.r(), c.g(), c.b()];
+        self.term.lock().set_colors(c(th.fg), c(th.bg), c(th.cursor), &crate::palette::term_palette(), crate::palette::light());
+        self.theme = Some(th);
+    }
 }
 
 impl Drop for LiveTerm {
@@ -61,16 +117,12 @@ impl Drop for LiveTerm {
         // under launchd, still eating RAM. Every intentional teardown - suspend,
         // close tab, quit - drops LiveTerm, so this is the single place that
         // frees them. finalize_exit clears the flag (the shell already exited).
+        self.closed.store(true, Ordering::SeqCst);
         if self.kill_on_drop {
             crate::plat::kill_tree(self.shell_pid);
         }
-        let _ = self.notifier.0.send(Msg::Shutdown);
-        // Windows has no master fd; the Pty (dropped with the event loop) owns
-        // its own handle cleanup.
-        #[cfg(not(windows))]
-        unsafe {
-            libc::close(self.master_fd)
-        };
+        // The master closes with `master`; the reader and writer threads hold
+        // their own handles and exit on `closed` / the dropped notifier.
     }
 }
 
@@ -120,12 +172,10 @@ pub struct Session {
     pub last_git_poll: Option<Instant>,
     pub git_inflight: bool,
     pub scroll_accum: f32,
-    /// Last selection and whether it was on the alt screen. Claude repaints its
-    /// live area with erase-line/erase-below, and alacritty drops any selection
-    /// those touch; we put it back so a drag or a copy survives the repaint.
-    pub sel_keep: Option<(alacritty_terminal::selection::Selection, bool)>,
-    /// Ctrl+F matches in this terminal (grid points) and the one jumped to.
-    pub find_hits: Vec<alacritty_terminal::term::search::Match>,
+    /// Mouse selection in progress: what it selects and where it started.
+    pub sel_drag: Option<crate::term_view::SelDrag>,
+    /// Ctrl+F matches in this terminal (buffer positions) and the one jumped to.
+    pub find_hits: Vec<crate::term_view::Match>,
     pub find_cur: Option<usize>,
     /// (cwd, project root) last worked out for it; see `project_root`. The
     /// lookup stats folders, so it runs off the UI thread: `proj_asked` is the
@@ -232,7 +282,7 @@ impl Session {
     }
 
     pub fn finalize_exit(&mut self, code: Option<i32>) {
-        // The shell exited on its own and alacritty already reaped it, so its
+        // The shell exited on its own and the exit watcher already reaped it, so its
         // pid may now belong to an unrelated process; disarm the kill in
         // LiveTerm::Drop (its children have reparented to launchd anyway).
         if let Phase::Live(live) = &mut self.phase {
@@ -303,7 +353,7 @@ impl Session {
             last_git_poll: None,
             git_inflight: false,
             scroll_accum: 0.0,
-            sel_keep: None,
+            sel_drag: None,
             find_hits: Vec::new(),
             find_cur: None,
             project: None,
@@ -324,14 +374,15 @@ impl Session {
     }
 }
 
-pub(crate) fn grab_snapshot(term: &FairMutex<Term<EventProxy>>) -> String {
+pub(crate) fn grab_snapshot(term: &TermLock) -> String {
     let term = term.lock();
-    let grid = term.grid();
-    let top = grid.topmost_line().0.max(-200);
-    let start = Point::new(Line(top), Column(0));
-    let end = Point::new(grid.bottommost_line(), Column(grid.columns().saturating_sub(1)));
-    let text = term.bounds_to_string(start, end);
-    text.trim_end().to_string()
+    // The screen plus up to 200 rows of scrollback above it.
+    let from = term.history().saturating_sub(200) as u32;
+    term.text_from(from).trim_end().to_string()
+}
+
+fn io_err(e: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::other(e.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -347,86 +398,221 @@ pub fn spawn_live(
     seed: Option<&str>,
 ) -> std::io::Result<LiveTerm> {
     #[cfg(not(windows))]
-    let shell = {
+    let mut cmd = {
         let prog = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        match command {
-            Some(cmd) => Shell::new(prog, vec!["-i".into(), "-l".into(), "-c".into(), cmd]),
-            None => Shell::new(prog, vec!["-i".into(), "-l".into()]),
+        let mut c = CommandBuilder::new(prog);
+        c.args(["-i", "-l"]);
+        if let Some(cmd) = command {
+            c.args(["-c", cmd.as_str()]);
         }
+        c
     };
     #[cfg(windows)]
-    let shell = {
-        let prog = "powershell.exe".to_string();
-        match command {
-            // PowerShell's -Command consumes the rest of the line, so the
-            // command's own spaces need no extra escaping.
-            Some(cmd) => Shell::new(prog, vec!["-NoLogo".into(), "-Command".into(), cmd]),
-            None => Shell::new(prog, vec!["-NoLogo".into()]),
+    let mut cmd = {
+        let mut c = CommandBuilder::new("powershell.exe");
+        c.arg("-NoLogo");
+        // PowerShell's -Command consumes the rest of the line, so the
+        // command's own spaces need no extra escaping.
+        if let Some(cmd) = command {
+            c.args(["-Command", cmd.as_str()]);
         }
+        c
     };
+    cmd.cwd(cwd);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("TERM_PROGRAM", "kip");
 
-    let mut env = HashMap::new();
-    env.insert("TERM".into(), "xterm-256color".into());
-    env.insert("COLORTERM".into(), "truecolor".into());
-    env.insert("TERM_PROGRAM".into(), "kip".into());
-
-    // Built via Default so the windows-only `escape_args` field is set too.
-    #[allow(clippy::field_reassign_with_default)]
-    let opts = {
-        let mut o = PtyOptions::default();
-        o.shell = Some(shell);
-        o.working_directory = Some(cwd.to_path_buf());
-        o.drain_on_exit = false;
-        o.env = env;
-        o
+    let size = PtySize {
+        rows,
+        cols,
+        pixel_width: cols.saturating_mul(cell_size.0),
+        pixel_height: rows.saturating_mul(cell_size.1),
     };
+    let pair = portable_pty::native_pty_system().openpty(size).map_err(io_err)?;
 
-    let window_size = WindowSize {
-        num_lines: rows,
-        num_cols: cols,
-        cell_width: cell_size.0,
-        cell_height: cell_size.1,
-    };
-
-    let pty = tty::new(&opts, window_size, id)?;
-    #[cfg(not(windows))]
-    let (master_fd, shell_pid) =
-        (unsafe { libc::dup(pty.file().as_raw_fd()) }, pty.child().id() as i32);
-    #[cfg(windows)]
-    let (master_fd, shell_pid) =
-        (-1, pty.child_watcher().pid().map(|p| p.get() as i32).unwrap_or(0));
-
-    let term_config = TermConfig {
-        scrolling_history: settings.scrollback,
-        kitty_keyboard: true,
-        ..Default::default()
-    };
-    let term = Term::new(term_config, &TermSize::new(cols as usize, rows as usize), proxy.clone());
-    let term = Arc::new(FairMutex::new(term));
-
+    let mut term = vt::Term::new(cols, rows, settings.scrollback);
+    term.resize(cols, rows, cell_size.0 as u32, cell_size.1 as u32);
     // Preload scrollback (e.g. a suspended session's snapshot) before the shell
-    // runs, so the on-screen history survives "reopen as terminal". Done before
-    // the event loop starts, so the shell's prompt lands after the history.
+    // runs, so the on-screen history survives "reopen as terminal" and the
+    // shell's prompt lands after it.
     if let Some(seed) = seed {
-        let mut parser =
-            alacritty_terminal::vte::ansi::Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
-        parser.advance(&mut *term.lock(), seed.as_bytes());
+        term.write(seed.as_bytes());
+        term.take_pty_out();
+        term.take_events();
+    }
+    let term = Arc::new(TermLock(Mutex::new(term)));
+
+    let mut child = pair.slave.spawn_command(cmd).map_err(io_err)?;
+    drop(pair.slave);
+    let master = pair.master;
+    let shell_pid = child.process_id().map(|p| p as i32).unwrap_or(0);
+    let closed = Arc::new(AtomicBool::new(false));
+
+    #[cfg(not(windows))]
+    let (master_fd, reader, mut writer) = {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let fd = master.as_raw_fd().unwrap_or(-1);
+        // Own handles: the reader polls so it can notice `closed`, the writer
+        // must not send EOF on drop (portable-pty's does). Non-blocking (the
+        // flag is shared by both dups): the reader drains the PTY one read()
+        // per chunk, as alacritty did.
+        let dup = |fd| unsafe {
+            let d = libc::dup(fd);
+            if d < 0 { Err(std::io::Error::last_os_error()) } else { Ok(std::fs::File::from_raw_fd(d)) }
+        };
+        let file = dup(fd)?;
+        unsafe {
+            let fl = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(file.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        let r: Box<dyn Read + Send> = Box::new(PollReader { file, closed: closed.clone() });
+        let w: Box<dyn Write + Send> = Box::new(PollWriter(dup(fd)?));
+        (fd, r, w)
+    };
+    #[cfg(windows)]
+    let (master_fd, reader, mut writer) =
+        (-1, master.try_clone_reader().map_err(io_err)?, master.take_writer().map_err(io_err)?);
+
+    let (wtx, wrx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::Builder::new().name(format!("pty-write-{id}")).spawn(move || {
+        for bytes in wrx {
+            if writer.write_all(&bytes).and_then(|_| writer.flush()).is_err() {
+                break;
+            }
+        }
+    })?;
+
+    {
+        let (term, proxy, wtx, mut reader) = (term.clone(), proxy.clone(), wtx.clone(), reader);
+        std::thread::Builder::new().name(format!("pty-read-{id}")).spawn(move || {
+            let mut buf = vec![0u8; 1024 * 1024];
+            loop {
+                let n = match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                let (reply, events) = {
+                    let mut t = term.lock();
+                    t.write(&buf[..n]);
+                    (t.take_pty_out(), t.take_events())
+                };
+                if !reply.is_empty() {
+                    let _ = wtx.send(reply);
+                }
+                for e in events {
+                    proxy.send_event(match e {
+                        vt::Event::Bell => TermEvent::Bell,
+                        vt::Event::Title(t) => TermEvent::Title(t),
+                        vt::Event::Clipboard(t) => TermEvent::Clipboard(t),
+                    });
+                }
+                proxy.send_event(TermEvent::Wakeup);
+            }
+        })?;
     }
 
-    let event_loop = match EventLoop::new(term.clone(), proxy, pty, false, false) {
-        Ok(el) => el,
-        Err(e) => {
-            #[cfg(not(windows))]
-            unsafe {
-                libc::close(master_fd)
-            };
-            return Err(e);
-        },
-    };
-    let notifier = Notifier(event_loop.channel());
-    event_loop.spawn();
+    {
+        let closed = closed.clone();
+        std::thread::Builder::new().name(format!("pty-wait-{id}")).spawn(move || {
+            let code = child.wait().ok().and_then(|s| s.signal().is_none().then_some(s.exit_code() as i32));
+            if !closed.load(Ordering::SeqCst) {
+                proxy.send_event(TermEvent::ChildExit(code));
+            }
+        })?;
+    }
 
-    Ok(LiveTerm { term, notifier, master_fd, shell_pid, cols, rows, pending_size: None, kill_on_drop: true })
+    let mut live = LiveTerm {
+        term,
+        notifier: Notifier(wtx),
+        master,
+        master_fd,
+        shell_pid,
+        cols,
+        rows,
+        pending_size: None,
+        kill_on_drop: true,
+        closed,
+        theme: None,
+    };
+    live.sync_theme();
+    Ok(live)
+}
+
+/// Blocking PTY reads that give up once the session is torn down: the master
+/// has other open handles, so a plain read would wait for the last process on
+/// the terminal to exit.
+#[cfg(not(windows))]
+struct PollReader {
+    file: std::fs::File,
+    closed: Arc<AtomicBool>,
+}
+
+#[cfg(not(windows))]
+fn wait_fd(fd: i32, events: i16, timeout_ms: i32) -> std::io::Result<bool> {
+    let mut p = libc::pollfd { fd, events, revents: 0 };
+    match unsafe { libc::poll(&mut p, 1, timeout_ms) } {
+        n if n < 0 => {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted { Ok(false) } else { Err(e) }
+        },
+        n => Ok(n > 0),
+    }
+}
+
+#[cfg(not(windows))]
+impl Read for PollReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::ErrorKind::{Interrupted, WouldBlock};
+        use std::os::fd::AsRawFd;
+        let mut n = 0;
+        loop {
+            // Drain what is there so the parser lock and the UI wakeup happen
+            // once per batch, not once per ~1KB the PTY hands out.
+            while n < buf.len() {
+                match self.file.read(&mut buf[n..]) {
+                    Ok(0) => return Ok(n),
+                    Ok(m) => n += m,
+                    Err(e) if e.kind() == WouldBlock => break,
+                    Err(e) if e.kind() == Interrupted => {},
+                    Err(_) if n > 0 => return Ok(n),
+                    Err(e) => return Err(e),
+                }
+            }
+            if n > 0 {
+                return Ok(n);
+            }
+            if self.closed.load(Ordering::SeqCst) {
+                return Ok(0);
+            }
+            wait_fd(self.file.as_raw_fd(), libc::POLLIN, 200)?;
+        }
+    }
+}
+
+/// Writes to the non-blocking master, waiting while the PTY is full.
+#[cfg(not(windows))]
+struct PollWriter(std::fs::File);
+
+#[cfg(not(windows))]
+impl Write for PollWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        loop {
+            match self.0.write(buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    wait_fd(self.0.as_raw_fd(), libc::POLLOUT, 1000)?;
+                },
+                r => return r,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Claude session ids are UUIDs. Everything else (filenames, external JSON)
@@ -821,22 +1007,9 @@ mod tests {
         // The "reopen as terminal" seed must be parsed into the grid before the
         // shell runs, so the suspended snapshot stays on screen. Feed the same
         // bytes spawn_live feeds and read them back.
-        use alacritty_terminal::event::VoidListener;
-        use alacritty_terminal::term::{Config, Term};
-        use alacritty_terminal::index::{Column, Point};
-        use alacritty_terminal::grid::Dimensions;
-
-        let size = TermSize::new(80, 24);
-        let mut term = Term::new(Config::default(), &size, VoidListener);
-        let seed = "line one\r\nline two\r\n";
-        let mut parser =
-            alacritty_terminal::vte::ansi::Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
-        parser.advance(&mut term, seed.as_bytes());
-
-        let grid = term.grid();
-        let start = Point::new(grid.topmost_line(), Column(0));
-        let end = Point::new(grid.bottommost_line(), Column(grid.columns() - 1));
-        let text = term.bounds_to_string(start, end);
+        let mut term = vt::Term::new(80, 24, 1000);
+        term.write(b"line one\r\nline two\r\n");
+        let text = grab_snapshot(&TermLock(Mutex::new(term)));
         assert!(text.contains("line one") && text.contains("line two"), "seed missing: {text:?}");
     }
 

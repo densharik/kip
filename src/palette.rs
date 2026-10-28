@@ -1,15 +1,12 @@
 use std::sync::RwLock;
 
-use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use egui::Color32;
 
 const fn c(r: u8, g: u8, b: u8) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Theme {
     pub bg: Color32,
     pub fg: Color32,
@@ -386,26 +383,8 @@ fn indexed(idx: u8, th: &Theme) -> Color32 {
     }
 }
 
-fn rgb32(rgb: Rgb) -> Color32 {
-    Color32::from_rgb(rgb.r, rgb.g, rgb.b)
-}
-
-fn named(n: NamedColor, colors: &Colors, th: &Theme) -> Color32 {
-    if let Some(rgb) = colors[n] {
-        return rgb32(rgb);
-    }
-    match n {
-        NamedColor::Foreground | NamedColor::BrightForeground => th.fg,
-        NamedColor::Background => th.bg,
-        NamedColor::Cursor => th.cursor,
-        NamedColor::DimForeground => dim(th.fg),
-        n if (n as usize) < 16 => th.ansi[n as usize],
-        n => {
-            // Dim variants: DimBlack=259 ..= DimWhite=266
-            let i = n as usize;
-            if (259..=266).contains(&i) { dim(th.ansi[i - 259]) } else { th.fg }
-        },
-    }
+fn rgb32(c: [u8; 3]) -> Color32 {
+    Color32::from_rgb(c[0], c[1], c[2])
 }
 
 fn dim(col: Color32) -> Color32 {
@@ -416,60 +395,39 @@ fn dim(col: Color32) -> Color32 {
     )
 }
 
-fn resolve(color: Color, colors: &Colors, bold: bool, th: &Theme) -> Color32 {
-    match color {
-        Color::Spec(rgb) => rgb32(rgb),
-        Color::Indexed(idx) => {
-            let idx = if bold && idx < 8 { idx + 8 } else { idx };
-            if let Some(rgb) = colors[idx as usize] { rgb32(rgb) } else { indexed(idx, th) }
-        },
-        Color::Named(n) => {
-            let n = if bold { n.to_bright() } else { n };
-            named(n, colors, th)
-        },
+/// The 256-color palette of the active theme, handed to the terminal core so
+/// palette colors and OSC 4 queries match what is drawn.
+pub fn term_palette() -> [[u8; 3]; 256] {
+    let th = theme();
+    let mut p = [[0u8; 3]; 256];
+    for (i, c) in p.iter_mut().enumerate() {
+        let col = indexed(i as u8, &th);
+        *c = [col.r(), col.g(), col.b()];
     }
+    p
 }
 
-/// Resolved (fg, bg) for a cell. `bg` is None when it matches the default background.
-pub fn cell_colors(
-    fg: Color,
-    bg: Color,
-    flags: Flags,
-    colors: &Colors,
-    selected: bool,
-) -> (Color32, Option<Color32>) {
+/// Resolved (fg, bg) for a cell. `bg` is None when it is the default background.
+pub fn cell_colors(cell: &crate::vt::Cell, palette: &[[u8; 3]; 256], fg: [u8; 3], bg: [u8; 3]) -> (Color32, Option<Color32>) {
+    use crate::vt::Color;
     let th = theme();
-    let bold = flags.contains(Flags::BOLD);
-    let mut fg32 = resolve(fg, colors, bold, &th);
-    if flags.contains(Flags::DIM) {
+    let mut fg32 = match cell.fg {
+        Color::Rgb(c) => rgb32(c),
+        // Bold brightens the 8 base colors.
+        Color::Idx(i) => rgb32(palette[if cell.bold && i < 8 { i as usize + 8 } else { i as usize }]),
+        Color::Default => rgb32(fg),
+    };
+    if cell.faint {
         fg32 = dim(fg32);
     }
-    let bg_default = bg == Color::Named(NamedColor::Background);
-    let mut bg32 = if bg_default { None } else { Some(resolve(bg, colors, false, &th)) };
-
-    if flags.contains(Flags::INVERSE) {
+    let mut bg32 = cell.bg.map(rgb32);
+    if cell.inverse {
         let old_fg = fg32;
-        fg32 = bg32.unwrap_or(th.bg);
+        fg32 = bg32.unwrap_or(rgb32(bg));
         bg32 = Some(old_fg);
     }
-    if selected {
+    if cell.selected {
         bg32 = Some(th.selection);
     }
     (fg32, bg32)
-}
-
-/// Default color for OSC color queries.
-pub fn query_color(index: usize, colors: &Colors) -> Rgb {
-    if let Some(rgb) = colors[index] {
-        return rgb;
-    }
-    let th = theme();
-    let col = match index {
-        256 => th.fg,
-        257 => th.bg,
-        258 => th.cursor,
-        i if i < 256 => indexed(i as u8, &th),
-        _ => th.fg,
-    };
-    Rgb { r: col.r(), g: col.g(), b: col.b() }
 }

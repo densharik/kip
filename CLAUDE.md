@@ -11,3 +11,8 @@ figure when tools change).
 eframe is vendored in `vendor/eframe` with a fix (grep "kip patch") and pinned
 to `=0.35.0`. Bumping egui/eframe drops the patch without an error: first check
 whether upstream fixed minimized windows freezing the UI, else port the patch.
+
+The terminal core is libghostty-vt from the `vendor/ghostty` submodule (pinned
+commit), built by build.rs with zig 0.17 and wrapped in `src/vt/`. Moving the
+submodule means regenerating `src/vt/sys.rs` (bindgen, options in its header).
+Its built-in search folds case for ASCII only; kip's `find_all` does its own.

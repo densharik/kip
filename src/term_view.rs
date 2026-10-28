@@ -1,13 +1,3 @@
-use alacritty_terminal::event::Notify;
-use alacritty_terminal::event_loop::Msg;
-use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
-use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
-use alacritty_terminal::term::{Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor};
 use egui::{
     Align2, Color32, CornerRadius, Event, EventFilter, FontId, Key, Modifiers, PointerButton,
     Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2,
@@ -16,6 +6,7 @@ use egui::{
 use crate::config::Settings;
 use crate::palette;
 use crate::session::Session;
+use crate::vt::{self, CursorShape, Modes, Pos};
 
 const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(120);
 
@@ -31,37 +22,79 @@ pub struct GridInfo {
     pub grown: bool,
 }
 
+/// A search hit: first and last cell, inclusive, in buffer positions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Match {
+    pub start: Pos,
+    pub end: Pos,
+}
+
+impl Match {
+    fn contains(&self, p: Pos) -> bool {
+        self.start <= p && p <= self.end
+    }
+}
+
+/// A plain drag selection: where it started and on which half of that cell.
+#[derive(Clone, Copy)]
+pub struct SelDrag {
+    anchor: Pos,
+    right: bool,
+}
+
 /// Every case-insensitive occurrence of `query` in the screen and scrollback,
-/// top to bottom. Matches across soft-wrapped lines too.
-pub fn find_all<T>(term: &Term<T>, query: &str) -> Vec<Match> {
+/// top to bottom. Matches across soft-wrapped lines too. Case folding is
+/// Unicode-aware (Cyrillic and all), unlike the terminal core's own search.
+pub fn find_all(term: &vt::Term, query: &str) -> Vec<Match> {
     const MAX: usize = 5000;
-    if query.is_empty() {
-        return Vec::new();
+    let q: Vec<char> = query.to_lowercase().chars().collect();
+    let mut out = Vec::new();
+    if q.is_empty() {
+        return out;
     }
-    // All-lowercase pattern = case-insensitive in alacritty's smart case.
-    let mut pat = String::new();
-    for c in query.to_lowercase().chars() {
-        if "\\.+*?()|[]{}^$#&-~".contains(c) {
-            pat.push('\\');
+    // One logical line at a time: lowercased chars and where each came from.
+    let (mut hay, mut pos): (Vec<char>, Vec<Pos>) = (Vec::new(), Vec::new());
+    let scan = |hay: &[char], pos: &[Pos], out: &mut Vec<Match>| {
+        let mut i = 0;
+        while i + q.len() <= hay.len() {
+            if hay[i] == q[0] && hay[i..i + q.len()] == q[..] {
+                out.push(Match { start: pos[i], end: pos[i + q.len() - 1] });
+                i += q.len();
+            } else {
+                i += 1;
+            }
         }
-        pat.push(c);
+    };
+    for y in 0..term.total_rows() {
+        let Some(row) = term.row_text(y) else { break };
+        for (c, &x) in row.chars.iter().zip(&row.cols) {
+            for lc in c.to_lowercase() {
+                hay.push(lc);
+                pos.push(Pos { y, x });
+            }
+        }
+        if !row.wrap {
+            scan(&hay, &pos, &mut out);
+            hay.clear();
+            pos.clear();
+            if out.len() >= MAX {
+                break;
+            }
+        }
     }
-    let Ok(mut re) = RegexSearch::new(&pat) else { return Vec::new() };
-    let start = Point::new(term.topmost_line(), Column(0));
-    let end = Point::new(term.bottommost_line(), term.last_column());
-    RegexIter::new(start, end, alacritty_terminal::index::Direction::Right, term, &mut re).take(MAX).collect()
+    scan(&hay, &pos, &mut out);
+    out.truncate(MAX);
+    out
 }
 
 /// Scroll so the match is in view (centered), unless it already is.
-pub fn reveal<T: alacritty_terminal::event::EventListener>(term: &mut Term<T>, m: &Match) {
-    let rows = term.screen_lines() as i32;
-    let d = term.grid().display_offset() as i32;
-    let line = m.start().line.0;
-    if line + d >= 0 && line + d < rows {
+pub fn reveal(term: &mut vt::Term, m: &Match) {
+    let rows = term.rows() as u32;
+    let top = term.viewport_top();
+    if m.start.y >= top && m.start.y < top + rows {
         return;
     }
-    let want = (rows / 2 - line).clamp(0, term.history_size() as i32);
-    term.scroll_display(Scroll::Delta(want - d));
+    term.scroll_to(m.start.y.saturating_sub(rows / 2));
 }
 
 /// Characters that only exist in a color-emoji font, which egui cannot
@@ -74,6 +107,26 @@ fn substitute(c: char) -> char {
         '⏹' => '■',
         '⏵' => '▶',
         _ => c,
+    }
+}
+
+/// Select from the drag anchor to `head`, each end on the cell half the
+/// pointer was over: starting on the right half of a cell leaves that cell out.
+fn select_span(term: &mut vt::Term, d: SelDrag, head: Pos, head_right: bool) {
+    let cols = term.cols().max(1) as u64;
+    let idx = |p: Pos| p.y as u64 * cols + p.x as u64;
+    let (a, h) = (idx(d.anchor), idx(head));
+    let (start, end) = if h >= a {
+        (a + d.right as u64, if head_right { Some(h) } else { h.checked_sub(1) })
+    } else {
+        (h + head_right as u64, if d.right { Some(a) } else { a.checked_sub(1) })
+    };
+    match end.filter(|e| *e >= start) {
+        Some(end) => {
+            let pos = |i: u64| Pos { y: (i / cols) as u32, x: (i % cols) as u16 };
+            term.select(pos(start), pos(end));
+        },
+        None => term.clear_selection(),
     }
 }
 
@@ -121,9 +174,6 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     }
     let focused = response.has_focus();
 
-    let term_arc = live.term.clone();
-    let mut term = term_arc.lock();
-
     // Resize PTY and terminal to fit the widget, but only once the size has held
     // still. Claude redraws its live region by moving the cursor up as many lines
     // as it printed at the old width; a resize per frame of a window drag reflows
@@ -139,34 +189,28 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         };
         let left = RESIZE_SETTLE.saturating_sub(since.elapsed());
         if left.is_zero() {
-            term.resize(TermSize::new(cols as usize, rows as usize));
-            let _ = live.notifier.0.send(Msg::Resize(alacritty_terminal::event::WindowSize {
-                num_lines: rows,
-                num_cols: cols,
-                cell_width: cell_w.round() as u16,
-                cell_height: cell_h.round() as u16,
-            }));
-            live.cols = cols;
-            live.rows = rows;
+            live.resize(cols, rows, cell_w.round() as u16, cell_h.round() as u16);
             live.pending_size = None;
         } else {
             ui.ctx().request_repaint_after(left);
         }
     }
+    live.sync_theme();
     let (cols, rows) = (live.cols, live.rows);
+
+    let term_arc = live.term.clone();
+    let mut term = term_arc.lock();
+    let mut frame = term.frame();
 
     // Bottom-anchor content that has not yet outgrown the viewport (Warp-style):
     // empty space stays above, the prompt and fresh output sit near the input.
-    let history = term.grid().total_lines() - term.grid().screen_lines();
+    let history = term.history();
     info.grown = history > 0;
-    let origin = if history == 0 && term.grid().display_offset() == 0 {
-        let content = term.renderable_content();
-        let mut bottom = content.cursor.point.line.0;
-        for c in content.display_iter {
-            let occupied =
-                c.cell.c != ' ' || c.cell.bg != AnsiColor::Named(NamedColor::Background);
-            if occupied && c.point.line.0 > bottom {
-                bottom = c.point.line.0;
+    let origin = if history == 0 && term.display_offset() == 0 {
+        let mut bottom = frame.cursor.map_or(0, |(_, y)| y as i32);
+        for c in &frame.cells {
+            if (c.c != ' ' || c.bg.is_some()) && c.y as i32 > bottom {
+                bottom = c.y as i32;
             }
         }
         let shift = (rows as i32 - 1 - bottom).max(0) as f32 * cell_h;
@@ -175,14 +219,11 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         origin
     };
 
-    let mode = *term.mode();
+    let mode = term.modes();
     let mut out: Vec<u8> = Vec::new();
-
-    let alt = mode.contains(TermMode::ALT_SCREEN);
-    if term.selection.is_none()
-        && let Some((sel, _)) = session.sel_keep.as_ref().filter(|(_, a)| *a == alt) {
-            term.selection = Some(sel.clone());
-        }
+    // Scroll or selection changed this frame: the snapshot above is stale.
+    let mut changed = false;
+    let alt = mode.alt_screen;
 
     // A link popup swallows Escape (it closes the menu, see link_menu) instead of
     // letting it reach claude and cancel whatever it is doing.
@@ -227,7 +268,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                     }
                 },
                 Event::Paste(s) => {
-                    if mode.contains(TermMode::BRACKETED_PASTE) {
+                    if mode.bracketed_paste {
                         // Strip a nested paste terminator: classic paste-injection guard.
                         let s = s.replace("\x1b[201~", "");
                         out.extend_from_slice(b"\x1b[200~");
@@ -238,7 +279,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                     }
                 },
                 Event::Copy => {
-                    if let Some(text) = term.selection_to_string()
+                    if let Some(text) = term.selection_text()
                         && !text.is_empty() {
                             ui.ctx().copy_text(text);
                         }
@@ -262,17 +303,16 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
             let lines = (session.scroll_accum / cell_h).trunc() as i32;
             if lines != 0 {
                 session.scroll_accum -= lines as f32 * cell_h;
-                if mode.intersects(TermMode::MOUSE_MODE) {
+                if mode.mouse {
                     let (col, row) =
                         wheel_cell(response.hover_pos(), origin, cell_w, cell_h, cols, rows);
-                    let sgr = mode.contains(TermMode::SGR_MOUSE);
                     for _ in 0..lines.abs() {
-                        out.extend_from_slice(&wheel_report(lines > 0, col, row, sgr));
+                        out.extend_from_slice(&wheel_report(lines > 0, col, row, mode.sgr_mouse));
                     }
-                } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+                } else if mode.alt_screen && mode.alt_scroll {
                     let seq: &[u8] = if lines > 0 {
-                        if mode.contains(TermMode::APP_CURSOR) { b"\x1bOA" } else { b"\x1b[A" }
-                    } else if mode.contains(TermMode::APP_CURSOR) {
+                        if mode.app_cursor { b"\x1bOA" } else { b"\x1b[A" }
+                    } else if mode.app_cursor {
                         b"\x1bOB"
                     } else {
                         b"\x1b[B"
@@ -281,7 +321,8 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                         out.extend_from_slice(seq);
                     }
                 } else {
-                    term.scroll_display(Scroll::Delta(lines));
+                    term.scroll(lines);
+                    changed = true;
                 }
             }
         }
@@ -289,7 +330,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
 
     // Dragging a selection past the top or bottom edge scrolls the scrollback,
     // faster the farther the pointer is, and keeps going while it is held still.
-    if response.dragged_by(PointerButton::Primary) && term.selection.is_some() && !alt
+    if response.dragged_by(PointerButton::Primary) && session.sel_drag.is_some() && !alt
         && let Some(pos) = response.interact_pointer_pos() {
             let over = if pos.y < rect.top() {
                 pos.y - rect.top()
@@ -300,19 +341,21 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
             };
             if over != 0.0 {
                 let n = 1 + (over.abs() / cell_h) as i32;
-                term.scroll_display(Scroll::Delta(if over < 0.0 { n } else { -n }));
+                term.scroll(if over < 0.0 { n } else { -n });
+                changed = true;
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
             }
         }
 
     // Mouse selection.
-    let display_offset = term.grid().display_offset();
-    let pos_to_point = |pos: Pos2| -> (Point, Side) {
+    let top = term.viewport_top();
+    let total = term.total_rows();
+    let pos_to_point = |pos: Pos2| -> (Pos, bool) {
         let rel = pos - origin;
-        let col = ((rel.x / cell_w) as usize).min(cols as usize - 1);
+        let col = ((rel.x / cell_w).max(0.0) as u16).min(cols - 1);
         let row = ((rel.y / cell_h) as i32).clamp(0, rows as i32 - 1);
-        let side = if rel.x / cell_w % 1.0 > 0.5 { Side::Right } else { Side::Left };
-        (Point::new(Line(row - display_offset as i32), Column(col)), side)
+        let right = rel.x / cell_w % 1.0 > 0.5;
+        (Pos { y: top + row as u32, x: col }, right)
     };
 
     // A filesystem path under the pointer becomes a clickable link (Warp-style):
@@ -324,13 +367,18 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         let col = (rel.x / cell_w) as i32;
         let row = (rel.y / cell_h) as i32;
         if rel.x >= 0.0 && rel.y >= 0.0 && col < cols as i32 && row < rows as i32 {
-            let grid = term.grid();
-            let (top, bottom) = (grid.topmost_line().0, grid.bottommost_line().0);
             let row_chars = |r: i32| -> Option<Vec<char>> {
-                let l = r - display_offset as i32;
-                (top..=bottom)
-                    .contains(&l)
-                    .then(|| (0..cols as usize).map(|c| grid[Line(l)][Column(c)].c).collect())
+                let y = u32::try_from(top as i64 + r as i64).ok().filter(|y| *y < total)?;
+                let text = term.row_text(y)?;
+                let mut chars = vec![' '; cols as usize];
+                let mut last = None;
+                for (c, &x) in text.chars.iter().zip(&text.cols) {
+                    if last != Some(x) && (x as usize) < chars.len() {
+                        chars[x as usize] = *c;
+                    }
+                    last = Some(x);
+                }
+                Some(chars)
             };
             let chars = row_chars(row).unwrap_or_default();
             if let Some((span, token)) = link_span(&chars, col as usize) {
@@ -380,33 +428,42 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         }
     }
 
-    let mut clicked_link: Option<(std::path::PathBuf, Pos2)> = None;
-    if let Some(pos) = response.interact_pointer_pos() {
+    let mut clicked_link: Option<(std::path::PathBuf, Pos2)> = None;    if let Some(pos) = response.interact_pointer_pos() {
         info.interacted = true;
-        let (point, side) = pos_to_point(pos);
-        if response.triple_clicked() {
-            term.selection = Some(Selection::new(SelectionType::Lines, point, side));
-        } else if response.double_clicked() {
-            term.selection = Some(Selection::new(SelectionType::Semantic, point, side));
+        let (point, right) = pos_to_point(pos);
+        if response.triple_clicked() || response.double_clicked() {
+            session.sel_drag = None;
+            match term.unit_at(point, response.triple_clicked()) {
+                Some((a, b)) => term.select(a, b),
+                None => term.clear_selection(),
+            }
+            changed = true;
         } else if response.drag_started_by(PointerButton::Primary) {
             // egui only declares a drag after ~6px of travel; by then the pointer
             // has left the pressed cell and the first character would be lost.
             let anchor = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
-            let (apoint, aside) = pos_to_point(anchor);
-            let mut sel = Selection::new(SelectionType::Simple, apoint, aside);
-            sel.update(point, side);
-            term.selection = Some(sel);
+            let (apoint, aright) = pos_to_point(anchor);
+            let d = SelDrag { anchor: apoint, right: aright };
+            session.sel_drag = Some(d);
+            select_span(&mut term, d, point, right);
+            changed = true;
         } else if response.dragged_by(PointerButton::Primary) {
-            if let Some(sel) = term.selection.as_mut() {
-                sel.update(point, side);
+            if let Some(d) = session.sel_drag {
+                select_span(&mut term, d, point, right);
+                changed = true;
             }
         } else if response.clicked() {
             if let Some((_, path)) = &hovered_link {
                 clicked_link = Some((path.clone(), pos));
             } else {
-                term.selection = None;
+                term.clear_selection();
+                session.sel_drag = None;
+                changed = true;
             }
         }
+    }
+    if response.drag_stopped_by(PointerButton::Primary) {
+        session.sel_drag = None;
     }
     if hovered_link.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -417,21 +474,27 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         && (response.drag_stopped_by(PointerButton::Primary)
             || response.double_clicked()
             || response.triple_clicked())
-        && let Some(text) = term.selection_to_string()
+        && let Some(text) = term.selection_text()
             && !text.is_empty() {
                 ui.ctx().copy_text(text);
             }
 
     if !out.is_empty() {
-        term.scroll_display(Scroll::Bottom);
+        term.scroll_bottom();
+        changed = true;
         session.scroll_accum = 0.0;
         info.had_input = true;
     }
-    session.sel_keep = term.selection.clone().map(|s| (s, alt));
+    if changed {
+        frame = term.frame();
+    }
+    let display_offset = term.display_offset();
+    let top = term.viewport_top();
+    drop(term);
 
-    // ---- Snapshot cells under the lock, paint after releasing it ----
-    // Painting shapes ~1-3ms per frame; doing it under the FairMutex would
-    // stall the PTY reader thread on every frame during heavy output.
+    // ---- Paint from the snapshot; the lock is already released ----
+    // Painting shapes ~1-3ms per frame; doing it under the lock would stall
+    // the PTY reader thread on every frame during heavy output.
     struct DrawCell {
         x: f32,
         y: f32,
@@ -444,53 +507,33 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         strike: bool,
     }
 
-    let content = term.renderable_content();
-    let display_offset = content.display_offset;
-    let sel = content.selection;
-    let colors = content.colors;
-    let cursor = content.cursor;
-    let show_cursor = content.mode.contains(TermMode::SHOW_CURSOR);
-
     // Search hits that touch the viewport, flagged when it is the current one.
-    let (vtop, vbot) = (-(display_offset as i32), rows as i32 - 1 - display_offset as i32);
+    let (vtop, vbot) = (top, top + rows as u32 - 1);
     let hits: Vec<(&Match, bool)> = session
         .find_hits
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.end().line.0 >= vtop && m.start().line.0 <= vbot)
+        .filter(|(_, m)| m.end.y >= vtop && m.start.y <= vbot)
         .map(|(i, m)| (m, session.find_cur == Some(i)))
         .collect();
 
-    let mut cursor_cell: Option<(char, Color32)> = None;
-    let mut cells: Vec<DrawCell> = Vec::with_capacity(512);
+    let mut cells: Vec<DrawCell> = Vec::with_capacity(frame.cells.len());
 
-    for indexed in content.display_iter {
-        let point = indexed.point;
-        let vp_line = point.line.0 + display_offset as i32;
-        if vp_line < 0 || vp_line >= rows as i32 {
+    for cell in &mut frame.cells {
+        if cell.y >= rows || cell.x >= cols {
             continue;
         }
-        let cell = &indexed.cell;
-        let flags = cell.flags;
-        let x = origin.x + point.column.0 as f32 * cell_w;
-        let y = origin.y + vp_line as f32 * cell_h;
-
-        let selected = sel.is_some_and(|r| selection_contains(&r, point));
-        let (fg, mut bg) = palette::cell_colors(cell.fg, cell.bg, flags, colors, selected);
-        if let Some(&(_, cur)) = hits.iter().find(|(m, _)| m.contains(&point)) {
+        let x = origin.x + cell.x as f32 * cell_w;
+        let y = origin.y + cell.y as f32 * cell_h;
+        let (fg, mut bg) = palette::cell_colors(cell, &frame.palette, frame.fg, frame.bg);
+        let point = Pos { y: top + cell.y as u32, x: cell.x };
+        if let Some(&(_, cur)) = hits.iter().find(|(m, _)| m.contains(point)) {
             let a = palette::selection();
             bg = Some(if cur { a } else { a.gamma_multiply(0.45) });
         }
-
-        if point == cursor.point {
-            cursor_cell = Some((substitute(cell.c), bg.unwrap_or(palette::term_bg())));
-        }
-
-        let spacer = flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-            || flags.contains(Flags::HIDDEN);
-        let has_text = !spacer && cell.c != ' ';
-        let underline = !spacer && flags.intersects(Flags::ALL_UNDERLINES);
-        let strike = !spacer && flags.contains(Flags::STRIKEOUT);
+        let has_text = !cell.hidden && cell.c != ' ';
+        let underline = cell.underline;
+        let strike = cell.strike;
         if bg.is_none() && !has_text && !underline && !strike {
             continue;
         }
@@ -498,18 +541,16 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
             x,
             y,
             c: if has_text { substitute(cell.c) } else { ' ' },
-            zw: if has_text { cell.zerowidth().map(|z| z.to_vec()) } else { None },
+            zw: if has_text { cell.extra.take() } else { None },
             fg,
             bg,
-            wide: flags.contains(Flags::WIDE_CHAR),
+            wide: cell.wide,
             underline,
             strike,
         });
     }
 
-    drop(term);
-
-    // ---- Render (lock released) ----
+    // ---- Render ----
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, palette::term_bg());
 
@@ -612,51 +653,44 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     }
 
     // Cursor.
-    if show_cursor {
-        let vp_line = cursor.point.line.0 + display_offset as i32;
-        if (0..rows as i32).contains(&vp_line) {
-            let x = origin.x + cursor.point.column.0 as f32 * cell_w;
-            let y = origin.y + vp_line as f32 * cell_h;
-            let cell_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, cell_h));
-            let shape = if focused { cursor.shape } else { CursorShape::HollowBlock };
-            match shape {
-                CursorShape::Block => {
-                    painter.rect_filled(cell_rect, 0.0, palette::cursor());
-                    if let Some((c, _)) = cursor_cell
-                        && c != ' ' {
-                            painter.text(
-                                Pos2::new(x, y),
-                                Align2::LEFT_TOP,
-                                c,
-                                font_id.clone(),
-                                palette::term_bg(),
-                            );
-                        }
-                },
-                CursorShape::Beam => {
-                    painter.rect_filled(
-                        Rect::from_min_size(Pos2::new(x, y), Vec2::new(2.0, cell_h)),
-                        0.0,
-                        palette::cursor(),
-                    );
-                },
-                CursorShape::Underline => {
-                    painter.rect_filled(
-                        Rect::from_min_size(Pos2::new(x, y + cell_h - 2.0), Vec2::new(cell_w, 2.0)),
-                        0.0,
-                        palette::cursor(),
-                    );
-                },
-                CursorShape::HollowBlock => {
-                    painter.rect_stroke(
-                        cell_rect,
-                        0.0,
-                        Stroke::new(1.0, palette::cursor()),
-                        StrokeKind::Inside,
-                    );
-                },
-                CursorShape::Hidden => {},
-            }
+    if frame.cursor_visible
+        && let Some((cx, cy)) = frame.cursor
+        && cy < rows
+    {
+        let x = origin.x + cx as f32 * cell_w;
+        let y = origin.y + cy as f32 * cell_h;
+        let cell_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, cell_h));
+        let shape = if focused { frame.cursor_shape } else { CursorShape::HollowBlock };
+        match shape {
+            CursorShape::Block => {
+                painter.rect_filled(cell_rect, 0.0, palette::cursor());
+                let c = substitute(frame.cursor_char);
+                if c != ' ' {
+                    painter.text(Pos2::new(x, y), Align2::LEFT_TOP, c, font_id.clone(), palette::term_bg());
+                }
+            },
+            CursorShape::Beam => {
+                painter.rect_filled(
+                    Rect::from_min_size(Pos2::new(x, y), Vec2::new(2.0, cell_h)),
+                    0.0,
+                    palette::cursor(),
+                );
+            },
+            CursorShape::Underline => {
+                painter.rect_filled(
+                    Rect::from_min_size(Pos2::new(x, y + cell_h - 2.0), Vec2::new(cell_w, 2.0)),
+                    0.0,
+                    palette::cursor(),
+                );
+            },
+            CursorShape::HollowBlock => {
+                painter.rect_stroke(
+                    cell_rect,
+                    0.0,
+                    Stroke::new(1.0, palette::cursor()),
+                    StrokeKind::Inside,
+                );
+            },
         }
     }
 
@@ -699,9 +733,7 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
         );
     }
 
-    if !out.is_empty() {
-        live.notifier.notify(out);
-    }
+    live.notifier.notify(out);
 
     link_menu(ui, session_id, clicked_link);
 
@@ -1044,22 +1076,6 @@ fn wheel_report(up: bool, col: usize, row: usize, sgr: bool) -> Vec<u8> {
     }
 }
 
-fn selection_contains(range: &SelectionRange, point: Point) -> bool {
-    if point.line < range.start.line || point.line > range.end.line {
-        return false;
-    }
-    if range.is_block {
-        return point.column >= range.start.column && point.column <= range.end.column;
-    }
-    if point.line == range.start.line && point.column < range.start.column {
-        return false;
-    }
-    if point.line == range.end.line && point.column > range.end.column {
-        return false;
-    }
-    true
-}
-
 fn key_letter(key: Key) -> Option<u8> {
     Some(match key {
         Key::A => b'a',
@@ -1108,7 +1124,7 @@ fn backspace_accel(count: &mut u8, key: Key, repeat: bool, mods: Modifiers) -> M
     if *count >= BS_WORD_AFTER { Modifiers { alt: true, ..mods } } else { mods }
 }
 
-fn encode_key(key: Key, mods: Modifiers, mode: TermMode, claude: bool) -> Option<Vec<u8>> {
+fn encode_key(key: Key, mods: Modifiers, mode: Modes, claude: bool) -> Option<Vec<u8>> {
     // Cmd+Z = undo: Ctrl+_ is undo in Claude's prompt (chat:undo), zsh and bash.
     if mods.mac_cmd && !mods.shift && key == Key::Z {
         return Some(vec![0x1f]);
@@ -1116,8 +1132,8 @@ fn encode_key(key: Key, mods: Modifiers, mode: TermMode, claude: bool) -> Option
     if mods.command {
         return None; // App-level shortcuts.
     }
-    let kitty = mode.contains(TermMode::DISAMBIGUATE_ESC_CODES);
-    let app_cursor = mode.contains(TermMode::APP_CURSOR);
+    let kitty = mode.kitty;
+    let app_cursor = mode.app_cursor;
     let mut m = 1u8;
     if mods.shift {
         m += 1;
@@ -1231,7 +1247,7 @@ fn encode_key(key: Key, mods: Modifiers, mode: TermMode, claude: bool) -> Option
 #[cfg(test)]
 mod tests {
     use super::{backspace_accel, encode_key, find_near, join_ci, link_span, wrapped_parts, BS_WORD_AFTER};
-    use super::{Key, Modifiers, TermMode};
+    use super::{Key, Modifiers, Modes};
 
     fn span(s: &str, col: usize) -> Option<(std::ops::Range<usize>, String)> {
         link_span(&s.chars().collect::<Vec<_>>(), col)
@@ -1239,13 +1255,13 @@ mod tests {
 
     #[test]
     fn backspace_erases_a_word_with_ctrl_or_alt() {
-        let plain = TermMode::empty();
+        let plain = Modes::default();
         let bs = |mods| encode_key(Key::Backspace, mods, plain, false);
         assert_eq!(bs(Modifiers::NONE), Some(b"\x7f".to_vec()));
         assert_eq!(bs(Modifiers::CTRL), Some(b"\x1b\x7f".to_vec()));
         assert_eq!(bs(Modifiers::ALT), Some(b"\x1b\x7f".to_vec()));
         // Apps that pushed kitty flags get the report instead.
-        let kitty = TermMode::DISAMBIGUATE_ESC_CODES;
+        let kitty = Modes { kitty: true, ..Modes::default() };
         assert_eq!(
             encode_key(Key::Backspace, Modifiers::CTRL, kitty, false),
             Some(b"\x1b[127;5u".to_vec())
@@ -1345,11 +1361,9 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    fn term_with(cols: usize, text: &str) -> alacritty_terminal::Term<alacritty_terminal::event::VoidListener> {
-        let size = alacritty_terminal::term::test::TermSize::new(cols, 5);
-        let mut t = alacritty_terminal::Term::new(Default::default(), &size, alacritty_terminal::event::VoidListener);
-        let mut p: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
-        p.advance(&mut t, text.as_bytes());
+    fn term_with(cols: u16, text: &str) -> crate::vt::Term {
+        let mut t = crate::vt::Term::new(cols, 5, 1000);
+        t.write(text.as_bytes());
         t
     }
 
@@ -1364,9 +1378,20 @@ mod tests {
     }
 
     #[test]
+    fn find_folds_cyrillic_case() {
+        let t = term_with(40, "Ошибка: файл\r\nвторая ошибка\r\nОШИБКА\r\n");
+        assert_eq!(super::find_all(&t, "ошибка").len(), 3);
+        assert_eq!(super::find_all(&t, "Ошибка").len(), 3);
+        assert_eq!(super::find_all(&t, "ОШИБКА").len(), 3);
+        // Positions point at the cells: "ошибка" on row 1 starts at column 7.
+        let m = super::find_all(&t, "ошибка")[1];
+        assert_eq!((m.start.x, m.end.x), (7, 12));
+    }
+
+    #[test]
     fn cmd_z_sends_undo() {
         let mut m = Modifiers::MAC_CMD;
         m.command = true;
-        assert_eq!(encode_key(Key::Z, m, TermMode::empty(), true), Some(vec![0x1f]));
+        assert_eq!(encode_key(Key::Z, m, Modes::default(), true), Some(vec![0x1f]));
     }
 }

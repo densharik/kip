@@ -410,8 +410,6 @@ impl App {
                 Ok(json!("shown"))
             },
             "search" => {
-                use alacritty_terminal::grid::Dimensions;
-                use alacritty_terminal::index::{Column, Point};
                 let q = args["query"].as_str().filter(|q| !q.is_empty()).ok_or("query is required")?;
                 let only = args["id"].as_u64();
                 let mut found = Vec::new();
@@ -425,9 +423,8 @@ impl App {
                                 .rev()
                                 .take(5)
                                 .map(|m| {
-                                    let ln = m.start().line;
-                                    let end = Point::new(ln, term.last_column());
-                                    term.bounds_to_string(Point::new(ln, Column(0)), end).trim().to_string()
+                                    let row = term.row_text(m.start.y);
+                                    row.map(|r| r.chars.iter().collect::<String>().trim().to_string()).unwrap_or_default()
                                 })
                                 .collect();
                             (hits.len(), lines)

@@ -19,6 +19,7 @@ mod session;
 mod term_view;
 mod update;
 mod usage;
+mod vt;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -26,8 +27,6 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use alacritty_terminal::event::{Event as TermEvent, Notify, WindowSize};
-use alacritty_terminal::term::TermMode;
 use eframe::egui;
 use egui::text::CCursor;
 use egui::text_selection::CCursorRange;
@@ -39,7 +38,7 @@ use egui::{
 
 use config::{load_state, save_state, AppState, SavedSession, Settings};
 use i18n::tr;
-use session::{poll_git, spawn_live, EventProxy, GitStats, Phase, Session};
+use session::{poll_git, spawn_live, EventProxy, GitStats, Phase, Session, TermEvent};
 
 const TICK: Duration = Duration::from_secs(2);
 const GIT_INTERVAL: Duration = Duration::from_secs(7);
@@ -1067,7 +1066,7 @@ impl App {
         let Some(live) = s.live() else { return };
         let busy = plat::foreground_pgid(live.master_fd, live.shell_pid).is_some_and(|pg| pg != live.shell_pid);
         if busy {
-            let bracketed = live.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+            let bracketed = live.term.lock().modes().bracketed_paste;
             let mut out = Vec::new();
             if bracketed {
                 out.extend_from_slice(b"\x1b[200~");
@@ -1770,45 +1769,11 @@ impl App {
                     }
                 },
                 TermEvent::Title(t) => s.title = t,
-                TermEvent::ResetTitle => s.title.clear(),
-                TermEvent::ClipboardStore(_, text) => ctx.copy_text(text),
-                // OSC 52 read is answered with an empty string on purpose: it would
-                // let any program in the terminal silently read the user's clipboard.
-                TermEvent::ClipboardLoad(_, fmt) => {
-                    if let Some(live) = s.live() {
-                        live.notifier.notify(fmt("").into_bytes());
-                    }
-                },
-                TermEvent::ColorRequest(i, fmt) => {
-                    if let Some(live) = s.live() {
-                        let rgb = {
-                            let term = live.term.lock();
-                            palette::query_color(i, term.colors())
-                        };
-                        live.notifier.notify(fmt(rgb).into_bytes());
-                    }
-                },
-                TermEvent::PtyWrite(text) => {
-                    if let Some(live) = s.live() {
-                        live.notifier.notify(text.into_bytes());
-                    }
-                },
-                TermEvent::TextAreaSizeRequest(fmt) => {
-                    if let Some(live) = s.live() {
-                        let ws = WindowSize {
-                            num_lines: live.rows,
-                            num_cols: live.cols,
-                            cell_width: self.cell.0,
-                            cell_height: self.cell.1,
-                        };
-                        live.notifier.notify(fmt(ws).into_bytes());
-                    }
-                },
-                TermEvent::ChildExit(status) => {
-                    s.finalize_exit(status.code());
+                TermEvent::Clipboard(text) => ctx.copy_text(text),
+                TermEvent::ChildExit(code) => {
+                    s.finalize_exit(code);
                     persist = true;
                 },
-                TermEvent::CursorBlinkingChange | TermEvent::MouseCursorDirty | TermEvent::Exit => {},
             }
         }
         if persist {
@@ -1945,6 +1910,13 @@ impl App {
             for s in &mut self.sessions {
                 if seen.contains(&s.id) {
                     s.done = false;
+                }
+                // A quiet terminal keeps its scrollback compressed; reading it
+                // back (scroll, search) unpacks it transparently.
+                if let Phase::Live(l) = &s.phase
+                    && s.last_activity.elapsed() >= Duration::from_secs(10)
+                {
+                    l.term.lock().compress_idle();
                 }
                 let (master_fd, shell_pid) = match &s.phase {
                     Phase::Live(l) => (l.master_fd, l.shell_pid),
