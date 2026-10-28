@@ -513,24 +513,69 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, palette::term_bg());
 
-    let mut buf = String::with_capacity(4);
+    // The whole grid goes out as one mesh: a Shape::Text per cell cost 2-17ms a
+    // frame at 200x60 (layout cache misses on every new color, plus tessellating
+    // ~13k shapes); copying cached glyph quads costs ~0.4ms. Each glyph stays at
+    // its cell's origin, so fallback fonts and wide chars cannot shift the grid.
+    let ppp = ui.ctx().pixels_per_point();
+    let mut mesh = egui::Mesh::default();
+    let mut i = 0;
+    while i < cells.len() {
+        let Some(bg) = cells[i].bg else {
+            i += 1;
+            continue;
+        };
+        // Merge neighbours with the same background into one rect.
+        let (x0, y) = (cells[i].x, cells[i].y);
+        let mut x1 = x0 + if cells[i].wide { cell_w * 2.0 } else { cell_w };
+        let mut j = i + 1;
+        while j < cells.len()
+            && cells[j].y == y
+            && cells[j].bg == Some(bg)
+            && (cells[j].x - x1).abs() < 0.01
+        {
+            x1 = cells[j].x + if cells[j].wide { cell_w * 2.0 } else { cell_w };
+            j += 1;
+        }
+        let w = if cells[j - 1].wide { x1 - x0 } else { x1 - x0 + 0.5 };
+        mesh.add_colored_rect(Rect::from_min_size(Pos2::new(x0, y), Vec2::new(w, cell_h + 0.5)), bg);
+        i = j;
+    }
+    let glyphs_from = mesh.vertices.len();
+    let mut galleys: std::collections::HashMap<char, std::sync::Arc<egui::Galley>> = Default::default();
+    let mut combining = Vec::new();
     for dc in &cells {
-        if let Some(bg) = dc.bg {
-            let w = if dc.wide { cell_w * 2.0 } else { cell_w + 0.5 };
-            painter.rect_filled(
-                Rect::from_min_size(Pos2::new(dc.x, dc.y), Vec2::new(w, cell_h + 0.5)),
-                0.0,
-                bg,
-            );
+        if dc.c == ' ' {
+            continue;
         }
-        if dc.c != ' ' {
-            buf.clear();
-            buf.push(dc.c);
-            if let Some(zw) = &dc.zw {
-                buf.extend(zw.iter());
-            }
-            painter.text(Pos2::new(dc.x, dc.y), Align2::LEFT_TOP, &buf, font_id.clone(), dc.fg);
+        if dc.zw.is_some() {
+            combining.push(dc);
+            continue;
         }
+        let g = galleys.entry(dc.c).or_insert_with(|| {
+            painter.layout_no_wrap(dc.c.to_string(), font_id.clone(), Color32::PLACEHOLDER)
+        });
+        let pos = Pos2::new((dc.x * ppp).round() / ppp, (dc.y * ppp).round() / ppp);
+        for row in &g.rows {
+            let off = pos.to_vec2() + row.pos.to_vec2();
+            let base = mesh.vertices.len() as u32;
+            mesh.vertices.extend(row.visuals.mesh.vertices.iter().map(|v| egui::epaint::Vertex {
+                pos: v.pos + off,
+                uv: v.uv,
+                color: dc.fg,
+            }));
+            mesh.indices.extend(row.visuals.mesh.indices.iter().map(|i| i + base));
+        }
+    }
+    // Galley UVs are in atlas pixels. Normalize after the last layout above,
+    // since a new glyph can grow the atlas mid-frame.
+    let tex = ui.ctx().fonts_mut(|f| f.font_image_size());
+    for v in &mut mesh.vertices[glyphs_from..] {
+        v.uv = Pos2::new(v.uv.x / tex[0] as f32, v.uv.y / tex[1] as f32);
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(ATLAS_KEY), tex));
+    painter.add(egui::Shape::mesh(mesh));
+    for dc in &cells {
         if dc.underline {
             let uy = dc.y + cell_h - 1.5;
             painter.line_segment(
@@ -545,6 +590,14 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
                 Stroke::new(1.0, dc.fg),
             );
         }
+    }
+    // Combining marks need real shaping to sit on their base char.
+    let mut buf = String::with_capacity(8);
+    for dc in combining {
+        buf.clear();
+        buf.push(dc.c);
+        buf.extend(dc.zw.iter().flatten());
+        painter.text(Pos2::new(dc.x, dc.y), Align2::LEFT_TOP, &buf, font_id.clone(), dc.fg);
     }
 
     // Underline the path under the pointer so it reads as clickable.
@@ -653,6 +706,18 @@ pub fn show(ui: &mut Ui, session: &mut Session, settings: &Settings, accept_inpu
     link_menu(ui, session_id, clicked_link);
 
     info
+}
+
+const ATLAS_KEY: &str = "kip-grid-atlas";
+
+/// Call after the frame's last UI: text laid out after the grid can grow the
+/// glyph atlas, leaving the grid's UVs scaled for the old size. Redraw then,
+/// or an idle window keeps the garbled frame.
+pub fn atlas_check(ctx: &egui::Context) {
+    let used = ctx.data(|d| d.get_temp::<[usize; 2]>(egui::Id::new(ATLAS_KEY)));
+    if used.is_some_and(|t| t != ctx.fonts_mut(|f| f.font_image_size())) {
+        ctx.request_repaint();
+    }
 }
 
 /// The Open / Reveal popup for a clicked path link. State lives in egui memory

@@ -901,6 +901,7 @@ impl App {
         self.dir_popup(ctx);
         self.stats_ui(ctx);
         self.usage_ui(ctx);
+        term_view::atlas_check(ctx);
     }
 
     fn drain_update(&mut self) {
@@ -5411,8 +5412,20 @@ impl eframe::App for App {
         if self.wins.iter().any(|w| !w.drawn) {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+        // A hidden window's present does not wait for vsync, so output to its
+        // session would redraw it hundreds of times a second at 100% CPU.
+        // Leaving it out of `active` coalesces those repaints to 4 per second.
         if let Ok(mut a) = self.active_shared.lock() {
-            *a = self.wins.iter().filter_map(|w| w.ui.active).collect();
+            *a = self
+                .wins
+                .iter()
+                .filter(|w| {
+                    ctx.input_for(w.viewport(), |i| {
+                        i.viewport().occluded != Some(true) && i.viewport().minimized != Some(true)
+                    })
+                })
+                .filter_map(|w| w.ui.active)
+                .collect();
         }
         if let Some(t) = self.geom_at {
             if t.elapsed() >= Duration::from_secs(1) {
