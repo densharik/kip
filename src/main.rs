@@ -3878,8 +3878,10 @@ impl App {
 
         // Multiline once the command has a newline (added with Shift+Enter, which
         // the singleline consume below lets through to the editor). Plain Enter
-        // still submits. While multiline, arrows move the caret, not history.
-        let multiline = self.w.cmd_input.contains('\n');
+        // still submits. While multiline, arrows move the caret, not history -
+        // unless the text came from history navigation (hist_sel is set until
+        // the user edits it), so a multiline entry does not trap the popup.
+        let multiline = self.w.cmd_input.contains('\n') && self.w.hist_sel.is_none();
         // Down on the last line has nowhere to go, so make it mean "end of the
         // text" the way every editor does.
         let editor_id = egui::Id::new(("cmdline-editor", self.cur_win));
