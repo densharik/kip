@@ -40,10 +40,14 @@ if [ -z "$ctx" ]; then
         | sed -n 's/.*"used_percentage"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\(\.[0-9][0-9]*\)\{0,1\}\).*/\1/p')
 fi
 
+# Real window size: the transcript only has the bare model id, so kip's own
+# estimate cannot tell a 1M-context session from a 200k one without this.
+win=$(printf '%s' "$line" | sed -n 's/.*"context_window_size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+
 # ctx 0 = no data yet (claude still booting), not an actual 0% session.
 if [ -n "$sid" ] && [ -n "$ctx" ] && [ "$ctx" != "0" ] && [ "$ctx" != "0.0" ]; then
     ts=$(date +%s)
-    snap="{\"session_id\":\"${sid}\",\"ctx\":${ctx},\"ts\":${ts}}"
+    snap="{\"session_id\":\"${sid}\",\"ctx\":${ctx},\"ts\":${ts}${win:+,\"win\":${win}}}"
     # $PPID is the claude process: it invokes this as a single command, so the
     # intermediate shell execs away.
     for f in "${DIR}/by-sid/${sid}.json" "${DIR}/by-pid/${PPID}.json"; do

@@ -263,6 +263,17 @@ fn read_snapshot(path: &Path) -> Option<CtxUpdate> {
     parse_snapshot(&std::fs::read_to_string(path).ok()?)
 }
 
+/// Window size claude reported for this session (hook "win"). Model ids in the
+/// transcript lack the [1m] marker, so guessing from them misreads 1M sessions.
+fn snapshot_window(sid: &str) -> Option<u64> {
+    let path = by_sid_path(sid)?;
+    if std::fs::metadata(&path).ok()?.len() > SNAPSHOT_MAX {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    v["win"].as_u64().filter(|w| *w >= 1000)
+}
+
 // ---- jsonl estimate ----
 
 /// "2026-07-23T12:38:25.388Z" -> SystemTime (days-from-civil, no deps).
@@ -310,7 +321,7 @@ fn settings_model_is_1m() -> bool {
 /// Reverse-scan transcript text for the last main-chain API usage. Returns
 /// (pct, source time of that usage entry). A torn last line fails the JSON
 /// parse and is skipped; sidechain (subagent) usage is not the main context.
-fn scan_usage(text: &str, pref_1m: bool) -> Option<(f32, Option<SystemTime>)> {
+fn scan_usage(text: &str, pref_1m: bool, known_win: Option<u64>) -> Option<(f32, Option<SystemTime>)> {
     for line in text.lines().rev() {
         if !line.contains("\"usage\"") {
             continue;
@@ -327,7 +338,8 @@ fn scan_usage(text: &str, pref_1m: bool) -> Option<(f32, Option<SystemTime>)> {
         if used == 0 {
             continue;
         }
-        let mut window = model_window(v["message"]["model"].as_str().unwrap_or(""), pref_1m);
+        let mut window = known_win
+            .unwrap_or_else(|| model_window(v["message"]["model"].as_str().unwrap_or(""), pref_1m));
         // Self-calibration: more tokens than the assumed window = wrong assumption.
         if used > window {
             window = 1_000_000;
@@ -344,6 +356,7 @@ fn scan_usage(text: &str, pref_1m: bool) -> Option<(f32, Option<SystemTime>)> {
 /// snapshot), falling back to mtime for malformed timestamps.
 pub fn estimate_from_jsonl(path: &Path, sid: &str) -> Option<CtxUpdate> {
     let pref_1m = settings_model_is_1m();
+    let known_win = snapshot_window(sid);
     let mut f = std::fs::File::open(path).ok()?;
     let meta = f.metadata().ok()?;
     let len = meta.len();
@@ -359,7 +372,7 @@ pub fn estimate_from_jsonl(path: &Path, sid: &str) -> Option<CtxUpdate> {
         }
         // A cut mid-UTF8 first line becomes replacement chars and fails JSON parse.
         let text = String::from_utf8_lossy(&buf);
-        if let Some((pct, ts)) = scan_usage(&text, pref_1m) {
+        if let Some((pct, ts)) = scan_usage(&text, pref_1m, known_win) {
             return Some(CtxUpdate {
                 sid: sid.to_string(),
                 pct,
@@ -739,8 +752,16 @@ mod tests {
     fn window_self_calibration() {
         // 500k tokens on an "opus 200k" line: false-red regression guard.
         let line = usage_line(1000, 499_000, "claude-opus-4-8", "2026-07-23T10:00:00.000Z");
-        let (pct, _) = scan_usage(&line, false).unwrap();
+        let (pct, _) = scan_usage(&line, false, None).unwrap();
         assert!((pct - 50.0).abs() < 0.1, "pct={pct}");
+    }
+
+    #[test]
+    fn window_from_snapshot_beats_model_guess() {
+        // Opus without [1m] in its id, 190k used on a 1M window: 19%, not 95%.
+        let line = usage_line(1000, 189_000, "claude-opus-5-5", "2026-07-23T10:00:00.000Z");
+        let (pct, _) = scan_usage(&line, false, Some(1_000_000)).unwrap();
+        assert!((pct - 19.0).abs() < 0.1, "pct={pct}");
     }
 
     // -- jsonl scan --
@@ -750,7 +771,7 @@ mod tests {
         let good = usage_line(1000, 150_000, "claude-fable-5", "2026-07-23T10:00:00.000Z");
         let torn = &good[..good.len() / 2];
         let text = format!("{good}\n{torn}");
-        let (pct, ts_) = scan_usage(&text, false).unwrap();
+        let (pct, ts_) = scan_usage(&text, false, None).unwrap();
         assert!((pct - 15.1).abs() < 0.2, "pct={pct}");
         assert!(ts_.is_some());
     }
@@ -760,9 +781,9 @@ mod tests {
         let side = "{\"isSidechain\":true,\"message\":{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":900000}}}".to_string();
         let main = usage_line(1000, 99_000, "claude-fable-5", "2026-07-23T10:00:00.000Z");
         let text = format!("{main}\n{side}");
-        let (pct, _) = scan_usage(&text, false).unwrap();
+        let (pct, _) = scan_usage(&text, false, None).unwrap();
         assert!((pct - 10.0).abs() < 0.1, "pct={pct}");
-        assert!(scan_usage("{\"type\":\"user\"}\nnot json\n", false).is_none());
+        assert!(scan_usage("{\"type\":\"user\"}\nnot json\n", false, None).is_none());
     }
 
     #[test]
@@ -941,11 +962,13 @@ mod tests {
     fn hook_writes_snapshots() {
         let home = tdir("hook-ok");
         let stdin = format!(
-            "{{\"session_id\":\"{SID}\",\"model\":{{\"id\":\"claude-fable-5\"}},\"context_window\":{{\"used_percentage\":37.5}}}}"
+            "{{\"session_id\":\"{SID}\",\"model\":{{\"id\":\"claude-fable-5\"}},\"context_window\":{{\"total_input_tokens\":5,\"context_window_size\":1000000,\"current_usage\":{{\"input_tokens\":2}},\"used_percentage\":37.5}}}}"
         );
         run_hook(&home, &stdin, None);
         let by_sid = home.join(".kip/ctx/by-sid").join(format!("{SID}.json"));
         let text = std::fs::read_to_string(by_sid).expect("by-sid snapshot written");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["win"].as_u64(), Some(1_000_000));
         let u = parse_snapshot(&text).unwrap();
         assert_eq!(u.sid, SID);
         assert!((u.pct - 37.5).abs() < 0.01);
