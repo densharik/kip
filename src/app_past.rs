@@ -41,9 +41,10 @@ impl App {
         self.past.focus = true;
         if !self.past.loading && self.past.loaded_at.is_none_or(|t| t.elapsed() > Duration::from_secs(15)) {
             self.past.loading = true;
+            let agent = self.settings.agent;
             let (tx, ctx) = (self.past_tx.clone(), ctx.clone());
             std::thread::spawn(move || {
-                let _ = tx.send(PastMsg::Index(history::load_index()));
+                let _ = tx.send(PastMsg::Index(history::load_index(agent)));
                 ctx.request_repaint();
             });
         }
@@ -116,11 +117,13 @@ impl App {
         let cwd = if e.cwd.is_dir() { e.cwd.clone() } else { dirs::home_dir().unwrap_or_default() };
         self.spawn(cwd, None, ctx);
         if let Some(id) = self.w.active
-            && let Some(idx) = self.idx_of(id) {
-                self.sessions[idx].claude_session_id = Some(e.sid.clone());
-                self.sessions[idx].claude_title = e.title.clone();
-                self.resume(id, true, ctx);
-            }
+            && let Some(idx) = self.idx_of(id)
+        {
+            self.sessions[idx].claude_session_id = Some(e.sid.clone());
+            self.sessions[idx].session_agent = Some(self.settings.agent);
+            self.sessions[idx].claude_title = e.title.clone();
+            self.resume(id, true, ctx);
+        }
         self.persist();
     }
 
@@ -148,6 +151,7 @@ impl App {
             return;
         };
         let files: Vec<(String, PathBuf)> = self.past.entries.iter().map(|e| (e.sid.clone(), e.path.clone())).collect();
+        let agent = self.settings.agent;
         let (tx, ctx, cancel) = (self.past_tx.clone(), ctx.clone(), self.past.epoch.clone());
         std::thread::spawn(move || {
             let next = AtomicUsize::new(0);
@@ -159,7 +163,7 @@ impl App {
                         if i >= files.len() || cancel.load(Ordering::Relaxed) != epoch {
                             return;
                         }
-                        let n = history::count_hits(&files[i].0, &re);
+                        let n = history::count_hits(agent, &files[i].0, &re);
                         if n > 0 {
                             let _ = tx.send(PastMsg::Hit(epoch, files[i].0.clone(), n));
                         }
@@ -416,11 +420,15 @@ impl App {
 
         // Preview.
         let Some(e) = self.past.sel.as_ref().and_then(|s| self.past.entries.iter().find(|e| &e.sid == s)).cloned() else {
+            let empty_msg = match self.settings.agent {
+                config::Agent::Claude => tr("Прошлых разговоров с Claude не найдено", "No past Claude conversations found"),
+                config::Agent::Agy => tr("Прошлых разговоров с agy не найдено", "No past agy conversations found"),
+            };
             ui.painter().text(
                 right.center(),
                 Align2::CENTER_CENTER,
                 if self.past.entries.is_empty() && !self.past.loading {
-                    tr("Прошлых разговоров с Claude не найдено", "No past Claude conversations found")
+                    empty_msg
                 } else {
                     tr("Выберите разговор слева", "Pick a conversation on the left")
                 },
@@ -456,9 +464,13 @@ impl App {
                     } else {
                         tr("Продолжить", "Continue")
                     };
+                    let resume_hint = match self.settings.agent {
+                        config::Agent::Claude => format!("{} --resume {} (Enter)", self.settings.claude_cmd, e.sid),
+                        config::Agent::Agy => format!("{} --conversation {} (Enter)", self.settings.agy_cmd, e.sid),
+                    };
                     if ui
                         .button(RichText::new(label).size(12.5))
-                        .on_hover_text(format!("claude --resume {} (Enter)", e.sid))
+                        .on_hover_text(resume_hint)
                         .clicked()
                     {
                         acts.push(Act::PastResume(e.sid.clone()));
@@ -485,12 +497,13 @@ impl App {
                 ui.label(RichText::new(tr("Загружаю...", "Loading...")).color(palette::text_dim()));
                 return;
             }
+            let bot = self.settings.agent.short();
             ScrollArea::vertical().id_salt(("kip_past_prev", e.sid.as_str())).auto_shrink([false, false]).show(ui, |ui| {
                 for (i, (user, text)) in msgs.iter().enumerate() {
                     let (who, col) = if *user {
                         (tr("Вы", "You"), palette::accent_bar())
                     } else {
-                        ("Claude", palette::text_dim())
+                        (bot, palette::text_dim())
                     };
                     let head = ui.label(RichText::new(who).size(11.0).strong().color(col));
                     let shown: String = if text.chars().count() > MSG_MAX {

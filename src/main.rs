@@ -37,7 +37,7 @@ use egui::{
     Vec2, Visuals,
 };
 
-use config::{load_state, save_state, AppState, SavedSession, Settings};
+use config::{load_state, save_state, Agent, AppState, SavedSession, Settings};
 use i18n::tr;
 use session::{poll_git, spawn_live, EventProxy, GitStats, Phase, Session};
 
@@ -66,18 +66,18 @@ fn main() -> eframe::Result {
         mcp::serve();
         return Ok(());
     }
-    // If kip itself was launched from a Claude Code session, its CLAUDE* markers
-    // leak into our shells and a claude started there thinks it is a child session
-    // and disables transcript saving (breaking resume and context tracking).
-    // CLAUDE_CONFIG_DIR is configuration, not a nesting marker: claude_dir() reads
-    // it to find sessions/transcripts, and dropping it here would leave us looking
-    // in ~/.claude while the shells (which re-export it from the user's rc) run a
-    // claude that writes somewhere else.
-    let claude_vars: Vec<String> = std::env::vars()
+    // If kip itself was launched from a Claude Code or Antigravity CLI session,
+    // its CLAUDE* / ANTIGRAVITY_* nesting markers leak into our shells and an
+    // agent started there thinks it is a child session. CLAUDE_CONFIG_DIR is
+    // configuration, not a nesting marker.
+    let agent_vars: Vec<String> = std::env::vars()
         .map(|(k, _)| k)
-        .filter(|k| k.starts_with("CLAUDE") && k != "CLAUDE_CONFIG_DIR")
+        .filter(|k| {
+            (k.starts_with("CLAUDE") && k != "CLAUDE_CONFIG_DIR")
+                || k.starts_with("ANTIGRAVITY_")
+        })
         .collect();
-    for k in claude_vars {
+    for k in agent_vars {
         // Safe: nothing else is running yet.
         unsafe { std::env::remove_var(k) };
     }
@@ -559,17 +559,18 @@ impl App {
         let (past_tx, past_rx) = mpsc::channel();
         let (proj_tx, proj_rx) = mpsc::channel();
         if !state.settings.mcp_offer_off {
+            let agent = state.settings.agent;
             let (tx, ctx) = (mcp_tx.clone(), cc.egui_ctx.clone());
             std::thread::spawn(move || {
-                let _ = tx.send(McpMsg::Installed(mcp::installed()));
+                let _ = tx.send(McpMsg::Installed(mcp::installed(agent)));
                 ctx.request_repaint();
             });
         }
         let jsonl_map: ctx_index::SharedMap = Default::default();
-        ctx_index::spawn_initial_scan(jsonl_map.clone());
+        ctx_index::spawn_initial_scan(jsonl_map.clone(), state.settings.agent);
         ctx_index::sweep();
         #[cfg(not(windows))]
-        if state.settings.ctx_hook {
+        if state.settings.ctx_hook || state.settings.agy_ctx_hook {
             // Keep the installed hook script current across kip updates.
             let _ = ctx_index::write_hook_script();
         }
@@ -922,12 +923,14 @@ impl App {
         }
     }
 
-    /// Immediate context poll by the saved session id (no live claude needed).
+    /// Immediate context poll by the saved session id (no live agent needed).
     fn poll_ctx_now(&self, s: &Session, ctx: &egui::Context) {
         if let Some(sid) = &s.claude_session_id {
+            let agent = s.effective_agent(&self.settings);
             ctx_index::lookup(
                 sid.clone(),
                 s.cwd.clone(),
+                agent,
                 self.jsonl_map.clone(),
                 self.ctxi_tx.clone(),
                 ctx.clone(),
@@ -938,10 +941,46 @@ impl App {
                 s.spawned_at,
                 s.claude_session_id.clone(),
                 None,
+                agent,
                 self.ctx_tx.clone(),
                 ctx.clone(),
             );
         }
+    }
+
+    /// Reset agent-scoped caches (history, usage, MCP status, transcript map)
+    /// when the user flips between Claude Code and Antigravity (agy).
+    fn on_agent_changed(&mut self, ctx: &egui::Context) {
+        self.past.entries.clear();
+        self.past.hay.clear();
+        self.past.loaded_at = None;
+        self.past.sel = None;
+        self.past.preview = None;
+        self.past.searched.clear();
+        self.past.hits.clear();
+        self.past.done = 0;
+        self.usage.clear();
+        self.usage_err = None;
+        self.usage_at = None;
+        self.mcp.status = None;
+        self.hook_error = None;
+        let agent = self.settings.agent;
+        ctx_index::spawn_initial_scan(self.jsonl_map.clone(), agent);
+        if !self.settings.mcp_offer_off {
+            let (tx, ctx2) = (self.mcp_tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(McpMsg::Installed(mcp::installed(agent)));
+                ctx2.request_repaint();
+            });
+        }
+        // Reset live fg detection so housekeeping re-evaluates against the new agent.
+        for s in &mut self.sessions {
+            s.fg_is_claude = false;
+            s.claude_pid = None;
+            s.last_ctx_poll = None;
+            s.ctx_stat = Default::default();
+        }
+        ctx.request_repaint();
     }
 
     /// Mark state for saving. The write happens at the end of the frame
@@ -1098,14 +1137,16 @@ impl App {
             s.last_activity = Instant::now();
             s.pending_cmd = Some(cmd.to_string());
             // A resume command names its session up front: bind it and show its
-            // context immediately instead of waiting for claude to boot.
-            if let Some(hint) = session::parse_resume_hint(cmd) {
+            // context immediately instead of waiting for the agent to boot.
+            let agent = self.settings.agent;
+            if let Some(hint) = session::parse_resume_hint(cmd, agent) {
                 let sid = match hint {
                     session::ResumeHint::Sid(sid) => Some(sid),
-                    session::ResumeHint::Latest => session::detect_claude_session(&s.cwd, None),
+                    session::ResumeHint::Latest => session::detect_agent_session(&s.cwd, None, agent),
                 };
                 if let Some(sid) = sid {
                     s.claude_session_id = Some(sid);
+                    s.session_agent = Some(agent);
                     s.saw_claude = true;
                     s.last_ctx_poll = None;
                     s.burst_until = Some(Instant::now() + Duration::from_secs(3));
@@ -1393,6 +1434,7 @@ impl App {
             SavedSession {
                 cwd,
                 claude_session_id: None,
+                session_agent: None,
                 claude_title: None,
                 custom_name: None,
                 group: group.clone(),
@@ -1511,7 +1553,8 @@ impl App {
                 },
                 Act::Suspend(id) => {
                     if let Some(idx) = self.idx_of(id) {
-                        self.sessions[idx].suspend();
+                        let agent = self.settings.agent;
+                        self.sessions[idx].suspend(agent);
                         self.persist();
                     }
                 },
@@ -1521,9 +1564,10 @@ impl App {
                 },
                 Act::ResumeInPlace(id) => {
                     if let Some(idx) = self.idx_of(id)
-                        && let Some(cmd) = self.sessions[idx].resume_command(&self.settings) {
-                            self.send_command_to(idx, &cmd, ctx);
-                        }
+                        && let Some(cmd) = self.sessions[idx].resume_command(&self.settings)
+                    {
+                        self.send_command_to(idx, &cmd, ctx);
+                    }
                 },
                 Act::Close(id) => {
                     if let Some(idx) = self.idx_of(id) {
@@ -1532,7 +1576,8 @@ impl App {
                         }
                         // Guards against reflexive Cmd+W killing a working agent.
                         if matches!(self.sessions[idx].phase, Phase::Live(_)) {
-                            self.sessions[idx].suspend();
+                            let agent = self.settings.agent;
+                            self.sessions[idx].suspend(agent);
                             self.persist();
                         } else {
                             self.remove_session(idx);
@@ -1747,13 +1792,15 @@ impl App {
                     {
                         s.last_fg_probe = Some(Instant::now());
                         if let Some(live) = s.live() {
+                            let agent = self.settings.agent;
                             let fg = plat::foreground_pgid(live.master_fd, live.shell_pid);
                             if fg.is_some_and(|pg| pg != live.shell_pid)
-                                && fg.is_some_and(plat::is_claude_proc)
+                                && fg.is_some_and(|pg| plat::is_agent_proc(pg, agent))
                             {
                                 s.fg_is_claude = true;
                                 s.claude_pid = fg;
                                 s.saw_claude = true;
+                                s.session_agent = Some(agent);
                                 s.last_ctx_poll = None;
                                 s.burst_until = Some(Instant::now() + Duration::from_secs(3));
                             }
@@ -1805,7 +1852,7 @@ impl App {
                     }
                 },
                 TermEvent::ChildExit(status) => {
-                    s.finalize_exit(status.code());
+                    s.finalize_exit(status.code(), self.settings.agent);
                     persist = true;
                 },
                 TermEvent::CursorBlinkingChange | TermEvent::MouseCursorDirty | TermEvent::Exit => {},
@@ -1847,46 +1894,72 @@ impl App {
                     },
                     None => {},
                 }
-                // Claude found behind a wrapper: adopt right away, don't wait
+                // Agent found behind a wrapper: adopt right away, don't wait
                 // for the next housekeeping tick to re-validate.
                 if let Some(cp) = info.claude_pid
-                    && s.claude_pid != Some(cp) {
-                        s.claude_pid = Some(cp);
-                        s.fg_is_claude = true;
-                        s.saw_claude = true;
-                        s.burst_until = Some(Instant::now() + Duration::from_secs(3));
-                    }
+                    && s.claude_pid != Some(cp)
+                {
+                    s.claude_pid = Some(cp);
+                    s.fg_is_claude = true;
+                    s.saw_claude = true;
+                    s.session_agent = Some(self.settings.agent);
+                    s.burst_until = Some(Instant::now() + Duration::from_secs(3));
+                }
                 if let Some(sid) = info.session_id
-                    && s.claude_session_id.as_deref() != Some(sid.as_str()) {
-                        s.claude_session_id = Some(sid.clone());
-                        s.ctx_stat.jsonl_path = None;
-                        s.ctx_stat.path_sid = None;
-                        lookups.push((sid, s.cwd.clone()));
-                    }
+                    && s.claude_session_id.as_deref() != Some(sid.as_str())
+                {
+                    s.claude_session_id = Some(sid.clone());
+                    s.session_agent = Some(self.settings.agent);
+                    s.ctx_stat.jsonl_path = None;
+                    s.ctx_stat.path_sid = None;
+                    lookups.push((sid, s.cwd.clone()));
+                }
             }
         }
         // Write the new id down now: after a force quit there is no on_exit to
-        // capture it, and "Resume Claude" would come back empty.
+        // capture it, and Resume would come back empty.
         if !lookups.is_empty() {
             self.persist();
         }
+        let agent = self.settings.agent;
         for (sid, cwd) in lookups {
-            ctx_index::lookup(sid, cwd, self.jsonl_map.clone(), self.ctxi_tx.clone(), ctx.clone());
+            ctx_index::lookup(sid, cwd, agent, self.jsonl_map.clone(), self.ctxi_tx.clone(), ctx.clone());
         }
     }
 
-    fn drain_ctx_index(&mut self) {
+    fn drain_ctx_index(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.ctxi_rx.try_recv() {
             match msg {
                 ctx_index::CtxMsg::Update(u) => self.ctx_index.apply(u),
                 ctx_index::CtxMsg::Rebind { session, update } => {
-                    // The tab's claude switched sessions (/resume inside claude).
+                    // The tab's agent switched sessions (/resume inside agent)
+                    // or reported a live turn state (agy statusline hook).
+                    let seen = self.seen(ctx, session);
                     if let Some(idx) = self.idx_of(session) {
                         let s = &mut self.sessions[idx];
                         if s.fg_is_claude {
-                            s.claude_session_id = Some(update.sid.clone());
-                            s.ctx_stat = Default::default();
-                            self.dirty.set(true);
+                            if s.claude_session_id.as_deref() != Some(update.sid.as_str()) {
+                                s.claude_session_id = Some(update.sid.clone());
+                                s.session_agent = Some(self.settings.agent);
+                                s.ctx_stat = Default::default();
+                                self.dirty.set(true);
+                            }
+                            #[allow(clippy::collapsible_match)]
+                            match update.state.as_deref() {
+                                Some("busy") => {
+                                    if s.turn_since.is_none() {
+                                        s.turn_since = Some(Instant::now());
+                                        s.done = false;
+                                    }
+                                },
+                                Some(_) => {
+                                    if s.turn_since.take().is_some() && !seen {
+                                        s.done = true;
+                                        s.unread = true;
+                                    }
+                                },
+                                None => {},
+                            }
                         }
                     }
                     self.ctx_index.apply(update);
@@ -1939,6 +2012,12 @@ impl App {
             }
             let seen: Vec<u64> = self.focused_wins(ctx).filter_map(|w| w.ui.active).collect();
             let idle_limit = self.settings.idle_suspend_min as u64 * 60;
+            let agent = self.settings.agent;
+            let poll_every = if agent == Agent::Agy && !self.settings.agy_ctx_hook {
+                Duration::from_secs(3)
+            } else {
+                Duration::from_secs(8)
+            };
             let mut suspend_any = false;
             let mut kill_pids: Vec<i32> = Vec::new();
 
@@ -1954,28 +2033,29 @@ impl App {
                 let busy_now = fg.is_some_and(|pg| pg != shell_pid);
                 let was_claude = s.fg_is_claude;
                 s.fg_name = if busy_now { fg.and_then(plat::process_name) } else { None };
-                let leader_claude = busy_now && fg.is_some_and(plat::is_claude_proc);
+                let leader_claude = busy_now && fg.is_some_and(|pg| plat::is_agent_proc(pg, agent));
                 if leader_claude {
                     s.claude_pid = fg;
                 } else if !busy_now {
                     s.claude_pid = None;
-                } else if s.claude_pid.is_some_and(|cp| !plat::is_claude_proc(cp)) {
-                    // Wrapper case: the claude child exited (or its pid was reused).
+                } else if s.claude_pid.is_some_and(|cp| !plat::is_agent_proc(cp, agent)) {
+                    // Wrapper case: the agent child exited (or its pid was reused).
                     s.claude_pid = None;
                 }
                 s.fg_is_claude = leader_claude || (busy_now && s.claude_pid.is_some());
                 let is_claude = s.fg_is_claude;
                 if is_claude {
                     s.saw_claude = true;
+                    s.session_agent = Some(agent);
                     if !was_claude {
                         s.last_ctx_poll = None;
                         s.burst_until = Some(Instant::now() + Duration::from_secs(3));
                     }
                 }
-                // Name/id capture while claude runs.
+                // Name/id/status capture while the agent runs.
                 if busy_now
                     && is_claude
-                    && s.last_ctx_poll.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(8))
+                    && s.last_ctx_poll.is_none_or(|t| now.duration_since(t) >= poll_every)
                 {
                     s.last_ctx_poll = Some(now);
                     session::poll_claude(
@@ -1984,6 +2064,7 @@ impl App {
                         s.spawned_at,
                         s.claude_session_id.clone(),
                         fg,
+                        agent,
                         self.ctx_tx.clone(),
                         ctx.clone(),
                     );
@@ -2032,7 +2113,7 @@ impl App {
                         l.kill_on_drop = false;
                     }
                     kill_pids.push(shell_pid);
-                    s.suspend();
+                    s.suspend(agent);
                     suspend_any = true;
                 }
             }
@@ -2081,6 +2162,7 @@ impl App {
         let tx = self.ctxi_tx.clone();
         let meta_tx = self.ctx_tx.clone();
         let map = self.jsonl_map.clone();
+        let agent = self.settings.agent;
         let mut watching = false;
 
         for s in &mut self.sessions {
@@ -2090,31 +2172,34 @@ impl App {
                 _ => continue,
             };
             let fg = plat::foreground_pgid(master_fd, shell_pid).filter(|pg| *pg != shell_pid);
-            // Busy but not (yet) claude: a wrapper (cchb etc) may be about to
-            // spawn claude as a child - look for it in the background.
-            if fg.is_some() && !s.fg_is_claude
-                && s.ctx_stat.last_finder.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(2)) {
-                    s.ctx_stat.last_finder = Some(now);
-                    session::poll_claude(
-                        s.id,
-                        s.cwd.clone(),
-                        s.spawned_at,
-                        s.claude_session_id.clone(),
-                        fg,
-                        meta_tx.clone(),
-                        ctx.clone(),
-                    );
-                }
+            // Busy but not (yet) the agent: a wrapper may be about to spawn
+            // it as a child - look for it in the background.
+            if fg.is_some()
+                && !s.fg_is_claude
+                && s.ctx_stat.last_finder.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(2))
+            {
+                s.ctx_stat.last_finder = Some(now);
+                session::poll_claude(
+                    s.id,
+                    s.cwd.clone(),
+                    s.spawned_at,
+                    s.claude_session_id.clone(),
+                    fg,
+                    agent,
+                    meta_tx.clone(),
+                    ctx.clone(),
+                );
+            }
             if !s.fg_is_claude && !bursting {
                 continue;
             }
             watching = true;
 
             if let Some(cp) = s.claude_pid.or(fg) {
-                // Universal fast binding: claude writes its own sessions/<pid>.json
-                // for ANY launch method (picker, --continue, wrappers) - the moment
-                // it changes, read the sessionId. No hook needed.
-                if let Some(p) = session::meta_path(cp) {
+                // Claude Code writes its own sessions/<pid>.json for any launch method.
+                if agent == Agent::Claude
+                    && let Some(p) = session::meta_path(cp)
+                {
                     let mt = std::fs::metadata(&p).ok().and_then(|m| m.modified().ok());
                     if mt.is_some() && mt != s.ctx_stat.meta_mtime {
                         s.ctx_stat.meta_mtime = mt;
@@ -2122,7 +2207,7 @@ impl App {
                         session::spawn_meta_read(s.id, cp, min, meta_tx.clone(), ctx.clone());
                     }
                 }
-                // by-pid hook snapshot: exact % for THIS tab + rebinding.
+                // by-pid hook snapshot: exact % for THIS tab + rebinding (+ agy live state).
                 if let Some(p) = ctx_index::by_pid_path(cp) {
                     let mt = std::fs::metadata(&p).ok().and_then(|m| m.modified().ok());
                     if mt.is_some() && mt != s.ctx_stat.bypid_mtime {
@@ -2192,7 +2277,8 @@ impl App {
                         .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(5))
                     {
                         s.ctx_stat.last_resolve = Some(now);
-                        ctx_index::lookup(sid, s.cwd.clone(), map.clone(), tx.clone(), ctx.clone());
+                        let s_agent = s.effective_agent(&self.settings);
+                        ctx_index::lookup(sid, s.cwd.clone(), s_agent, map.clone(), tx.clone(), ctx.clone());
                     }
                 },
             }
@@ -2489,7 +2575,7 @@ impl App {
             ui.add_space(4.0);
             if ui
                 .selectable_label(self.w.past_open, RichText::new(tr("История", "History")).size(12.5))
-                .on_hover_text(tr("Прошлые разговоры с Claude: поиск и продолжение (Cmd+Y)", "Past Claude conversations: search and continue (Cmd+Y)"))
+                .on_hover_text(tr("Прошлые разговоры: поиск и продолжение (Cmd+Y)", "Past conversations: search and continue (Cmd+Y)"))
                 .clicked()
             {
                 acts.push(Act::TogglePast);
@@ -3544,7 +3630,11 @@ impl App {
                     }
                 },
                 _ => {
-                    if s.claude_session_id.is_some() && ui.button(tr("Продолжить Claude", "Resume Claude")).clicked() {
+                    let resume_lbl = match s.effective_agent(&self.settings) {
+                        Agent::Claude => tr("Продолжить Claude", "Resume Claude"),
+                        Agent::Agy => tr("Продолжить agy", "Resume agy"),
+                    };
+                    if s.claude_session_id.is_some() && ui.button(resume_lbl).clicked() {
                         acts.push(Act::Resume(s.id, true));
                         ui.close();
                     }
@@ -3695,11 +3785,16 @@ impl App {
                             // skip-permissions only matters when (re)launching claude,
                             // so it lives on the restart card, not here.
                             if let Some(cid) = &s.claude_session_id {
+                                let s_agent = s.effective_agent(&self.settings);
                                 if s.fg_is_claude {
+                                    let tip = match s_agent {
+                                        Agent::Claude => format!("{}: {cid}", tr("Сохранённая сессия Claude", "Saved Claude session")),
+                                        Agent::Agy => format!("{}: {cid}", tr("Сохранённая сессия agy", "Saved agy session")),
+                                    };
                                     ui.label(
                                         RichText::new(short_id(cid)).size(10.5).monospace().color(palette::text_faint()),
                                     )
-                                    .on_hover_text(format!("{}: {cid}", tr("Сохранённая сессия Claude", "Saved Claude session")));
+                                    .on_hover_text(tip);
                                 } else {
                                     // Type the resume into the shell that is already
                                     // running instead of respawning the terminal: a
@@ -3708,6 +3803,7 @@ impl App {
                                     // click away from a build the user is watching.
                                     // Disabled outright while anything else holds the
                                     // foreground, since the shell would not read it.
+                                    let hover_cmd = s.resume_command(&self.settings).unwrap_or_else(|| cid.clone());
                                     let btn = ui
                                         .add_enabled(
                                             !busy_now,
@@ -3717,7 +3813,7 @@ impl App {
                                                     .color(Color32::from_rgb(0xd8, 0xe4, 0xd0)),
                                             ),
                                         )
-                                        .on_hover_text(format!("claude --resume {cid}"))
+                                        .on_hover_text(hover_cmd)
                                         .on_disabled_hover_text(tr("Терминал занят", "Terminal busy"));
                                     if btn.clicked() {
                                         acts.push(Act::ResumeInPlace(s.id));
@@ -4377,7 +4473,7 @@ impl App {
             let stale = self.usage_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
             if stale && !self.usage_inflight {
                 self.usage_inflight = true;
-                usage::fetch(self.usage_tx.clone(), ctx.clone());
+                usage::fetch(self.settings.agent, self.settings.agy_ctx_hook, self.usage_tx.clone(), ctx.clone());
             }
             ctx.request_repaint_after(Duration::from_secs(30));
         }
@@ -4405,8 +4501,12 @@ impl App {
                     .show(ui, |ui| {
                         let w = 220.0;
                         ui.set_min_width(w);
+                        let limits_title = match self.settings.agent {
+                            Agent::Claude => tr("Лимиты Claude", "Claude limits"),
+                            Agent::Agy => tr("Лимиты Antigravity", "Antigravity limits"),
+                        };
                         ui.label(
-                            RichText::new(tr("Лимиты Claude", "Claude limits")).size(10.0).strong().color(palette::text_dim()),
+                            RichText::new(limits_title).size(10.0).strong().color(palette::text_dim()),
                         );
                         ui.add_space(6.0);
                         if self.usage.is_empty() {
@@ -4887,9 +4987,14 @@ impl App {
                                 ui.label(RichText::new(hint).size(11.0).color(palette::text_dim()));
                             }
                             ui.label(RichText::new(tilde(&s.cwd)).size(11.0).color(palette::text_dim()));
+                            let s_agent = s.effective_agent(&self.settings);
                             if let Some(cid) = &s.claude_session_id {
+                                let tag = match s_agent {
+                                    Agent::Claude => "claude",
+                                    Agent::Agy => "agy",
+                                };
                                 ui.label(
-                                    RichText::new(format!("claude: {}", short_id(cid)))
+                                    RichText::new(format!("{tag}: {}", short_id(cid)))
                                         .size(10.5)
                                         .monospace()
                                         .color(palette::text_faint()),
@@ -4908,8 +5013,12 @@ impl App {
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
                                 if s.claude_session_id.is_some() {
+                                    let resume_lbl = match s_agent {
+                                        Agent::Claude => tr("Продолжить Claude", "Resume Claude"),
+                                        Agent::Agy => tr("Продолжить agy", "Resume agy"),
+                                    };
                                     let btn = egui::Button::new(
-                                        RichText::new(tr("Продолжить Claude", "Resume Claude")).size(12.5).color(Color32::from_rgb(0xd8, 0xe4, 0xd0)),
+                                        RichText::new(resume_lbl).size(12.5).color(Color32::from_rgb(0xd8, 0xe4, 0xd0)),
                                     )
                                     .fill(Color32::from_rgb(0x2e, 0x3a, 0x2a));
                                     if ui.add(btn).clicked() {
@@ -4957,7 +5066,7 @@ impl App {
             tr("Вид", "Look"),
             tr("Сессии", "Sessions"),
             tr("Уведомления", "Alerts"),
-            "Claude",
+            tr("Агент", "Agent"),
             tr("О kip", "About"),
         ];
         egui::Window::new(tr("Настройки", "Settings"))
@@ -5127,7 +5236,7 @@ impl App {
             ui.end_row();
 
             ui.label("");
-            ui.checkbox(&mut self.settings.show_last_msg, tr("Время последнего ответа Claude", "Time since Claude's last reply"))
+            ui.checkbox(&mut self.settings.show_last_msg, tr("Время последнего ответа агента", "Time since agent's last reply"))
                 .on_hover_text(tr(
                     "В углу строки, под процентом контекста. Берётся из транскрипта, поэтому у вчерашней сессии там и будет вчера.",
                     "In the row's corner, under the context %. Read from the transcript, so yesterday's session says yesterday.",
@@ -5192,9 +5301,35 @@ impl App {
     }
 
     fn settings_claude(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut agent_changed = false;
+        let mut start_mcp = false;
         Self::settings_grid(ui, "set-claude", |ui| {
+            ui.label(tr("CLI-агент", "CLI agent"));
+            ui.horizontal(|ui| {
+                let prev = self.settings.agent;
+                ui.selectable_value(&mut self.settings.agent, Agent::Claude, Agent::Claude.label())
+                    .on_hover_text(tr(
+                        "Интеграция с Claude Code (~/.claude, claude --resume, лимиты Claude).",
+                        "Claude Code integration (~/.claude, claude --resume, Claude limits).",
+                    ));
+                ui.selectable_value(&mut self.settings.agent, Agent::Agy, Agent::Agy.label())
+                    .on_hover_text(tr(
+                        "Интеграция с Antigravity CLI (~/.gemini/antigravity-cli, agy --conversation, квоты agy).",
+                        "Antigravity CLI integration (~/.gemini/antigravity-cli, agy --conversation, agy quotas).",
+                    ));
+                if self.settings.agent != prev {
+                    agent_changed = true;
+                }
+            });
+            ui.end_row();
+
+            let agent = self.settings.agent;
             ui.label(tr("Команда запуска", "Launch command"));
-            ui.add(egui::TextEdit::singleline(&mut self.settings.claude_cmd).desired_width(260.0));
+            let cmd = match agent {
+                Agent::Claude => &mut self.settings.claude_cmd,
+                Agent::Agy => &mut self.settings.agy_cmd,
+            };
+            ui.add(egui::TextEdit::singleline(cmd).desired_width(260.0));
             ui.end_row();
 
             ui.label(tr("Новые сессии", "New sessions"));
@@ -5206,24 +5341,43 @@ impl App {
             #[cfg(not(windows))]
             {
                 ui.label(tr("% контекста", "Context %"));
-                let mut hook_on = self.settings.ctx_hook;
-                let resp = ui.checkbox(&mut hook_on, tr("точный, через statusline-хук", "exact, via a statusline hook")).on_hover_text(tr(
-                    "Ставит крошечный скрипт в ~/.kip/bin и подключает его statusline-хуком Claude Code: \
-                     % будет ровно тот, что видит сам Claude. Уже настроенный statusline оборачивается и \
-                     продолжает работать. Снятие галочки возвращает прежний.",
-                    "Installs a tiny script in ~/.kip/bin and wires it as a Claude Code statusline hook: \
-                     the % is exactly what Claude shows. An existing statusline is wrapped and keeps \
-                     working. Unchecking restores it.",
-                ));
+                let mut hook_on = match agent {
+                    Agent::Claude => self.settings.ctx_hook,
+                    Agent::Agy => self.settings.agy_ctx_hook,
+                };
+                let tip = match agent {
+                    Agent::Claude => tr(
+                        "Ставит крошечный скрипт в ~/.kip/bin и подключает его statusline-хуком Claude Code: \
+                         % будет ровно тот, что видит сам Claude. Уже настроенный statusline оборачивается и \
+                         продолжает работать. Снятие галочки возвращает прежний.",
+                        "Installs a tiny script in ~/.kip/bin and wires it as a Claude Code statusline hook: \
+                         the % is exactly what Claude shows. An existing statusline is wrapped and keeps \
+                         working. Unchecking restores it.",
+                    ),
+                    Agent::Agy => tr(
+                        "Ставит скрипт в ~/.kip/bin и подключает его в ~/.gemini/antigravity-cli/settings.json \
+                         (со штатным statusline): даёт точный % контекста, мгновенный статус хода и квоты agy. \
+                         Снятие галочки возвращает прежние настройки.",
+                        "Installs a script in ~/.kip/bin and wires it into ~/.gemini/antigravity-cli/settings.json \
+                         (keeping the built-in statusline): gives exact context %, instant turn status, and agy quotas. \
+                         Unchecking restores the previous config.",
+                    ),
+                };
+                let resp = ui
+                    .checkbox(&mut hook_on, tr("точный, через statusline-хук", "exact, via a statusline hook"))
+                    .on_hover_text(tip);
                 if resp.changed() {
                     let res = if hook_on {
-                        ctx_index::install_hook(&mut self.settings)
+                        ctx_index::install_hook(&mut self.settings, agent)
                     } else {
-                        ctx_index::uninstall_hook(&mut self.settings)
+                        ctx_index::uninstall_hook(&mut self.settings, agent)
                     };
                     match res {
                         Ok(()) => {
-                            self.settings.ctx_hook = hook_on;
+                            match agent {
+                                Agent::Claude => self.settings.ctx_hook = hook_on,
+                                Agent::Agy => self.settings.agy_ctx_hook = hook_on,
+                            }
                             self.hook_error = None;
                         },
                         Err(e) => self.hook_error = Some(e),
@@ -5238,26 +5392,46 @@ impl App {
             }
 
             ui.label(tr("MCP-сервер kip", "kip MCP server"));
+            let (btn_lbl, btn_tip) = match agent {
+                Agent::Claude => (
+                    tr("Подключить к Claude Code", "Connect to Claude Code"),
+                    tr(
+                        "claude mcp add -s user kip: Claude сможет видеть, открывать, закрывать, переименовывать и чистить сессии kip.",
+                        "claude mcp add -s user kip: Claude can list, open, close, rename and clean up kip sessions.",
+                    ),
+                ),
+                Agent::Agy => (
+                    tr("Подключить к Antigravity CLI", "Connect to Antigravity CLI"),
+                    tr(
+                        "agy mcp add kip: agy сможет видеть, открывать, закрывать, переименовывать и чистить сессии kip.",
+                        "agy mcp add kip: agy can list, open, close, rename and clean up kip sessions.",
+                    ),
+                ),
+            };
             if ui
-                .add_enabled(!self.mcp.busy, egui::Button::new(tr("Подключить к Claude Code", "Connect to Claude Code")))
-                .on_hover_text(tr(
-                    "claude mcp add -s user kip: Claude сможет видеть, открывать, закрывать, переименовывать и чистить сессии kip.",
-                    "claude mcp add -s user kip: Claude can list, open, close, rename and clean up kip sessions.",
-                ))
+                .add_enabled(!self.mcp.busy, egui::Button::new(btn_lbl))
+                .on_hover_text(btn_tip)
                 .clicked()
             {
-                self.start_mcp_install(ctx);
+                start_mcp = true;
             }
             ui.end_row();
 
             ui.label("");
             ui.checkbox(&mut self.settings.mcp_send_input, tr("MCP может печатать в сессии", "MCP may type into sessions"))
                 .on_hover_text(tr(
-                    "Разрешает Claude из одной сессии отправлять текст и команды в другие сессии kip (send_input).",
-                    "Lets Claude in one session send text and commands to other kip sessions (send_input).",
+                    "Разрешает агенту из одной сессии отправлять текст и команды в другие сессии kip (send_input).",
+                    "Lets the agent in one session send text and commands to other kip sessions (send_input).",
                 ));
             ui.end_row();
         });
+        if agent_changed {
+            self.on_agent_changed(ctx);
+            self.persist();
+        }
+        if start_mcp {
+            self.start_mcp_install(ctx);
+        }
         self.mcp_status_ui(ui);
     }
 
@@ -5329,7 +5503,7 @@ impl eframe::App for App {
         self.drain_events(&ctx);
         self.drain_git();
         self.drain_ctx(&ctx);
-        self.drain_ctx_index();
+        self.drain_ctx_index(&ctx);
         self.drain_mods();
         self.drain_update();
         self.drain_history();
@@ -5441,11 +5615,12 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
-        // Capture Claude session ids of live terminals so "Продолжить Claude"
-        // is available after restart even without an explicit save.
+        // Capture active agent session ids of live terminals so Resume is
+        // available after restart even without an explicit save.
+        let agent = self.settings.agent;
         for s in &mut self.sessions {
             if matches!(s.phase, Phase::Live(_)) {
-                s.save_claude_session();
+                s.save_claude_session(agent);
             }
         }
         self.save_now();

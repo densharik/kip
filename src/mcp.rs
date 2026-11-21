@@ -5,24 +5,26 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::config::Agent;
 use crate::ctl;
 
-const INSTRUCTIONS: &str = "kip is the terminal app these Claude Code sessions run in. \
+const INSTRUCTIONS: &str = "kip is the terminal app these AI agent sessions (Claude Code or Antigravity agy) run in. \
 Session ids come from list_sessions; done = its agent finished unseen. A pinned session refuses close/move unless force is set. \
 To summarize a session, read_transcript it and summarize the text yourself.";
 
 fn tools() -> Value {
     let id = json!({"type": "integer", "description": "kip session id (from list_sessions)"});
     json!([
-        {"name": "list_sessions", "description": "All kip sessions: id, window, name, folder, group, project, state (live/suspended/exited), busy, pinned, Claude session id, context %, idle time.",
+        {"name": "list_sessions", "description": "All kip sessions: id, window, name, folder, group, project, state (live/suspended/exited), busy, pinned, agent session id, context %, idle time.",
          "inputSchema": {"type": "object", "properties": {}}},
         {"name": "list_windows", "description": "Open kip windows with their active session and session count.",
          "inputSchema": {"type": "object", "properties": {}}},
-        {"name": "open_session", "description": "Open a new terminal session in a folder. Optionally start Claude in it, resume a Claude session by id, or run a command; put it in a window, group, under a name.",
+        {"name": "open_session", "description": "Open a new terminal session in a folder. Optionally start the active agent (Claude/agy), resume a conversation by id, or run a command; put it in a window, group, under a name.",
          "inputSchema": {"type": "object", "properties": {
             "cwd": {"type": "string", "description": "Folder; ~ is expanded"},
-            "claude": {"type": "boolean", "description": "Start a fresh Claude in it"},
-            "resume": {"type": "string", "description": "Claude session id to resume"},
+            "claude": {"type": "boolean", "description": "Start the active agent in it"},
+            "agent": {"type": "boolean", "description": "Alias for claude: start the active agent"},
+            "resume": {"type": "string", "description": "Conversation/session id to resume"},
             "command": {"type": "string", "description": "Shell command to run; the shell stays after it"},
             "window": {"type": "integer", "description": "Window id (default: main window 0)"},
             "group": {"type": "string"},
@@ -31,11 +33,11 @@ fn tools() -> Value {
          "inputSchema": {"type": "object", "properties": {"id": id, "force": {"type": "boolean", "description": "Also close a pinned session"}}, "required": ["id"]}},
         {"name": "suspend_session", "description": "Put a session to sleep: the process is stopped, the row and a screen snapshot stay; wake_session brings it back.",
          "inputSchema": {"type": "object", "properties": {"id": id}, "required": ["id"]}},
-        {"name": "wake_session", "description": "Revive a suspended/exited session in place, resuming its Claude conversation by default.",
-         "inputSchema": {"type": "object", "properties": {"id": id, "claude": {"type": "boolean", "description": "Resume Claude (default true); false = plain shell"}}, "required": ["id"]}},
+        {"name": "wake_session", "description": "Revive a suspended/exited session in place, resuming its agent conversation by default.",
+         "inputSchema": {"type": "object", "properties": {"id": id, "claude": {"type": "boolean", "description": "Resume agent (default true); false = plain shell"}, "agent": {"type": "boolean", "description": "Alias for claude"}}, "required": ["id"]}},
         {"name": "focus_session", "description": "Show a session in its window and bring the window forward.",
          "inputSchema": {"type": "object", "properties": {"id": id}, "required": ["id"]}},
-        {"name": "rename_session", "description": "Set a session's display name; empty string resets to Claude's title.",
+        {"name": "rename_session", "description": "Set a session's display name; empty string resets to the agent's title.",
          "inputSchema": {"type": "object", "properties": {"id": id, "name": {"type": "string"}}, "required": ["id", "name"]}},
         {"name": "set_group", "description": "Move a session into a named group (created on demand); null or empty = ungrouped.",
          "inputSchema": {"type": "object", "properties": {"id": id, "group": {"type": ["string", "null"]}}, "required": ["id"]}},
@@ -57,18 +59,18 @@ fn tools() -> Value {
          "inputSchema": {"type": "object", "properties": {"id": id, "lines": {"type": "integer", "description": "Last N lines (default 60)"}}, "required": ["id"]}},
         {"name": "search", "description": "Case-insensitive text search in sessions' screen and scrollback (sleeping ones: their snapshot). Sessions with hits, count, up to 5 newest matching lines.",
          "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "id": {"type": "integer", "description": "Only this session"}}, "required": ["query"]}},
-        {"name": "read_transcript", "description": "The user/Claude messages of a Claude conversation (tail), for summaries: a kip session id, or sid for a past one.",
-         "inputSchema": {"type": "object", "properties": {"id": id, "sid": {"type": "string", "description": "Claude session id (from list_history)"}, "max_chars": {"type": "integer", "description": "Default 20000"}}}},
+        {"name": "read_transcript", "description": "The user/agent messages of a conversation (tail), for summaries: a kip session id, or sid for a past one.",
+         "inputSchema": {"type": "object", "properties": {"id": id, "sid": {"type": "string", "description": "Conversation id (from list_history)"}, "max_chars": {"type": "integer", "description": "Default 20000"}}}},
         {"name": "show_history", "description": "Open kip's history browser in a window, optionally with a search query and a conversation (sid) selected.",
          "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "sid": {"type": "string"}, "window": {"type": "integer"}}}},
-        {"name": "list_history", "description": "Past Claude conversations on disk, newest first: sid, title, first prompt, folder, branch, age, hits. query searches titles and message text. Continue one with open_session(cwd, resume=sid).",
+        {"name": "list_history", "description": "Past conversations on disk for the active agent, newest first: sid, title, first prompt, folder, branch, age, hits. query searches titles and message text. Continue one with open_session(cwd, resume=sid).",
          "inputSchema": {"type": "object", "properties": {
             "query": {"type": "string"},
             "cwd": {"type": "string", "description": "Only this folder and below"},
             "limit": {"type": "integer", "description": "Default 20"}}}},
         {"name": "send_input", "description": "Type text into a live session (Enter appended by default). Off unless enabled in kip settings.",
          "inputSchema": {"type": "object", "properties": {"id": id, "text": {"type": "string"}, "enter": {"type": "boolean"}}, "required": ["id", "text"]}},
-        {"name": "get_settings", "description": "All kip settings (font, theme, notifications, finished-session glow, idle suspend, group_by_project...).",
+        {"name": "get_settings", "description": "All kip settings (agent: claude|agy, font, theme, notifications, finished-session glow, idle suspend, group_by_project...).",
          "inputSchema": {"type": "object", "properties": {}}},
         {"name": "set_settings", "description": "Change kip settings: pass only the keys to change, names and value types as get_settings returns them.",
          "inputSchema": {"type": "object", "additionalProperties": true}},
@@ -159,36 +161,53 @@ fn claude_json() -> Option<std::path::PathBuf> {
     }
 }
 
-/// kip is registered as a user-scope MCP server in Claude Code.
-pub fn installed() -> bool {
-    claude_json()
-        .and_then(|p| std::fs::read(p).ok())
+fn agy_mcp_json() -> Option<std::path::PathBuf> {
+    Some(crate::session::agy_config_dir()?.join("mcp_config.json"))
+}
+
+/// kip is registered as a user-scope MCP server in the active CLI agent.
+pub fn installed(agent: Agent) -> bool {
+    let path = match agent {
+        Agent::Claude => claude_json(),
+        Agent::Agy => agy_mcp_json(),
+    };
+    path.and_then(|p| std::fs::read(p).ok())
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .is_some_and(|v| v["mcpServers"]["kip"].is_object())
 }
 
-/// Register this kip binary with Claude Code (`claude mcp add -s user kip`).
-pub fn install(claude_cmd: &str) -> Result<String, String> {
+/// Register this kip binary with Claude Code or Antigravity CLI.
+pub fn install(agent: Agent, cmd: &str) -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy();
     #[cfg(not(windows))]
     let out = {
         let q = format!("'{}'", exe.replace('\'', r"'\''"));
-        let script = format!("{claude_cmd} mcp remove -s user kip >/dev/null 2>&1; {claude_cmd} mcp add -s user kip -- {q} mcp");
+        let script = match agent {
+            Agent::Claude => format!("{cmd} mcp remove -s user kip >/dev/null 2>&1; {cmd} mcp add -s user kip -- {q} mcp"),
+            Agent::Agy => format!("{cmd} mcp remove kip >/dev/null 2>&1; {cmd} mcp add kip -- {q} mcp"),
+        };
         let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
         std::process::Command::new(sh).args(["-i", "-l", "-c", &script]).stdin(std::process::Stdio::null()).output()
     };
     #[cfg(windows)]
     let out = {
-        let script = format!("{claude_cmd} mcp remove -s user kip *> $null; {claude_cmd} mcp add -s user kip -- '{exe}' mcp");
+        let script = match agent {
+            Agent::Claude => format!("{cmd} mcp remove -s user kip *> $null; {cmd} mcp add -s user kip -- '{exe}' mcp"),
+            Agent::Agy => format!("{cmd} mcp remove kip *> $null; {cmd} mcp add kip -- '{exe}' mcp"),
+        };
         std::process::Command::new("powershell.exe").args(["-NoLogo", "-Command", &script]).output()
     };
     let out = out.map_err(|e| e.to_string())?;
-    if out.status.success() && installed() {
+    if out.status.success() && installed(agent) {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
         let err = String::from_utf8_lossy(&out.stderr);
-        let last = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("claude mcp add failed");
+        let fallback = match agent {
+            Agent::Claude => "claude mcp add failed",
+            Agent::Agy => "agy mcp add failed",
+        };
+        let last = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(fallback);
         Err(last.trim().to_string())
     }
 }

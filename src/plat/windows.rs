@@ -92,10 +92,26 @@ pub fn is_claude_proc(pid: i32) -> bool {
     process_path(pid).is_some_and(|p| p.to_ascii_lowercase().contains("claude"))
 }
 
-/// First process in `root`'s tree that looks like claude (claude may run
-/// behind a wrapper, so it can be a descendant rather than `root` itself).
-pub fn find_claude_desc(root: i32) -> Option<i32> {
-    if is_claude_proc(root) {
+/// Process looks like Antigravity CLI (`agy`) by its executable filename or path.
+pub fn is_agy_proc(pid: i32) -> bool {
+    process_path(pid).is_some_and(|p| {
+        let low = p.to_ascii_lowercase();
+        let base = low.rsplit(['\\', '/']).next().unwrap_or(&low);
+        base == "agy.exe" || base == "agy" || low.contains("antigravity-cli")
+    })
+}
+
+pub fn is_agent_proc(pid: i32, agent: crate::config::Agent) -> bool {
+    match agent {
+        crate::config::Agent::Claude => is_claude_proc(pid),
+        crate::config::Agent::Agy => is_agy_proc(pid),
+    }
+}
+
+/// First process in `root`'s tree matching `agent` (an agent may run behind a
+/// wrapper, so it can be a descendant rather than `root` itself).
+pub fn find_agent_desc(root: i32, agent: crate::config::Agent) -> Option<i32> {
+    if is_agent_proc(root, agent) {
         return Some(root);
     }
     let kids = children_map();
@@ -105,13 +121,19 @@ pub fn find_claude_desc(root: i32) -> Option<i32> {
         if !seen.insert(p) {
             continue;
         }
-        if p != root && is_claude_proc(p) {
+        if p != root && is_agent_proc(p, agent) {
             return Some(p);
         }
         if let Some(cs) = kids.get(&p) {
             stack.extend(cs);
         }
     }
+    None
+}
+
+/// Windows cannot inspect another process's open file handles without kernel
+/// handle tables; agy session binding falls back to cache files & hooks.
+pub fn agy_pid_conversation(_pid: i32) -> Option<String> {
     None
 }
 

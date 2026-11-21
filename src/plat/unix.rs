@@ -167,6 +167,13 @@ unsafe extern "C" {
         buffer: *mut libc::c_void,
         buffersize: libc::c_int,
     ) -> libc::c_int;
+    fn proc_pidfdinfo(
+        pid: libc::c_int,
+        fd: libc::c_int,
+        flavor: libc::c_int,
+        buffer: *mut libc::c_void,
+        buffersize: libc::c_int,
+    ) -> libc::c_int;
 }
 
 /// Current working directory of an arbitrary process (macOS, via PROC_PIDVNODEPATHINFO).
@@ -288,11 +295,29 @@ pub fn is_claude_proc(pid: i32) -> bool {
         || process_path(pid).is_some_and(|p| p.contains("claude"))
 }
 
-/// First process in `root`'s tree (including root itself) that looks like
-/// claude. Finds claude behind wrapper tools (session pickers like cchb spawn
-/// it as a child, so the PTY foreground leader is the wrapper, not claude).
-pub fn find_claude_desc(root: i32) -> Option<i32> {
-    if is_claude_proc(root) {
+/// Process looks like Antigravity CLI (`agy`) by exact binary name or path.
+pub fn is_agy_proc(pid: i32) -> bool {
+    let by_name = process_name(pid).is_some_and(|n| n.eq_ignore_ascii_case("agy"));
+    let by_path = process_path(pid).is_some_and(|p| {
+        let low = p.to_ascii_lowercase();
+        let base = low.rsplit('/').next().unwrap_or(&low);
+        base == "agy" || low.contains("antigravity-cli")
+    });
+    by_name || by_path
+}
+
+pub fn is_agent_proc(pid: i32, agent: crate::config::Agent) -> bool {
+    match agent {
+        crate::config::Agent::Claude => is_claude_proc(pid),
+        crate::config::Agent::Agy => is_agy_proc(pid),
+    }
+}
+
+/// First process in `root`'s tree (including root itself) matching `agent`.
+/// Finds the agent behind wrapper tools (session pickers spawn it as a child,
+/// so the PTY foreground leader is the wrapper, not the agent).
+pub fn find_agent_desc(root: i32, agent: crate::config::Agent) -> Option<i32> {
+    if is_agent_proc(root, agent) {
         return Some(root);
     }
     let out = Command::new("ps")
@@ -316,11 +341,101 @@ pub fn find_claude_desc(root: i32) -> Option<i32> {
         if !seen.insert(p) {
             continue;
         }
-        if p != root && is_claude_proc(p) {
+        if p != root && is_agent_proc(p, agent) {
             return Some(p);
         }
         if let Some(kids) = children.get(&p) {
             stack.extend(kids);
+        }
+    }
+    None
+}
+
+/// Extract a conversation UUID from an agy presence lock path like
+/// `.../.gemini/antigravity-cli/presence/<uuid>.lock`.
+fn parse_presence_lock(path: &str) -> Option<String> {
+    let rest = path.rsplit("/antigravity-cli/presence/").next()?;
+    if rest.len() == path.len() {
+        return None;
+    }
+    let sid = rest.strip_suffix(".lock")?;
+    crate::session::valid_sid(sid).then(|| sid.to_string())
+}
+
+/// PID-exact conversation ID for a running `agy` process: agy holds an open
+/// lock fd on `~/.gemini/antigravity-cli/presence/<conversation_id>.lock`.
+#[cfg(target_os = "macos")]
+pub fn agy_pid_conversation(pid: i32) -> Option<String> {
+    const PROC_PIDLISTFDS: libc::c_int = 1;
+    const PROX_FDTYPE_VNODE: u32 = 1;
+    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+    const VNODE_FDINFO_SIZE: usize = 1200;
+    const VIP_PATH_OFFSET: usize = 176;
+    const MAXPATHLEN: usize = 1024;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcFdInfo {
+        proc_fd: i32,
+        proc_fdtype: u32,
+    }
+
+    let bytes = unsafe { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if bytes <= 0 {
+        return None;
+    }
+    let cap = (bytes as usize / std::mem::size_of::<ProcFdInfo>()) + 16;
+    let mut fds = vec![ProcFdInfo { proc_fd: 0, proc_fdtype: 0 }; cap];
+    let ret = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr() as *mut libc::c_void,
+            (fds.len() * std::mem::size_of::<ProcFdInfo>()) as libc::c_int,
+        )
+    };
+    if ret <= 0 {
+        return None;
+    }
+    let count = (ret as usize) / std::mem::size_of::<ProcFdInfo>();
+    let mut buf = [0u8; VNODE_FDINFO_SIZE];
+    for fd in &fds[..count] {
+        if fd.proc_fdtype != PROX_FDTYPE_VNODE {
+            continue;
+        }
+        let n = unsafe {
+            proc_pidfdinfo(
+                pid,
+                fd.proc_fd,
+                PROC_PIDFDVNODEPATHINFO,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                VNODE_FDINFO_SIZE as libc::c_int,
+            )
+        };
+        if n <= VIP_PATH_OFFSET as libc::c_int {
+            continue;
+        }
+        let path_bytes = &buf[VIP_PATH_OFFSET..VIP_PATH_OFFSET + MAXPATHLEN];
+        let end = path_bytes.iter().position(|&b| b == 0).unwrap_or(MAXPATHLEN);
+        if end == 0 {
+            continue;
+        }
+        let path = String::from_utf8_lossy(&path_bytes[..end]);
+        if let Some(sid) = parse_presence_lock(&path) {
+            return Some(sid);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn agy_pid_conversation(pid: i32) -> Option<String> {
+    let rd = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    for entry in rd.flatten() {
+        let Ok(target) = std::fs::read_link(entry.path()) else { continue };
+        if let Some(sid) = parse_presence_lock(&target.to_string_lossy()) {
+            return Some(sid);
         }
     }
     None
@@ -418,5 +533,20 @@ pub fn open_path(path: &std::path::Path, reveal: bool) {
         std::thread::spawn(move || {
             let _ = child.wait();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_presence_lock;
+
+    #[test]
+    fn presence_lock_extracts_sid() {
+        assert_eq!(
+            parse_presence_lock("/Users/x/.gemini/antigravity-cli/presence/20b6db44-9e97-4895-9190-c51e17ad176f.lock").as_deref(),
+            Some("20b6db44-9e97-4895-9190-c51e17ad176f")
+        );
+        assert!(parse_presence_lock("/tmp/other.lock").is_none());
+        assert!(parse_presence_lock("/Users/x/.gemini/antigravity-cli/presence/../evil.lock").is_none());
     }
 }

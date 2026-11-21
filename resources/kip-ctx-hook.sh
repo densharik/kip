@@ -43,12 +43,24 @@ fi
 # Real window size: the transcript only has the bare model id, so kip's own
 # estimate cannot tell a 1M-context session from a 200k one without this.
 win=$(printf '%s' "$line" | sed -n 's/.*"context_window_size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+# Antigravity CLI (agy) also reports live agent_state ("idle", "working", "tool_use", ...).
+state=$(printf '%s' "$line" | sed -n 's/.*"agent_state"[[:space:]]*:[[:space:]]*"\([a-z_]*\)".*/\1/p')
 
-# ctx 0 = no data yet (claude still booting), not an actual 0% session.
+# Antigravity CLI quota snapshot (for kip's bottom-right limits chip).
+case "$line" in
+    *'"product"'*'"antigravity"'*'"quota"'*|*'"quota"'*'"product"'*'"antigravity"'*)
+        qtmp="${DIR}/agy-status.json.tmp.$$"
+        if (umask 077 && cp "$IN" "$qtmp") 2>/dev/null; then
+            mv -f "$qtmp" "${DIR}/agy-status.json" 2>/dev/null || rm -f "$qtmp" 2>/dev/null
+        fi
+        ;;
+esac
+
+# ctx 0 = no data yet (agent still booting), not an actual 0% session.
 if [ -n "$sid" ] && [ -n "$ctx" ] && [ "$ctx" != "0" ] && [ "$ctx" != "0.0" ]; then
     ts=$(date +%s)
-    snap="{\"session_id\":\"${sid}\",\"ctx\":${ctx},\"ts\":${ts}${win:+,\"win\":${win}}}"
-    # $PPID is the claude process: it invokes this as a single command, so the
+    snap="{\"session_id\":\"${sid}\",\"ctx\":${ctx},\"ts\":${ts}${win:+,\"win\":${win}}${state:+,\"state\":\"${state}\"}}"
+    # $PPID is the agent process: it invokes this as a single command, so the
     # intermediate shell execs away.
     for f in "${DIR}/by-sid/${sid}.json" "${DIR}/by-pid/${PPID}.json"; do
         tmp="${f}.tmp.$$"
@@ -56,6 +68,15 @@ if [ -n "$sid" ] && [ -n "$ctx" ] && [ "$ctx" != "0" ] && [ "$ctx" != "0.0" ]; t
             mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null
         fi
     done
+elif [ -n "$sid" ] && [ -n "$state" ]; then
+    # Before the first model turn (ctx=0), agy still has session_id and agent_state.
+    ts=$(date +%s)
+    snap="{\"session_id\":\"${sid}\",\"ctx\":0,\"ts\":${ts},\"state\":\"${state}\"}"
+    f="${DIR}/by-pid/${PPID}.json"
+    tmp="${f}.tmp.$$"
+    if printf '%s' "$snap" > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    fi
 fi
 
 run_prev

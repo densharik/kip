@@ -15,8 +15,8 @@ fn expand(path: &str) -> PathBuf {
     }
 }
 
-/// Plain user/Claude text of a transcript tail, oldest first.
-fn transcript_text(path: &std::path::Path, max_chars: usize) -> Option<String> {
+/// Plain user/agent text of a transcript tail, oldest first.
+fn transcript_text(path: &std::path::Path, max_chars: usize, agent: config::Agent) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
@@ -24,10 +24,11 @@ fn transcript_text(path: &std::path::Path, max_chars: usize) -> Option<String> {
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).ok()?;
     let mut out = String::new();
+    let bot = agent.short();
     for line in String::from_utf8_lossy(&buf).lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
         let Some((user, text)) = history::msg_text(&v) else { continue };
-        out.push_str(&format!("{}: {text}\n\n", if user { "User" } else { "Claude" }));
+        out.push_str(&format!("{}: {text}\n\n", if user { "User" } else { bot }));
     }
     if out.len() > max_chars {
         let cut = out.len() - max_chars;
@@ -58,9 +59,10 @@ impl App {
         }
     }
 
-    /// Past Claude conversations for MCP. Reading and searching them takes
+    /// Past agent conversations for MCP. Reading and searching them takes
     /// seconds, so it runs off the UI thread and answers the request itself.
     fn list_history(&self, req: ctl::Req) {
+        let agent = self.settings.agent;
         let open: std::collections::HashMap<String, u64> = self
             .sessions
             .iter()
@@ -70,7 +72,7 @@ impl App {
             // ctl gives up on a reply after 15s; the index read counts too.
             let deadline = Instant::now() + Duration::from_secs(10);
             let args = &req.args;
-            let entries = history::load_index();
+            let entries = history::load_index(agent);
             let scope = args["cwd"].as_str().map(expand);
             let q = args["query"].as_str().map(str::trim).filter(|q| !q.is_empty());
             let re = q.and_then(history::matcher);
@@ -90,7 +92,7 @@ impl App {
                             continue;
                         }
                     } else {
-                        hits = history::count_hits(&e.sid, re);
+                        hits = history::count_hits(agent, &e.sid, re);
                     }
                     if !named && hits == 0 {
                         continue;
@@ -154,6 +156,7 @@ impl App {
             "pinned": s.pinned,
             "on_screen": self.shown(s.id),
             "claude_session_id": s.claude_session_id,
+            "agent": s.effective_agent(&self.settings),
             "context_pct": ctx.map(|c| c.pct.round()),
             "idle_minutes": s.last_activity.elapsed().as_secs() / 60,
         })
@@ -186,8 +189,9 @@ impl App {
                 }
                 let k = self.win_index(args["window"].as_u64().unwrap_or(0))?;
                 let resume = args["resume"].as_str().filter(|s| session::valid_sid(s)).map(String::from);
-                let command = if args["claude"].as_bool() == Some(true) {
-                    let mut c = self.settings.claude_cmd.clone();
+                let start_agent = args["claude"].as_bool() == Some(true) || args["agent"].as_bool() == Some(true);
+                let command = if start_agent {
+                    let mut c = self.settings.agent.cmd(&self.settings).to_string();
                     if self.settings.skip_permissions_default {
                         c.push_str(" --dangerously-skip-permissions");
                     }
@@ -195,6 +199,7 @@ impl App {
                 } else {
                     args["command"].as_str().map(String::from)
                 };
+                let active_agent = self.settings.agent;
                 let id = self.in_window(k, |a| {
                     a.spawn(cwd, command.as_deref().map(keep_shell), ctx);
                     let id = a.w.active?;
@@ -208,10 +213,12 @@ impl App {
                         a.move_session(id, g, None);
                     }
                     if let Some(sid) = resume
-                        && let Some(idx) = a.idx_of(id) {
-                            a.sessions[idx].claude_session_id = Some(sid);
-                            a.resume(id, true, ctx);
-                        }
+                        && let Some(idx) = a.idx_of(id)
+                    {
+                        a.sessions[idx].claude_session_id = Some(sid);
+                        a.sessions[idx].session_agent = Some(active_agent);
+                        a.resume(id, true, ctx);
+                    }
                     a.persist();
                     Some(id)
                 });
@@ -238,7 +245,8 @@ impl App {
                 if !matches!(self.sessions[idx].phase, Phase::Live(_)) {
                     return Err("session is not running".into());
                 }
-                self.sessions[idx].suspend();
+                let agent = self.settings.agent;
+                self.sessions[idx].suspend(agent);
                 self.persist();
                 Ok(json!("suspended"))
             },
@@ -248,11 +256,13 @@ impl App {
                 if matches!(self.sessions[idx].phase, Phase::Live(_)) {
                     return Err("session is already running".into());
                 }
-                let claude = args["claude"].as_bool() != Some(false) && self.sessions[idx].claude_session_id.is_some();
+                let want = args["claude"].as_bool().or_else(|| args["agent"].as_bool()) != Some(false);
+                let with_agent = want && self.sessions[idx].claude_session_id.is_some();
+                let label = self.sessions[idx].effective_agent(&self.settings).short();
                 let k = self.win_of(id)?;
-                self.in_window(k, |a| a.resume(id, claude, ctx));
+                self.in_window(k, |a| a.resume(id, with_agent, ctx));
                 self.persist();
-                Ok(json!(if claude { "resumed with Claude" } else { "reopened as a shell" }))
+                Ok(json!(if with_agent { format!("resumed with {label}") } else { "reopened as a shell".into() }))
             },
             "focus_session" => {
                 let id = arg_id(args)?;
@@ -314,9 +324,10 @@ impl App {
                 Ok(json!({"window": self.sessions[idx].window}))
             },
             "save_state" => {
+                let agent = self.settings.agent;
                 for s in &mut self.sessions {
                     if matches!(s.phase, Phase::Live(_)) {
-                        s.save_claude_session();
+                        s.save_claude_session(agent);
                     }
                 }
                 self.save_now();
@@ -446,25 +457,30 @@ impl App {
                 Ok(Value::Array(found))
             },
             "read_transcript" => {
-                let path = match args["sid"].as_str() {
+                let (path, agent) = match args["sid"].as_str() {
                     // A sid from list_history may be newer than the jsonl map's last scan.
-                    Some(sid) => self
-                        .past
-                        .entries
-                        .iter()
-                        .find(|e| e.sid == sid)
-                        .map(|e| e.path.clone())
-                        .or_else(|| ctx_index::resolve_jsonl(&self.jsonl_map, sid, None))
-                        .or_else(|| ctx_index::scan_projects().remove(sid)),
+                    Some(sid) => {
+                        let agent = self.settings.agent;
+                        let p = self
+                            .past
+                            .entries
+                            .iter()
+                            .find(|e| e.sid == sid)
+                            .map(|e| e.path.clone())
+                            .or_else(|| ctx_index::resolve_jsonl(&self.jsonl_map, sid, None, agent))
+                            .or_else(|| ctx_index::scan_projects_for(agent).remove(sid));
+                        (p, agent)
+                    },
                     None => {
                         let s = &self.sessions[self.session_index(arg_id(args)?)?];
-                        let sid = s.claude_session_id.as_deref().ok_or("no Claude session in this terminal")?;
-                        ctx_index::resolve_jsonl(&self.jsonl_map, sid, Some(&s.cwd))
+                        let sid = s.claude_session_id.as_deref().ok_or("no agent session in this terminal")?;
+                        let agent = s.effective_agent(&self.settings);
+                        (ctx_index::resolve_jsonl(&self.jsonl_map, sid, Some(&s.cwd), agent), agent)
                     },
                 };
                 let path = path.ok_or("transcript not found")?;
                 let max = args["max_chars"].as_u64().unwrap_or(20_000) as usize;
-                transcript_text(&path, max).map(Value::String).ok_or_else(|| "cannot read transcript".into())
+                transcript_text(&path, max, agent).map(Value::String).ok_or_else(|| "cannot read transcript".into())
             },
             "send_input" => {
                 if !self.settings.mcp_send_input {
@@ -510,7 +526,8 @@ impl App {
                                 if remove {
                                     a.remove_session(i);
                                 } else {
-                                    a.sessions[i].suspend();
+                                    let agent = a.settings.agent;
+                                    a.sessions[i].suspend(agent);
                                     a.persist();
                                 }
                             }
@@ -544,9 +561,14 @@ impl App {
                     palette::apply(&self.settings.theme, self.settings.accent.map(rgb32));
                     apply_style(ctx);
                 }
-                // The statusline hook is installed by its own settings checkbox only.
+                // Statusline hooks are installed by their own settings checkbox only.
                 self.settings.ctx_hook = old.ctx_hook;
                 self.settings.prev_statusline = old.prev_statusline;
+                self.settings.agy_ctx_hook = old.agy_ctx_hook;
+                self.settings.agy_prev_statusline = old.agy_prev_statusline;
+                if old.agent != self.settings.agent {
+                    self.on_agent_changed(ctx);
+                }
                 self.persist();
                 ctx.request_repaint();
                 serde_json::to_value(&self.settings).map_err(|e| e.to_string())
@@ -558,9 +580,11 @@ impl App {
     pub(super) fn start_mcp_install(&mut self, ctx: &egui::Context) {
         self.mcp.busy = true;
         self.mcp.status = None;
-        let (tx, ctx, cmd) = (self.mcp_tx.clone(), ctx.clone(), self.settings.claude_cmd.clone());
+        let agent = self.settings.agent;
+        let cmd = agent.cmd(&self.settings).to_string();
+        let (tx, ctx) = (self.mcp_tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(McpMsg::Done(mcp::install(&cmd)));
+            let _ = tx.send(McpMsg::Done(mcp::install(agent, &cmd)));
             ctx.request_repaint();
         });
     }
@@ -568,14 +592,17 @@ impl App {
     pub(super) fn mcp_status_ui(&self, ui: &mut egui::Ui) {
         match &self.mcp.status {
             Some(Ok(_)) => {
-                ui.label(
-                    RichText::new(tr(
+                let msg = match self.settings.agent {
+                    config::Agent::Claude => tr(
                         "Готово. Новые сессии Claude Code увидят инструменты kip.",
                         "Done. New Claude Code sessions will see kip's tools.",
-                    ))
-                    .size(11.0)
-                    .color(GIT_ADD),
-                );
+                    ),
+                    config::Agent::Agy => tr(
+                        "Готово. Новые сессии Antigravity CLI увидят инструменты kip.",
+                        "Done. New Antigravity CLI sessions will see kip's tools.",
+                    ),
+                };
+                ui.label(RichText::new(msg).size(11.0).color(GIT_ADD));
             },
             Some(Err(e)) => {
                 ui.label(RichText::new(e).size(10.5).color(GIT_DEL));
@@ -591,20 +618,35 @@ impl App {
         let mut open = true;
         let mut install = false;
         let mut later = false;
-        egui::Window::new(tr("Подключить kip к Claude Code", "Connect kip to Claude Code"))
+        let (win_title, intro, add_cmd) = match self.settings.agent {
+            config::Agent::Claude => (
+                tr("Подключить kip к Claude Code", "Connect kip to Claude Code"),
+                tr(
+                    "Рекомендуем поставить MCP-сервер kip. Тогда Claude в любой сессии сможет управлять kip по вашей просьбе:",
+                    "We recommend installing kip's MCP server. Claude in any session can then manage kip when you ask:",
+                ),
+                "claude mcp add -s user kip",
+            ),
+            config::Agent::Agy => (
+                tr("Подключить kip к Antigravity CLI", "Connect kip to Antigravity CLI"),
+                tr(
+                    "Рекомендуем поставить MCP-сервер kip. Тогда agy в любой сессии сможет управлять kip по вашей просьбе:",
+                    "We recommend installing kip's MCP server. agy in any session can then manage kip when you ask:",
+                ),
+                "agy mcp add kip",
+            ),
+        };
+        egui::Window::new(win_title)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-16.0, -48.0))
             .show(ctx, |ui| {
                 ui.set_max_width(380.0);
-                ui.label(tr(
-                    "Рекомендуем поставить MCP-сервер kip. Тогда Claude в любой сессии сможет управлять kip по вашей просьбе:",
-                    "We recommend installing kip's MCP server. Claude in any session can then manage kip when you ask:",
-                ));
+                ui.label(intro);
                 for line in [
                     tr("видеть все сессии, их папки, статус и % контекста", "see all sessions, their folders, status and context %"),
-                    tr("открывать сессии в нужной папке и окне, сразу с Claude", "open sessions in a folder and window, with Claude started"),
+                    tr("открывать сессии в нужной папке и окне, сразу с агентом", "open sessions in a folder and window, with the agent started"),
                     tr("закрывать, усыплять и будить сессии", "close, suspend and wake sessions"),
                     tr("переименовывать, раскладывать по группам и окнам, закреплять", "rename, group, move between windows, pin"),
                     tr("читать экран и переписку сессии и делать саммари", "read a session's screen and conversation and summarize it"),
@@ -613,9 +655,16 @@ impl App {
                     ui.label(RichText::new(format!("- {line}")).size(11.5).color(palette::text_faint()));
                 }
                 ui.label(
-                    RichText::new(tr(
-                        "Компактно: 24 инструмента, около 2.1 тыс. токенов контекста. Ставится одной командой: claude mcp add -s user kip. Печатать в чужие сессии MCP не может, пока вы не разрешите это в настройках.",
-                        "Compact: 24 tools, about 2.1k tokens of context. Installs with one command: claude mcp add -s user kip. MCP cannot type into sessions unless you allow it in Settings.",
+                    RichText::new(format!(
+                        "{} {add_cmd}. {}",
+                        tr(
+                            "Компактно: 24 инструмента, около 2.1 тыс. токенов контекста. Ставится одной командой:",
+                            "Compact: 24 tools, about 2.1k tokens of context. Installs with one command:",
+                        ),
+                        tr(
+                            "Печатать в чужие сессии MCP не может, пока вы не разрешите это в настройках.",
+                            "MCP cannot type into sessions unless you allow it in Settings.",
+                        ),
                     ))
                     .size(10.5)
                     .color(palette::text_faint()),

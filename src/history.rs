@@ -1,12 +1,16 @@
-//! Past Claude Code conversations (~/.claude/projects/*/*.jsonl): an index
-//! cached in ~/.kip/history.json, a full-text search over them, and the
-//! message list for the preview.
+//! Past conversations (Claude Code `~/.claude/projects/*/*.jsonl` and
+//! Antigravity CLI `~/.gemini/antigravity-cli/brain/*/transcript.jsonl`): an
+//! index cached in ~/.kip/, a full-text search over them, and the message list
+//! for the preview.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::config::Agent;
+use crate::session::{agy_history_cwds, agy_meta_map, agy_strip_user_request, AgyConvMeta};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Entry {
@@ -29,13 +33,30 @@ impl Entry {
     }
 }
 
-fn cache_path() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".kip").join("history-2.json"))
+fn cache_path(agent: Agent) -> Option<PathBuf> {
+    let name = match agent {
+        Agent::Claude => "history-2.json",
+        Agent::Agy => "history-agy-1.json",
+    };
+    Some(dirs::home_dir()?.join(".kip").join(name))
 }
 
-/// The user's or Claude's text in one transcript line. None for tool calls and
-/// results, meta lines, subagents, and the tagged echoes of slash commands.
+/// The user's or agent's text in one transcript line (supports both Claude Code
+/// and Antigravity CLI transcripts). None for tool calls and results, meta
+/// lines, subagents, and the tagged echoes of slash commands.
 pub fn msg_text(v: &Value) -> Option<(bool, String)> {
+    match v["type"].as_str() {
+        Some("USER_INPUT") => {
+            let raw = v["content"].as_str()?;
+            let text = agy_strip_user_request(raw);
+            return (!text.is_empty()).then_some((true, text));
+        },
+        Some("PLANNER_RESPONSE") => {
+            let text = v["content"].as_str()?.trim();
+            return (!text.is_empty()).then_some((false, text.to_string()));
+        },
+        _ => {},
+    }
     let user = match v["type"].as_str() {
         Some("user") => true,
         Some("assistant") => false,
@@ -73,28 +94,36 @@ fn is_tagged(text: &str) -> bool {
 
 /// Plain conversation text per session, kept next to the index so a search
 /// reads ~1% of what the transcripts weigh (tool output and snapshots are the rest).
-fn text_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".kip").join("history-text"))
+fn text_dir(agent: Agent) -> Option<PathBuf> {
+    let name = match agent {
+        Agent::Claude => "history-text",
+        Agent::Agy => "history-agy-text",
+    };
+    Some(dirs::home_dir()?.join(".kip").join(name))
 }
 
 /// One pass over a transcript: cwd, branch, first prompt, title, and the
-/// user/Claude text. Only lines that can hold one of those get parsed.
+/// user/agent text. Only lines that can hold one of those get parsed.
 fn scan(path: &Path) -> (PathBuf, String, String, Option<String>, String) {
     let (mut cwd, mut branch, mut first, mut text) = (None, String::new(), String::new(), String::new());
     let (mut custom, mut ai) = (None, None);
     for_lines(path, |line| {
         let has = |pat: &[u8]| line.windows(pat.len()).any(|w| w == pat);
-        let talk = has(b"\"type\":\"user\"") || has(b"\"type\":\"assistant\"");
+        let talk = has(b"\"type\":\"user\"")
+            || has(b"\"type\":\"assistant\"")
+            || has(b"\"type\":\"USER_INPUT\"")
+            || has(b"\"type\":\"PLANNER_RESPONSE\"");
         let titled = has(b"-title\"");
         if !talk && !titled && cwd.is_some() {
             return;
         }
         let Ok(v) = serde_json::from_slice::<Value>(line) else { return };
         if cwd.is_none()
-            && let Some(c) = v["cwd"].as_str() {
-                cwd = Some(PathBuf::from(c));
-                branch = v["gitBranch"].as_str().unwrap_or_default().to_string();
-            }
+            && let Some(c) = v["cwd"].as_str()
+        {
+            cwd = Some(PathBuf::from(c));
+            branch = v["gitBranch"].as_str().unwrap_or_default().to_string();
+        }
         match v["type"].as_str() {
             Some("custom-title") => custom = v["customTitle"].as_str().map(String::from),
             Some("ai-title") => ai = v["aiTitle"].as_str().map(String::from),
@@ -112,35 +141,67 @@ fn scan(path: &Path) -> (PathBuf, String, String, Option<String>, String) {
     (cwd.unwrap_or_default(), branch, first, title, text)
 }
 
-fn read_entry(sid: String, path: PathBuf, mtime: u64, size: u64) -> Option<Entry> {
-    let (cwd, branch, first, title, text) = scan(&path);
+fn read_entry(
+    agent: Agent,
+    sid: String,
+    path: PathBuf,
+    mtime: u64,
+    size: u64,
+    agy_meta: Option<&AgyConvMeta>,
+    agy_cwd: Option<&PathBuf>,
+) -> Option<Entry> {
+    let (mut cwd, branch, mut first, mut title, text) = scan(&path);
+    if agent == Agent::Agy {
+        if let Some(m) = agy_meta {
+            if title.is_none() {
+                title = m.title.clone();
+            }
+            if first.is_empty()
+                && let Some(p) = &m.preview
+            {
+                first = p.clone();
+            }
+            if cwd.as_os_str().is_empty()
+                && let Some(c) = &m.cwd
+            {
+                cwd = c.clone();
+            }
+        }
+        if cwd.as_os_str().is_empty()
+            && let Some(c) = agy_cwd
+        {
+            cwd = c.clone();
+        }
+    }
     // A session that never got a prompt is noise in the list.
     if first.is_empty() && title.is_none() {
         return None;
     }
-    if let Some(dir) = text_dir() {
+    if let Some(dir) = text_dir(agent) {
         let _ = std::fs::write(dir.join(format!("{sid}.txt")), text);
     }
     Some(Entry { sid, path, cwd, branch, title, first, mtime, size })
 }
 
-/// All past conversations, newest first. Only files changed since the cached
-/// index are read again; the rest come from ~/.kip/history.json.
-pub fn load_index() -> Vec<Entry> {
-    let cached: HashMap<PathBuf, Entry> = cache_path()
+/// All past conversations for `agent`, newest first. Only files changed since
+/// the cached index are read again; the rest come from ~/.kip/.
+pub fn load_index(agent: Agent) -> Vec<Entry> {
+    let cached: HashMap<PathBuf, Entry> = cache_path(agent)
         .and_then(|p| std::fs::read(p).ok())
         .and_then(|b| serde_json::from_slice::<Vec<Entry>>(&b).ok())
         .unwrap_or_default()
         .into_iter()
         .map(|e| (e.path.clone(), e))
         .collect();
+    let agy_meta = if agent == Agent::Agy { agy_meta_map() } else { HashMap::new() };
+    let agy_cwds = if agent == Agent::Agy { agy_history_cwds() } else { HashMap::new() };
     let mut todo = Vec::new();
     let mut out = Vec::new();
-    let texts = text_dir();
+    let texts = text_dir(agent);
     if let Some(d) = &texts {
         let _ = std::fs::create_dir_all(d);
     }
-    for (sid, path) in crate::ctx_index::scan_projects() {
+    for (sid, path) in crate::ctx_index::scan_projects_for(agent) {
         let Ok(meta) = std::fs::metadata(&path) else { continue };
         let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
         let size = meta.len();
@@ -150,20 +211,50 @@ pub fn load_index() -> Vec<Entry> {
                     && e.size == size
                     && texts.as_ref().is_some_and(|d| d.join(format!("{sid}.txt")).exists()) =>
             {
-                out.push(e.clone())
+                let mut e = e.clone();
+                if agent == Agent::Agy {
+                    if let Some(m) = agy_meta.get(&sid) {
+                        if e.title.is_none() && m.title.is_some() {
+                            e.title = m.title.clone();
+                        }
+                        if e.cwd.as_os_str().is_empty()
+                            && let Some(c) = &m.cwd
+                        {
+                            e.cwd = c.clone();
+                        }
+                    }
+                    if e.cwd.as_os_str().is_empty()
+                        && let Some(c) = agy_cwds.get(&sid)
+                    {
+                        e.cwd = c.clone();
+                    }
+                }
+                out.push(e)
             },
             _ => todo.push((sid, path, mtime, size)),
         }
     }
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
     let chunk = todo.len().div_ceil(threads).max(1);
+    let agy_meta_ref = &agy_meta;
+    let agy_cwds_ref = &agy_cwds;
     std::thread::scope(|sc| {
         let parts: Vec<_> = todo
             .chunks(chunk)
             .map(|part| {
                 sc.spawn(move || {
                     part.iter()
-                        .filter_map(|(s, p, m, z)| read_entry(s.clone(), p.clone(), *m, *z))
+                        .filter_map(|(s, p, m, z)| {
+                            read_entry(
+                                agent,
+                                s.clone(),
+                                p.clone(),
+                                *m,
+                                *z,
+                                agy_meta_ref.get(s),
+                                agy_cwds_ref.get(s),
+                            )
+                        })
                         .collect::<Vec<_>>()
                 })
             })
@@ -182,7 +273,7 @@ pub fn load_index() -> Vec<Entry> {
             }
         }
     }
-    if let Some(p) = cache_path() {
+    if let Some(p) = cache_path(agent) {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -202,8 +293,8 @@ pub fn matcher(query: &str) -> Option<regex::Regex> {
 }
 
 /// How many times the query occurs in a session's conversation text.
-pub fn count_hits(sid: &str, re: &regex::Regex) -> usize {
-    text_dir()
+pub fn count_hits(agent: Agent, sid: &str, re: &regex::Regex) -> usize {
+    text_dir(agent)
         .and_then(|d| std::fs::read_to_string(d.join(format!("{sid}.txt"))).ok())
         .map_or(0, |t| re.find_iter(&t).count())
 }
@@ -226,7 +317,11 @@ pub fn messages(path: &Path, max: usize) -> Vec<(bool, String)> {
     let mut out = Vec::new();
     for_lines(path, |l| {
         let talk = |pat: &[u8]| l.windows(pat.len()).any(|w| w == pat);
-        if !talk(b"\"type\":\"user\"") && !talk(b"\"type\":\"assistant\"") {
+        if !talk(b"\"type\":\"user\"")
+            && !talk(b"\"type\":\"assistant\"")
+            && !talk(b"\"type\":\"USER_INPUT\"")
+            && !talk(b"\"type\":\"PLANNER_RESPONSE\"")
+        {
             return;
         }
         if let Some(m) = serde_json::from_slice::<Value>(l).ok().and_then(|v| msg_text(&v)) {
@@ -262,6 +357,13 @@ mod tests {
         assert!(msg_text(&html).is_some());
         let meta = json!({"type": "user", "isMeta": true, "message": {"content": "x"}});
         assert_eq!(msg_text(&meta), None);
+        // Antigravity CLI transcript lines.
+        let agy_u = json!({"type": "USER_INPUT", "content": "<USER_REQUEST>\nПривет\n</USER_REQUEST>\n<ADDITIONAL_METADATA>t</ADDITIONAL_METADATA>"});
+        assert_eq!(msg_text(&agy_u), Some((true, "Привет".into())));
+        let agy_a = json!({"type": "PLANNER_RESPONSE", "content": "Ответ"});
+        assert_eq!(msg_text(&agy_a), Some((false, "Ответ".into())));
+        let agy_tool = json!({"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command"}]});
+        assert_eq!(msg_text(&agy_tool), None);
     }
 
     #[test]

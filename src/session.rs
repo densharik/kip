@@ -15,7 +15,7 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config as TermConfig, Term};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 
-use crate::config::{SavedSession, Settings};
+use crate::config::{Agent, SavedSession, Settings};
 
 #[derive(Clone)]
 pub struct EventProxy {
@@ -104,6 +104,8 @@ pub struct Session {
     pub last_activity: Instant,
     pub spawned_at: SystemTime,
     pub claude_session_id: Option<String>,
+    /// Which CLI agent owns `claude_session_id` (None on legacy saves = Claude).
+    pub session_agent: Option<Agent>,
     pub skip_permissions: bool,
     pub keep_awake: bool,
     /// Pinned = protected: cannot be dragged, closed by mistake, or auto-suspended.
@@ -181,21 +183,35 @@ impl Session {
         }
     }
 
+    /// Which agent this session belongs to: its own captured agent, else Claude
+    /// for legacy sessions that already carry an id, else the global setting.
+    pub fn effective_agent(&self, settings: &Settings) -> Agent {
+        self.session_agent.unwrap_or(if self.claude_session_id.is_some() {
+            Agent::Claude
+        } else {
+            settings.agent
+        })
+    }
+
     pub fn resume_command(&self, settings: &Settings) -> Option<String> {
         let id = self.claude_session_id.as_ref().filter(|s| valid_sid(s))?;
-        let mut cmd = format!("{} --resume {}", settings.claude_cmd, id);
+        let agent = self.effective_agent(settings);
+        let mut cmd = match agent {
+            Agent::Claude => format!("{} --resume {}", settings.claude_cmd, id),
+            Agent::Agy => format!("{} --conversation {}", settings.agy_cmd, id),
+        };
         if self.skip_permissions {
             cmd.push_str(" --dangerously-skip-permissions");
         }
         Some(cmd)
     }
 
-    /// Remember the Claude session of THIS terminal. Only a pid-exact match
-    /// (the claude process in this PTY's foreground) may overwrite an already
+    /// Remember the agent session of THIS terminal. Only a pid-exact match
+    /// (the agent process in this PTY's foreground) may overwrite an already
     /// captured id - several sessions in the same directory must never converge
     /// on whichever transcript happens to be newest.
-    pub fn save_claude_session(&mut self) {
-        // Only a foreground process that is NOT the shell itself can be claude.
+    pub fn save_claude_session(&mut self, agent: Agent) {
+        // Only a foreground process that is NOT the shell itself can be the agent.
         // Without this filter an idle terminal still scanned the whole sessions
         // directory looking for a pid-exact hit that cannot exist - wasted work
         // on the UI thread, which runs this for every session on suspend and on
@@ -203,35 +219,60 @@ impl Session {
         let fg_pid = self.live().and_then(|l| {
             crate::plat::foreground_pgid(l.master_fd, l.shell_pid).filter(|pg| *pg != l.shell_pid)
         });
-        let hit = fg_pid
-            .and_then(|_| find_claude_meta(&self.cwd, None, fg_pid, self.spawned_at))
-            .filter(|m| m.score >= 3);
-        if let Some(m) = hit {
-            self.claude_session_id = Some(m.session_id);
-            if m.name.is_some() {
-                self.claude_title = m.name;
-            }
-        } else if self.claude_session_id.is_none() && self.saw_claude {
-            // Newest-jsonl fallback only when claude actually ran here - otherwise
-            // it would happily adopt a session started from some other terminal.
-            if let Some(id) = detect_claude_session(&self.cwd, Some(self.spawned_at)) {
-                self.claude_session_id = Some(id);
-            }
+        match agent {
+            Agent::Claude => {
+                let hit = fg_pid
+                    .and_then(|_| find_claude_meta(&self.cwd, None, fg_pid, self.spawned_at))
+                    .filter(|m| m.score >= 3);
+                if let Some(m) = hit {
+                    self.claude_session_id = Some(m.session_id);
+                    self.session_agent = Some(Agent::Claude);
+                    if m.name.is_some() {
+                        self.claude_title = m.name;
+                    }
+                } else if self.claude_session_id.is_none() && self.saw_claude {
+                    // Newest-jsonl fallback only when claude actually ran here - otherwise
+                    // it would happily adopt a session started from some other terminal.
+                    if let Some(id) = detect_claude_session(&self.cwd, Some(self.spawned_at)) {
+                        self.claude_session_id = Some(id);
+                        self.session_agent = Some(Agent::Claude);
+                    }
+                }
+            },
+            Agent::Agy => {
+                let pid_sid = self
+                    .claude_pid
+                    .or(fg_pid)
+                    .and_then(crate::plat::agy_pid_conversation);
+                if let Some(sid) = pid_sid {
+                    self.claude_session_id = Some(sid.clone());
+                    self.session_agent = Some(Agent::Agy);
+                    if let Some(t) = agy_title_for_sid(&sid) {
+                        self.claude_title = Some(t);
+                    }
+                } else if self.claude_session_id.is_none()
+                    && self.saw_claude
+                    && let Some(id) = detect_agy_session(&self.cwd, Some(self.spawned_at))
+                {
+                    self.claude_session_id = Some(id);
+                    self.session_agent = Some(Agent::Agy);
+                }
+            },
         }
     }
 
     /// Kill the child and free terminal memory, keeping a text snapshot.
-    pub fn suspend(&mut self) {
+    pub fn suspend(&mut self, agent: Agent) {
         if let Phase::Live(live) = &self.phase {
             self.snapshot = Some(grab_snapshot(&live.term));
-            self.save_claude_session();
+            self.save_claude_session(agent);
             self.phase = Phase::Suspended;
         }
         self.busy = false;
         self.busy_since = None;
     }
 
-    pub fn finalize_exit(&mut self, code: Option<i32>) {
+    pub fn finalize_exit(&mut self, code: Option<i32>, agent: Agent) {
         // The shell exited on its own and alacritty already reaped it, so its
         // pid may now belong to an unrelated process; disarm the kill in
         // LiveTerm::Drop (its children have reparented to launchd anyway).
@@ -240,7 +281,7 @@ impl Session {
         }
         if let Phase::Live(live) = &self.phase {
             self.snapshot = Some(grab_snapshot(&live.term));
-            self.save_claude_session();
+            self.save_claude_session(agent);
             self.phase = Phase::Exited(code);
         }
         self.busy = false;
@@ -254,6 +295,7 @@ impl Session {
         SavedSession {
             cwd: self.cwd.clone(),
             claude_session_id: self.claude_session_id.clone(),
+            session_agent: self.session_agent,
             claude_title: self.claude_title.clone(),
             custom_name: self.custom_name.clone(),
             group: self.group.clone(),
@@ -277,7 +319,10 @@ impl Session {
             .claude_session_id
             .as_deref()
             .filter(|s| valid_sid(s))
-            .and_then(|sid| transcript_title(&project_dir(&saved.cwd)?.join(format!("{sid}.jsonl"))));
+            .and_then(|sid| match saved.session_agent {
+                Some(Agent::Agy) => agy_title_for_sid(sid),
+                _ => transcript_title(&project_dir(&saved.cwd)?.join(format!("{sid}.jsonl"))),
+            });
         Session {
             id,
             window: saved.window,
@@ -290,6 +335,7 @@ impl Session {
             last_activity: Instant::now(),
             spawned_at: SystemTime::now(),
             claude_session_id: saved.claude_session_id,
+            session_agent: saved.session_agent,
             skip_permissions: saved.skip_permissions,
             keep_awake: saved.keep_awake,
             pinned: saved.pinned,
@@ -452,29 +498,38 @@ fn valid_uuid(s: &str) -> bool {
         })
 }
 
-/// Parse a typed command or a process argv for a claude resume target. The id
-/// is known the moment the user hits Enter - no need to wait for claude.
-pub fn parse_resume_hint(cmd: &str) -> Option<ResumeHint> {
+/// Parse a typed command or a process argv for an agent resume target. The id
+/// is known the moment the user hits Enter - no need to wait for the agent.
+pub fn parse_resume_hint(cmd: &str, agent: Agent) -> Option<ResumeHint> {
     let tokens: Vec<&str> = cmd.split_whitespace().collect();
-    // Only a command that actually launches claude counts (not `echo claude ...`).
+    // Only a command that actually launches the agent counts (not `echo claude ...`).
     let first = tokens.first()?;
-    if !first.rsplit('/').next().unwrap_or(first).contains("claude") {
+    let base = first.rsplit(['/', '\\']).next().unwrap_or(first).to_ascii_lowercase();
+    let ok = match agent {
+        Agent::Claude => base.contains("claude"),
+        Agent::Agy => base == "agy" || base == "agy.exe",
+    };
+    if !ok {
         return None;
     }
-    resume_from_tokens(&tokens)
+    resume_from_tokens(&tokens, agent)
 }
 
-/// argv of a VERIFIED claude process: no first-token check - the binary's
-/// basename is a bare version number (".../claude/versions/2.1.217"), and
+/// argv of a VERIFIED agent process: no first-token check - the binary's
+/// basename may be a bare version number (".../claude/versions/2.1.217"), and
 /// wrappers may exec it under any argv0.
-pub fn parse_resume_hint_argv(cmd: &str) -> Option<ResumeHint> {
-    resume_from_tokens(&cmd.split_whitespace().collect::<Vec<_>>())
+pub fn parse_resume_hint_argv(cmd: &str, agent: Agent) -> Option<ResumeHint> {
+    resume_from_tokens(&cmd.split_whitespace().collect::<Vec<_>>(), agent)
 }
 
-fn resume_from_tokens(tokens: &[&str]) -> Option<ResumeHint> {
+fn resume_from_tokens(tokens: &[&str], agent: Agent) -> Option<ResumeHint> {
     for (i, t) in tokens.iter().enumerate() {
         match *t {
             "--resume" | "-r" => {
+                let sid = tokens.get(i + 1).filter(|s| valid_uuid(s))?;
+                return Some(ResumeHint::Sid(sid.to_string()));
+            },
+            "--conversation" if agent == Agent::Agy => {
                 let sid = tokens.get(i + 1).filter(|s| valid_uuid(s))?;
                 return Some(ResumeHint::Sid(sid.to_string()));
             },
@@ -482,6 +537,7 @@ fn resume_from_tokens(tokens: &[&str]) -> Option<ResumeHint> {
             _ => {
                 let sid = t
                     .strip_prefix("--resume=")
+                    .or_else(|| (agent == Agent::Agy).then(|| t.strip_prefix("--conversation=")).flatten())
                     .or_else(|| t.strip_prefix("-r"))
                     .filter(|s| valid_uuid(s));
                 if let Some(sid) = sid {
@@ -498,6 +554,248 @@ pub(crate) fn claude_dir() -> Option<PathBuf> {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
+}
+
+/// Antigravity CLI data dir: ~/.gemini/antigravity-cli.
+pub(crate) fn agy_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".gemini").join("antigravity-cli"))
+}
+
+/// Antigravity shared config dir: ~/.gemini/config (mcp_config.json, hooks.json).
+pub(crate) fn agy_config_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".gemini").join("config"))
+}
+
+/// Transcript file of one Antigravity CLI conversation.
+pub(crate) fn agy_transcript_path(sid: &str) -> Option<PathBuf> {
+    valid_sid(sid).then(|| {
+        agy_dir()
+            .map(|d| d.join("brain").join(sid).join(".system_generated").join("logs").join("transcript.jsonl"))
+    })?
+}
+
+/// Decode a `file:///path/to/dir` workspace URI from agy metadata into a PathBuf.
+pub(crate) fn agy_uri_to_path(uri: &str) -> PathBuf {
+    let raw = uri.strip_prefix("file://").unwrap_or(uri);
+    let mut bytes = Vec::with_capacity(raw.len());
+    let b = raw.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(hex) = std::str::from_utf8(&b[i + 1..i + 3])
+            && let Ok(val) = u8::from_str_radix(hex, 16)
+        {
+            bytes.push(val);
+            i += 3;
+            continue;
+        }
+        bytes.push(b[i]);
+        i += 1;
+    }
+    let decoded = String::from_utf8_lossy(&bytes);
+    // Windows file URIs look like file:///C:/work -> strip leading slash before drive letter.
+    let s = if decoded.len() >= 3
+        && decoded.as_bytes()[0] == b'/'
+        && decoded.as_bytes()[1].is_ascii_alphabetic()
+        && decoded.as_bytes()[2] == b':'
+    {
+        &decoded[1..]
+    } else {
+        decoded.as_ref()
+    };
+    PathBuf::from(s)
+}
+
+/// Strip Antigravity's `<USER_REQUEST>...</USER_REQUEST>` prompt envelope from
+/// a transcript `USER_INPUT` content string.
+pub(crate) fn agy_strip_user_request(content: &str) -> String {
+    if let Some(start) = content.find("<USER_REQUEST>") {
+        let rest = &content[start + "<USER_REQUEST>".len()..];
+        let body = match rest.find("</USER_REQUEST>") {
+            Some(end) => &rest[..end],
+            None => rest,
+        };
+        return body.trim().to_string();
+    }
+    content.trim().to_string()
+}
+
+pub(crate) struct AgyConvMeta {
+    pub title: Option<String>,
+    pub preview: Option<String>,
+    pub cwd: Option<PathBuf>,
+}
+
+/// Cached conversation summaries written by agy (`cache/conversation_metadata.json`).
+pub(crate) fn agy_meta_map() -> HashMap<String, AgyConvMeta> {
+    let mut out = HashMap::new();
+    let Some(path) = agy_dir().map(|d| d.join("cache").join("conversation_metadata.json")) else {
+        return out;
+    };
+    let Ok(text) = std::fs::read_to_string(path) else { return out };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return out };
+    let Some(convs) = v["conversations"].as_object() else { return out };
+    for (sid, entry) in convs {
+        if !valid_sid(sid) {
+            continue;
+        }
+        let sum = &entry["summary"];
+        let title = sum["Title"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+        let preview = sum["Preview"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+        let cwd = sum["WorkspaceURIs"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|u| u.as_str())
+            .filter(|s| !s.is_empty())
+            .map(agy_uri_to_path);
+        out.insert(sid.clone(), AgyConvMeta { title, preview, cwd });
+    }
+    out
+}
+
+/// Workspace map from agy's append-only `history.jsonl` (covers brand-new
+/// conversations not yet flushed to `conversation_metadata.json`).
+pub(crate) fn agy_history_cwds() -> HashMap<String, PathBuf> {
+    let mut out = HashMap::new();
+    let Some(path) = agy_dir().map(|d| d.join("history.jsonl")) else { return out };
+    let Ok(text) = std::fs::read_to_string(path) else { return out };
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Some(sid) = v["conversationId"].as_str().filter(|s| valid_sid(s)) else { continue };
+        let Some(ws) = v["workspace"].as_str().filter(|s| !s.is_empty()) else { continue };
+        out.insert(sid.to_string(), PathBuf::from(ws));
+    }
+    out
+}
+
+fn agy_transcript_first_prompt(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; 32 * 1024];
+    let n = f.read(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf[..n]);
+    for line in text.lines() {
+        if !line.contains("\"USER_INPUT\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v["type"].as_str() != Some("USER_INPUT") {
+            continue;
+        }
+        let raw = v["content"].as_str()?;
+        let clean = agy_strip_user_request(raw);
+        let first = clean.lines().next().unwrap_or("").trim();
+        if !first.is_empty() {
+            return Some(first.chars().take(80).collect());
+        }
+    }
+    None
+}
+
+/// Best available title for an agy conversation: live statusline hook title
+/// (when matching sid), else metadata Title/Preview, else first user prompt.
+pub(crate) fn agy_title_for_sid(sid: &str) -> Option<String> {
+    if let Some(p) = crate::ctx_index::agy_status_path()
+        && let Ok(text) = std::fs::read_to_string(p)
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+        && v["session_id"].as_str() == Some(sid)
+        && let Some(t) = v["conversation_title"].as_str().map(str::trim).filter(|s| !s.is_empty())
+    {
+        return Some(t.to_string());
+    }
+    if let Some(m) = agy_meta_map().remove(sid)
+        && let Some(t) = m.title.or(m.preview)
+    {
+        return Some(t);
+    }
+    agy_transcript_path(sid).and_then(|p| agy_transcript_first_prompt(&p))
+}
+
+/// Derive agy's turn status ("busy" vs "idle") from the tail of transcript.jsonl:
+/// a final PLANNER_RESPONSE without tool_calls means the turn finished.
+pub(crate) fn agy_transcript_status(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 64 * 1024;
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    for line in text.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let kind = v["type"].as_str()?;
+        let done = v["status"].as_str() == Some("DONE");
+        let has_tools = v["tool_calls"].as_array().is_some_and(|a| !a.is_empty());
+        let has_content = v["content"].as_str().is_some_and(|c| !c.trim().is_empty());
+        return if kind == "PLANNER_RESPONSE" && done && !has_tools && has_content {
+            Some("idle".into())
+        } else {
+            Some("busy".into())
+        };
+    }
+    None
+}
+
+/// Detect the newest Antigravity CLI conversation for `cwd`.
+pub fn detect_agy_session(cwd: &Path, only_after: Option<SystemTime>) -> Option<String> {
+    let cwd_str = cwd.to_string_lossy();
+    let fresh = |sid: &str| -> bool {
+        let Some(after) = only_after else { return true };
+        let t_ok = agy_transcript_path(sid)
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok())
+            .is_some_and(|mt| mt >= after);
+        if t_ok {
+            return true;
+        }
+        agy_dir()
+            .map(|d| d.join("presence").join(format!("{sid}.lock")))
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok())
+            .is_some_and(|mt| mt >= after)
+    };
+    if let Some(path) = agy_dir().map(|d| d.join("cache").join("last_conversations.json"))
+        && let Ok(text) = std::fs::read_to_string(path)
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(sid) = v[cwd_str.as_ref()].as_str().filter(|s| valid_sid(s))
+        && fresh(sid)
+    {
+        return Some(sid.to_string());
+    }
+    let after_ms = only_after
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64);
+    if let Some(path) = agy_dir().map(|d| d.join("history.jsonl"))
+        && let Ok(text) = std::fs::read_to_string(path)
+    {
+        for line in text.lines().rev() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            let Some(sid) = v["conversationId"].as_str().filter(|s| valid_sid(s)) else { continue };
+            if v["workspace"].as_str() != Some(cwd_str.as_ref()) {
+                continue;
+            }
+            if let Some(min_ms) = after_ms
+                && v["timestamp"].as_u64().is_some_and(|ts| ts < min_ms)
+            {
+                continue;
+            }
+            return Some(sid.to_string());
+        }
+    }
+    None
+}
+
+pub fn detect_agent_session(cwd: &Path, only_after: Option<SystemTime>, agent: Agent) -> Option<String> {
+    match agent {
+        Agent::Claude => detect_claude_session(cwd, only_after),
+        Agent::Agy => detect_agy_session(cwd, only_after),
+    }
 }
 
 /// ~/.claude/projects directory for a cwd (Claude Code path encoding).
@@ -550,39 +848,75 @@ pub struct ClaudeInfo {
     pub status: Option<String>,
 }
 
-/// Resolve the Claude session running in a terminal (via ~/.claude/sessions
-/// metadata, matched by claude pid, then saved id, then cwd) and read its
-/// name and id. `fg_pid` is the PTY foreground leader; the real claude may be
-/// its descendant (wrappers like cchb) - resolved here, in the background.
+/// Resolve the active agent session running in a terminal and read its name,
+/// id, and turn status. `fg_pid` is the PTY foreground leader; the real agent
+/// may be its descendant (wrappers) - resolved here, in the background.
+#[allow(clippy::too_many_arguments)]
 pub fn poll_claude(
     id: u64,
     cwd: PathBuf,
     spawned_at: SystemTime,
     known_id: Option<String>,
     fg_pid: Option<i32>,
+    agent: Agent,
     tx: Sender<(u64, ClaudeInfo)>,
     ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
-        let cpid = fg_pid.and_then(crate::plat::find_claude_desc);
-        let meta = find_claude_meta(&cwd, known_id.as_deref(), cpid, spawned_at);
-        // A cwd-only guess (score 1) may be another terminal's session:
-        // good enough to display, never good enough to overwrite the saved id.
-        let (mut store_sid, name) = match meta {
-            Some(m) => ((m.score >= 2).then(|| m.session_id.clone()), m.name),
-            None => (None, None),
-        };
-        // The claude argv may carry the resumed id (alias/scripts/wrappers), pid-exact.
-        match cpid.and_then(crate::plat::process_args).and_then(|a| parse_resume_hint_argv(&a)) {
-            Some(ResumeHint::Sid(sid)) => store_sid = Some(sid),
-            Some(ResumeHint::Latest) => {
-                if let Some(sid) = detect_claude_session(&cwd, None) {
-                    store_sid = Some(sid);
+        let info = match agent {
+            Agent::Claude => {
+                let cpid = fg_pid.and_then(|p| crate::plat::find_agent_desc(p, Agent::Claude));
+                let meta = find_claude_meta(&cwd, known_id.as_deref(), cpid, spawned_at);
+                // A cwd-only guess (score 1) may be another terminal's session:
+                // good enough to display, never good enough to overwrite the saved id.
+                let (mut store_sid, name) = match meta {
+                    Some(m) => ((m.score >= 2).then(|| m.session_id.clone()), m.name),
+                    None => (None, None),
+                };
+                // The claude argv may carry the resumed id (alias/scripts/wrappers), pid-exact.
+                match cpid
+                    .and_then(crate::plat::process_args)
+                    .and_then(|a| parse_resume_hint_argv(&a, Agent::Claude))
+                {
+                    Some(ResumeHint::Sid(sid)) => store_sid = Some(sid),
+                    Some(ResumeHint::Latest) => {
+                        if let Some(sid) = detect_claude_session(&cwd, None) {
+                            store_sid = Some(sid);
+                        }
+                    },
+                    None => {},
                 }
+                ClaudeInfo { session_id: store_sid, name, claude_pid: cpid, status: None }
             },
-            None => {},
-        }
-        if tx.send((id, ClaudeInfo { session_id: store_sid, name, claude_pid: cpid, status: None })).is_ok() {
+            Agent::Agy => {
+                let cpid = fg_pid.and_then(|p| crate::plat::find_agent_desc(p, Agent::Agy));
+                let mut store_sid = cpid.and_then(crate::plat::agy_pid_conversation);
+                if store_sid.is_none() {
+                    match cpid
+                        .and_then(crate::plat::process_args)
+                        .and_then(|a| parse_resume_hint_argv(&a, Agent::Agy))
+                    {
+                        Some(ResumeHint::Sid(sid)) => store_sid = Some(sid),
+                        Some(ResumeHint::Latest) => store_sid = detect_agy_session(&cwd, None),
+                        None => {},
+                    }
+                }
+                if store_sid.is_none() && cpid.is_some() {
+                    store_sid = detect_agy_session(&cwd, Some(spawned_at));
+                }
+                let lookup_sid = store_sid.as_deref().or(known_id.as_deref());
+                let name = lookup_sid.and_then(agy_title_for_sid);
+                let status = if cpid.is_some() {
+                    lookup_sid
+                        .and_then(agy_transcript_path)
+                        .and_then(|p| agy_transcript_status(&p))
+                } else {
+                    None
+                };
+                ClaudeInfo { session_id: store_sid, name, claude_pid: cpid, status }
+            },
+        };
+        if tx.send((id, info)).is_ok() {
             ctx.request_repaint();
         }
     });
@@ -779,7 +1113,7 @@ mod tests {
     const SID: &str = "11111111-2222-3333-4444-555555555555";
 
     fn sid_of(cmd: &str) -> Option<String> {
-        match parse_resume_hint(cmd) {
+        match parse_resume_hint(cmd, Agent::Claude) {
             Some(ResumeHint::Sid(s)) => Some(s),
             _ => None,
         }
@@ -790,20 +1124,35 @@ mod tests {
         assert_eq!(sid_of(&format!("claude --resume {SID}")).as_deref(), Some(SID));
         assert_eq!(sid_of(&format!("claude -r{SID}")).as_deref(), Some(SID));
         assert_eq!(sid_of(&format!("claude --resume={SID} -x")).as_deref(), Some(SID));
-        assert!(matches!(parse_resume_hint("claude --continue"), Some(ResumeHint::Latest)));
+        assert!(matches!(parse_resume_hint("claude --continue", Agent::Claude), Some(ResumeHint::Latest)));
+    }
+
+    #[test]
+    fn resume_hint_agy_forms() {
+        assert!(matches!(
+            parse_resume_hint(&format!("agy --conversation {SID}"), Agent::Agy),
+            Some(ResumeHint::Sid(s)) if s == SID
+        ));
+        assert!(matches!(
+            parse_resume_hint(&format!("/Users/x/.local/bin/agy --conversation={SID}"), Agent::Agy),
+            Some(ResumeHint::Sid(s)) if s == SID
+        ));
+        assert!(matches!(parse_resume_hint("agy -c", Agent::Agy), Some(ResumeHint::Latest)));
+        assert!(parse_resume_hint(&format!("echo agy --conversation {SID}"), Agent::Agy).is_none());
+        assert!(parse_resume_hint(&format!("claude --resume {SID}"), Agent::Agy).is_none());
     }
 
     #[test]
     fn resume_hint_rejects_search_term() {
         // --resume also takes a picker search term - never a session id.
-        assert!(parse_resume_hint("claude --resume fix-the-bug").is_none());
+        assert!(parse_resume_hint("claude --resume fix-the-bug", Agent::Claude).is_none());
         // Clipped argv: a truncated uuid must not pass.
-        assert!(parse_resume_hint(&format!("claude --resume {}", &SID[..20])).is_none());
+        assert!(parse_resume_hint(&format!("claude --resume {}", &SID[..20]), Agent::Claude).is_none());
     }
 
     #[test]
     fn resume_hint_requires_claude_command() {
-        assert!(parse_resume_hint(&format!("echo claude --resume {SID}")).is_none());
+        assert!(parse_resume_hint(&format!("echo claude --resume {SID}"), Agent::Claude).is_none());
         assert_eq!(sid_of(&format!("/usr/local/bin/claude -r {SID}")).as_deref(), Some(SID));
     }
 
@@ -812,8 +1161,57 @@ mod tests {
         // The claude binary's basename is a bare version number; the typed-command
         // parser rejects it, the argv parser (verified claude process) must not.
         let argv = format!("/Users/x/.local/share/claude/versions/2.1.217 --resume {SID}");
-        assert!(parse_resume_hint(&argv).is_none());
-        assert!(matches!(parse_resume_hint_argv(&argv), Some(ResumeHint::Sid(s)) if s == SID));
+        assert!(parse_resume_hint(&argv, Agent::Claude).is_none());
+        assert!(matches!(parse_resume_hint_argv(&argv, Agent::Claude), Some(ResumeHint::Sid(s)) if s == SID));
+    }
+
+    #[test]
+    fn agy_helpers_parse_uris_and_requests() {
+        assert_eq!(agy_uri_to_path("file:///Users/a/my%20repo"), PathBuf::from("/Users/a/my repo"));
+        assert_eq!(agy_uri_to_path("file:///C:/work/app"), PathBuf::from("C:/work/app"));
+        assert_eq!(
+            agy_strip_user_request("<USER_REQUEST>\nПривет\n</USER_REQUEST>\n<ADDITIONAL_METADATA>x</ADDITIONAL_METADATA>"),
+            "Привет"
+        );
+        let p = std::env::temp_dir().join(format!("kip-agy-st-{}.jsonl", std::process::id()));
+        std::fs::write(&p, "{\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"content\":\"hi\"}\n").unwrap();
+        assert_eq!(agy_transcript_status(&p).as_deref(), Some("busy"));
+        std::fs::write(
+            &p,
+            "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"tool_calls\":[{\"name\":\"run_command\"}]}\n",
+        )
+        .unwrap();
+        assert_eq!(agy_transcript_status(&p).as_deref(), Some("busy"));
+        std::fs::write(
+            &p,
+            "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Done!\"}\n",
+        )
+        .unwrap();
+        assert_eq!(agy_transcript_status(&p).as_deref(), Some("idle"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn resume_command_uses_session_agent() {
+        let settings = Settings::default();
+        let mut s = Session::from_saved(
+            SavedSession {
+                claude_session_id: Some(SID.into()),
+                session_agent: Some(Agent::Agy),
+                skip_permissions: true,
+                ..Default::default()
+            },
+            1,
+        );
+        assert_eq!(
+            s.resume_command(&settings).as_deref(),
+            Some(format!("agy --conversation {SID} --dangerously-skip-permissions").as_str())
+        );
+        s.session_agent = None;
+        assert_eq!(
+            s.resume_command(&settings).as_deref(),
+            Some(format!("claude --resume {SID} --dangerously-skip-permissions").as_str())
+        );
     }
 
     #[test]

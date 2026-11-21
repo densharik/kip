@@ -14,8 +14,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::i18n::tr;
 
-use crate::config::Settings;
-use crate::session::{claude_dir, project_dir, valid_sid};
+use crate::config::{Agent, Settings};
+use crate::session::{agy_dir, agy_transcript_path, claude_dir, project_dir, valid_sid};
 
 pub const HOOK_SCRIPT: &str = include_str!("../resources/kip-ctx-hook.sh");
 
@@ -38,15 +38,16 @@ pub struct CtxUpdate {
     pub pct: f32,
     pub exact: bool,
     pub source_ts: SystemTime,
-    /// When Claude last answered in this session, straight from the transcript.
+    /// When the agent last answered in this session, straight from the transcript.
     /// Only a transcript read can know it - a hook snapshot carries None.
     pub last_msg: Option<SystemTime>,
+    /// Optional normalized turn status from an agy statusline hook ("busy" | "idle").
+    pub state: Option<String>,
 }
 
 pub enum CtxMsg {
     Update(CtxUpdate),
-    /// A by-pid snapshot revealed the tab runs a different session now
-    /// (/resume inside claude).
+    /// A by-pid snapshot revealed the tab's session id (including /resume) or turn state.
     Rebind { session: u64, update: CtxUpdate },
 }
 
@@ -177,9 +178,34 @@ pub(crate) fn scan_projects() -> HashMap<String, PathBuf> {
     }
 }
 
-pub fn spawn_initial_scan(map: SharedMap) {
+/// Walk agy's `~/.gemini/antigravity-cli/brain/<sid>/.system_generated/logs/transcript.jsonl`.
+fn scan_agy_in(root: &Path) -> HashMap<String, PathBuf> {
+    let mut out = HashMap::new();
+    let Ok(rd) = std::fs::read_dir(root) else { return out };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(sid) = name.to_str().filter(|s| valid_sid(s)) else { continue };
+        let path = entry.path().join(".system_generated").join("logs").join("transcript.jsonl");
+        if path.is_file() {
+            out.insert(sid.to_string(), path);
+        }
+    }
+    out
+}
+
+pub(crate) fn scan_projects_for(agent: Agent) -> HashMap<String, PathBuf> {
+    match agent {
+        Agent::Claude => scan_projects(),
+        Agent::Agy => match agy_dir() {
+            Some(d) => scan_agy_in(&d.join("brain")),
+            None => HashMap::new(),
+        },
+    }
+}
+
+pub fn spawn_initial_scan(map: SharedMap, agent: Agent) {
     std::thread::spawn(move || {
-        let scanned = scan_projects();
+        let scanned = scan_projects_for(agent);
         if let Ok(mut m) = map.lock() {
             for (k, v) in scanned {
                 m.map.entry(k).or_insert(v);
@@ -189,24 +215,46 @@ pub fn spawn_initial_scan(map: SharedMap) {
     });
 }
 
-/// Background-thread path resolution: map hit, then the cwd candidate (new
-/// bindings land here instantly), then a full rescan throttled to 1/30s.
-pub fn resolve_jsonl(map: &SharedMap, sid: &str, cwd_hint: Option<&Path>) -> Option<PathBuf> {
+/// Background-thread path resolution: map hit, then the cwd/direct candidate
+/// (new bindings land here instantly), then a full rescan throttled to 1/30s.
+pub fn resolve_jsonl(
+    map: &SharedMap,
+    sid: &str,
+    cwd_hint: Option<&Path>,
+    agent: Agent,
+) -> Option<PathBuf> {
     if let Ok(m) = map.lock()
         && let Some(p) = m.map.get(sid)
-            && p.exists() {
-                return Some(p.clone());
-            }
-    if let Some(cwd) = cwd_hint
-        && let Some(dir) = project_dir(cwd) {
-            let cand = dir.join(format!("{sid}.jsonl"));
-            if cand.exists() {
+        && p.exists()
+    {
+        return Some(p.clone());
+    }
+    match agent {
+        Agent::Agy => {
+            if let Some(cand) = agy_transcript_path(sid)
+                && cand.exists()
+            {
                 if let Ok(mut m) = map.lock() {
                     m.map.insert(sid.to_string(), cand.clone());
                 }
                 return Some(cand);
             }
-        }
+            return None;
+        },
+        Agent::Claude => {
+            if let Some(cwd) = cwd_hint
+                && let Some(dir) = project_dir(cwd)
+            {
+                let cand = dir.join(format!("{sid}.jsonl"));
+                if cand.exists() {
+                    if let Ok(mut m) = map.lock() {
+                        m.map.insert(sid.to_string(), cand.clone());
+                    }
+                    return Some(cand);
+                }
+            }
+        },
+    }
     let due = {
         let mut m = map.lock().ok()?;
         if m.last_scan.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
@@ -234,6 +282,10 @@ fn ctx_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".kip").join("ctx"))
 }
 
+pub fn agy_status_path() -> Option<PathBuf> {
+    ctx_dir().map(|d| d.join("agy-status.json"))
+}
+
 pub fn by_sid_path(sid: &str) -> Option<PathBuf> {
     ctx_dir().map(|d| d.join("by-sid").join(format!("{sid}.json")))
 }
@@ -242,17 +294,48 @@ pub fn by_pid_path(pid: i32) -> Option<PathBuf> {
     ctx_dir().map(|d| d.join("by-pid").join(format!("{pid}.json")))
 }
 
+fn normalize_agy_state(raw: &str) -> Option<String> {
+    match raw {
+        "working" | "tool_use" => Some("busy".into()),
+        "idle" | "reviewing" | "error" => Some("idle".into()),
+        _ => None,
+    }
+}
+
 fn parse_snapshot(text: &str) -> Option<CtxUpdate> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let sid = v["session_id"].as_str().filter(|s| valid_sid(s))?;
     let pct = v["ctx"].as_f64().filter(|p| *p > 0.0)? as f32;
     let ts = v["ts"].as_u64()?;
+    let state = v["state"].as_str().and_then(normalize_agy_state);
     Some(CtxUpdate {
         sid: sid.to_string(),
         pct: pct.min(100.0),
         exact: true,
         source_ts: SystemTime::UNIX_EPOCH + Duration::from_secs(ts),
         last_msg: None,
+        state,
+    })
+}
+
+/// by-pid snapshot parser: also accepts ctx == 0 when an agy statusline carries
+/// `state` (so session binding & busy/idle transitions work from turn 0).
+fn parse_bypid_snapshot(text: &str) -> Option<CtxUpdate> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let sid = v["session_id"].as_str().filter(|s| valid_sid(s))?;
+    let pct = v["ctx"].as_f64().unwrap_or(0.0) as f32;
+    let ts = v["ts"].as_u64()?;
+    let state = v["state"].as_str().and_then(normalize_agy_state);
+    if pct <= 0.0 && state.is_none() {
+        return None;
+    }
+    Some(CtxUpdate {
+        sid: sid.to_string(),
+        pct: pct.clamp(0.0, 100.0),
+        exact: true,
+        source_ts: SystemTime::UNIX_EPOCH + Duration::from_secs(ts),
+        last_msg: None,
+        state,
     })
 }
 
@@ -261,6 +344,13 @@ fn read_snapshot(path: &Path) -> Option<CtxUpdate> {
         return None;
     }
     parse_snapshot(&std::fs::read_to_string(path).ok()?)
+}
+
+fn read_bypid_snapshot(path: &Path) -> Option<CtxUpdate> {
+    if std::fs::metadata(path).ok()?.len() > SNAPSHOT_MAX {
+        return None;
+    }
+    parse_bypid_snapshot(&std::fs::read_to_string(path).ok()?)
 }
 
 /// Window size claude reported for this session (hook "win"). Model ids in the
@@ -300,7 +390,9 @@ fn parse_iso_ts(s: &str) -> Option<SystemTime> {
 
 fn model_window(model: &str, pref_1m: bool) -> u64 {
     let m = model.to_ascii_lowercase();
-    if m.contains("fable") || m.contains("mythos") || m.contains("[1m]") || pref_1m {
+    if m.contains("gemini") {
+        1_048_576
+    } else if m.contains("fable") || m.contains("mythos") || m.contains("[1m]") || pref_1m {
         1_000_000
     } else {
         200_000
@@ -318,15 +410,34 @@ fn settings_model_is_1m() -> bool {
         .unwrap_or(false)
 }
 
-/// Reverse-scan transcript text for the last main-chain API usage. Returns
-/// (pct, source time of that usage entry). A torn last line fails the JSON
-/// parse and is skipped; sidechain (subagent) usage is not the main context.
+/// Reverse-scan transcript text for the last main-chain API usage (supports
+/// both Claude Code and Antigravity CLI transcripts). Returns (pct, source time
+/// of that usage entry). A torn last line fails the JSON parse and is skipped;
+/// sidechain (subagent) usage is not the main context.
 fn scan_usage(text: &str, pref_1m: bool, known_win: Option<u64>) -> Option<(f32, Option<SystemTime>)> {
     for line in text.lines().rev() {
-        if !line.contains("\"usage\"") {
+        let is_claude = line.contains("\"usage\"");
+        let is_agy = line.contains("\"PLANNER_RESPONSE\"") && line.contains("\"input_tokens\"");
+        if !is_claude && !is_agy {
             continue;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if is_agy && v["type"].as_str() == Some("PLANNER_RESPONSE") {
+            let inp = v["input_tokens"].as_u64().unwrap_or(0);
+            let cache = v["cache_read_tokens"].as_u64().unwrap_or(0);
+            let used = inp + cache;
+            if used == 0 {
+                continue;
+            }
+            let model = v["model"].as_str().unwrap_or("");
+            let mut window = known_win.unwrap_or_else(|| model_window(model, false));
+            if used > window {
+                window = 1_048_576;
+            }
+            let pct = (used as f64 / window as f64 * 100.0).clamp(1.0, 100.0) as f32;
+            let ts = v["created_at"].as_str().and_then(parse_iso_ts);
+            return Some((pct, ts));
+        }
         if v["isSidechain"].as_bool() == Some(true) {
             continue;
         }
@@ -378,11 +489,12 @@ pub fn estimate_from_jsonl(path: &Path, sid: &str) -> Option<CtxUpdate> {
                 pct,
                 exact: false,
                 source_ts: ts.or(mtime).unwrap_or_else(SystemTime::now),
-                // That usage entry IS Claude's last main-chain answer, so its
+                // That usage entry IS the agent's last main-chain answer, so its
                 // own timestamp is the last-reply time. mtime is NOT a fallback
                 // here: the transcript is also touched by user messages and
-                // tool results, which would read as Claude having answered.
+                // tool results, which would read as the agent having answered.
                 last_msg: ts,
+                state: None,
             });
         }
         if start == 0 {
@@ -400,6 +512,7 @@ pub fn estimate_from_jsonl(path: &Path, sid: &str) -> Option<CtxUpdate> {
 pub fn lookup(
     sid: String,
     cwd: PathBuf,
+    agent: Agent,
     map: SharedMap,
     tx: Sender<CtxMsg>,
     egui: egui::Context,
@@ -407,13 +520,15 @@ pub fn lookup(
     std::thread::spawn(move || {
         let mut sent = false;
         if let Some(u) = by_sid_path(&sid).as_deref().and_then(read_snapshot)
-            && u.sid == sid {
-                sent |= tx.send(CtxMsg::Update(u)).is_ok();
-            }
-        if let Some(path) = resolve_jsonl(&map, &sid, Some(&cwd))
-            && let Some(u) = estimate_from_jsonl(&path, &sid) {
-                sent |= tx.send(CtxMsg::Update(u)).is_ok();
-            }
+            && u.sid == sid
+        {
+            sent |= tx.send(CtxMsg::Update(u)).is_ok();
+        }
+        if let Some(path) = resolve_jsonl(&map, &sid, Some(&cwd), agent)
+            && let Some(u) = estimate_from_jsonl(&path, &sid)
+        {
+            sent |= tx.send(CtxMsg::Update(u)).is_ok();
+        }
         if sent {
             egui.request_repaint();
         }
@@ -429,9 +544,9 @@ pub fn spawn_sid_read(sid: String, tx: Sender<CtxMsg>, egui: egui::Context) {
     });
 }
 
-/// by-pid snapshot: the tab's own claude wrote it, so it both carries the
-/// exact % (two claudes on one sid diverge - by-sid is last-writer-wins,
-/// by-pid is per-process) and reveals in-claude /resume rebinding.
+/// by-pid snapshot: the tab's own agent wrote it, so it both carries the
+/// exact % (two instances on one sid diverge - by-sid is last-writer-wins,
+/// by-pid is per-process) and reveals in-agent /resume rebinding and turn state.
 pub fn spawn_bypid_read(
     session: u64,
     pid: i32,
@@ -440,15 +555,15 @@ pub fn spawn_bypid_read(
     egui: egui::Context,
 ) {
     std::thread::spawn(move || {
-        let Some(u) = by_pid_path(pid).as_deref().and_then(read_snapshot) else { return };
-        // Stale file = possibly a dead claude's pid, reused. Never rebind on it.
+        let Some(u) = by_pid_path(pid).as_deref().and_then(read_bypid_snapshot) else { return };
+        // Stale file = possibly a dead process's pid, reused. Never rebind on it.
         let fresh = SystemTime::now()
             .duration_since(u.source_ts)
             .is_ok_and(|d| d <= BYPID_FRESH);
         if !fresh {
             return;
         }
-        let msg = if cur_sid.as_deref() != Some(u.sid.as_str()) {
+        let msg = if cur_sid.as_deref() != Some(u.sid.as_str()) || u.state.is_some() {
             CtxMsg::Rebind { session, update: u }
         } else {
             CtxMsg::Update(u)
@@ -500,8 +615,11 @@ pub fn sweep() {
 
 // ---- hook install / uninstall ----
 
-fn claude_settings_path() -> Option<PathBuf> {
-    claude_dir().map(|d| d.join("settings.json"))
+fn agent_settings_path(agent: Agent) -> Option<PathBuf> {
+    match agent {
+        Agent::Claude => claude_dir().map(|d| d.join("settings.json")),
+        Agent::Agy => agy_dir().map(|d| d.join("settings.json")),
+    }
 }
 
 /// $HOME stays literal in settings.json so the entry survives dotfiles sync
@@ -523,15 +641,31 @@ fn build_cmd(prev_cmd: Option<&str>) -> String {
 
 /// Wrap statusLine in a settings root, touching nothing else. Returns the
 /// serialized previous value ("" if the key was absent), None if already ours.
-fn wrap_root(root: &mut serde_json::Value) -> Option<String> {
+/// For `agy` with no prior custom command, sets `stack_with_default: true` so
+/// agy's built-in status line stays visible alongside our silent hook.
+fn wrap_root(root: &mut serde_json::Value, is_agy: bool) -> Option<String> {
     let cur = root.get("statusLine").cloned();
     let cur_cmd = cur.as_ref().and_then(|v| v["command"].as_str()).map(String::from);
     if cur_cmd.as_deref().is_some_and(is_ours) {
         return None;
     }
     let prev_ser = cur.as_ref().map(|v| v.to_string()).unwrap_or_default();
+    let has_prev_cmd = cur_cmd.as_deref().is_some_and(|p| !p.trim().is_empty());
     let cmd = build_cmd(cur_cmd.as_deref());
-    root["statusLine"] = serde_json::json!({ "type": "command", "command": cmd });
+    let mut obj = serde_json::json!({ "type": "command", "command": cmd });
+    if is_agy {
+        if let Some(prev_obj) = cur.as_ref().and_then(|v| v.as_object()) {
+            for k in ["padding", "stack_with_default"] {
+                if let Some(val) = prev_obj.get(k) {
+                    obj[k] = val.clone();
+                }
+            }
+        }
+        if !has_prev_cmd {
+            obj["stack_with_default"] = serde_json::json!(true);
+        }
+    }
+    root["statusLine"] = obj;
     Some(prev_ser)
 }
 
@@ -554,10 +688,12 @@ fn restore_root(root: &mut serde_json::Value, prev_ser: &str) -> bool {
     true
 }
 
-fn read_settings_root(path: &Path) -> Result<serde_json::Value, String> {
+fn read_settings_root(path: &Path, agent: Agent) -> Result<serde_json::Value, String> {
     match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text)
-            .map_err(|_| tr("settings.json Claude не парсится - не трогаю его", "Claude settings.json does not parse - leaving it alone").to_string()),
+        Ok(text) => serde_json::from_str(&text).map_err(|_| match agent {
+            Agent::Claude => tr("settings.json Claude не парсится - не трогаю его", "Claude settings.json does not parse - leaving it alone").to_string(),
+            Agent::Agy => tr("settings.json agy не парсится - не трогаю его", "agy settings.json does not parse - leaving it alone").to_string(),
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
         Err(e) => Err(format!("{}: {e}", tr("чтение settings.json", "reading settings.json"))),
     }
@@ -602,29 +738,37 @@ fn recover_prev(cmd: &str) -> String {
     serde_json::json!({ "type": "command", "command": inner }).to_string()
 }
 
-pub fn install_hook(settings: &mut Settings) -> Result<(), String> {
+pub fn install_hook(settings: &mut Settings, agent: Agent) -> Result<(), String> {
     write_hook_script()?;
-    let path = claude_settings_path().ok_or(tr("нет домашней директории", "no home directory"))?;
-    let mut root = read_settings_root(&path)?;
-    if let Some(prev) = wrap_root(&mut root) {
-        settings.prev_statusline = Some(prev);
+    let path = agent_settings_path(agent).ok_or(tr("нет домашней директории", "no home directory"))?;
+    let mut root = read_settings_root(&path, agent)?;
+    let prev_slot = match agent {
+        Agent::Claude => &mut settings.prev_statusline,
+        Agent::Agy => &mut settings.agy_prev_statusline,
+    };
+    if let Some(prev) = wrap_root(&mut root, agent == Agent::Agy) {
+        *prev_slot = Some(prev);
         write_settings_root(&path, &root)?;
-    } else if settings.prev_statusline.is_none() {
+    } else if prev_slot.is_none() {
         // Already wrapped, but this kip never saw the original.
         let cmd = root["statusLine"]["command"].as_str().unwrap_or_default();
-        settings.prev_statusline = Some(recover_prev(cmd));
+        *prev_slot = Some(recover_prev(cmd));
     }
     Ok(())
 }
 
-pub fn uninstall_hook(settings: &mut Settings) -> Result<(), String> {
-    let path = claude_settings_path().ok_or(tr("нет домашней директории", "no home directory"))?;
-    let mut root = read_settings_root(&path)?;
-    let prev = settings.prev_statusline.clone().unwrap_or_default();
+pub fn uninstall_hook(settings: &mut Settings, agent: Agent) -> Result<(), String> {
+    let path = agent_settings_path(agent).ok_or(tr("нет домашней директории", "no home directory"))?;
+    let mut root = read_settings_root(&path, agent)?;
+    let prev_slot = match agent {
+        Agent::Claude => &mut settings.prev_statusline,
+        Agent::Agy => &mut settings.agy_prev_statusline,
+    };
+    let prev = prev_slot.clone().unwrap_or_default();
     if restore_root(&mut root, &prev) {
         write_settings_root(&path, &root)?;
     }
-    settings.prev_statusline = None;
+    *prev_slot = None;
     Ok(())
 }
 
@@ -638,7 +782,7 @@ mod tests {
     }
 
     fn upd(sid: &str, pct: f32, exact: bool, t: u64) -> CtxUpdate {
-        CtxUpdate { sid: sid.into(), pct, exact, source_ts: ts(t), last_msg: None }
+        CtxUpdate { sid: sid.into(), pct, exact, source_ts: ts(t), last_msg: None, state: None }
     }
 
     fn tdir(name: &str) -> PathBuf {
@@ -869,10 +1013,18 @@ mod tests {
         let map: SharedMap = Default::default();
         map.lock().unwrap().last_scan = Some(Instant::now());
         // Fresh scan mark + unknown sid + no cwd hint -> throttled, no result.
-        assert!(resolve_jsonl(&map, SID, None).is_none());
+        assert!(resolve_jsonl(&map, SID, None, Agent::Claude).is_none());
         // Manual insert = "new binding adds the path immediately".
         map.lock().unwrap().map.insert(SID.into(), PathBuf::from("/tmp/x.jsonl"));
         assert!(map.lock().unwrap().map.contains_key(SID));
+    }
+
+    #[test]
+    fn scan_usage_parses_agy_planner_response() {
+        let line = r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-21T20:39:38Z","model":"gemini-4-neon-high","input_tokens":52428,"cache_read_tokens":52429,"output_tokens":38,"content":"hi"}"#;
+        let (pct, ts_) = scan_usage(line, false, None).unwrap();
+        assert!((pct - 10.0).abs() < 0.2, "pct={pct}");
+        assert!(ts_.is_some());
     }
 
     // -- settings wrap / restore --
@@ -883,21 +1035,28 @@ mod tests {
             "{\"model\":\"opus[1m]\",\"statusLine\":{\"type\":\"command\",\"command\":\"node /x/heartbeat.js\"}}",
         )
         .unwrap();
-        let prev = wrap_root(&mut root).unwrap();
+        let prev = wrap_root(&mut root, false).unwrap();
         assert!(prev.contains("heartbeat.js"));
         assert_eq!(root["model"], "opus[1m]");
         let cmd = root["statusLine"]["command"].as_str().unwrap();
         assert!(cmd.starts_with(HOOK_CMD) && cmd.contains("'node /x/heartbeat.js'"));
         // Second install: already ours, no double wrap.
-        assert!(wrap_root(&mut root).is_none());
+        assert!(wrap_root(&mut root, false).is_none());
     }
 
     #[test]
     fn wrap_absent_statusline() {
         let mut root = serde_json::json!({});
-        let prev = wrap_root(&mut root).unwrap();
+        let prev = wrap_root(&mut root, false).unwrap();
         assert_eq!(prev, "");
         assert_eq!(root["statusLine"]["command"].as_str().unwrap(), HOOK_CMD);
+        assert!(root["statusLine"].get("stack_with_default").is_none());
+
+        let mut agy_root = serde_json::json!({});
+        let prev = wrap_root(&mut agy_root, true).unwrap();
+        assert_eq!(prev, "");
+        assert_eq!(agy_root["statusLine"]["command"].as_str().unwrap(), HOOK_CMD);
+        assert_eq!(agy_root["statusLine"]["stack_with_default"], serde_json::json!(true));
     }
 
     #[test]
@@ -1009,5 +1168,22 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with("in."))
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    #[cfg(unix)]    #[test]
+    fn hook_writes_agy_state_and_quota() {
+        let home = tdir("hook-agy");
+        let stdin = format!(
+            "{{\"session_id\":\"{SID}\",\"product\":\"antigravity\",\"agent_state\":\"working\",\"context_window\":{{\"context_window_size\":1048576,\"used_percentage\":14.24}},\"quota\":{{\"gemini-weekly\":{{\"remaining_fraction\":0.8}}}}}}"
+        );
+        run_hook(&home, &stdin, None);
+        let by_sid = home.join(".kip/ctx/by-sid").join(format!("{SID}.json"));
+        let text = std::fs::read_to_string(by_sid).expect("by-sid snapshot written");
+        let u = parse_snapshot(&text).unwrap();
+        assert_eq!(u.sid, SID);
+        assert!((u.pct - 14.24).abs() < 0.01);
+        assert_eq!(u.state.as_deref(), Some("busy"));
+        let quota = std::fs::read_to_string(home.join(".kip/ctx/agy-status.json")).expect("agy status saved");
+        assert!(quota.contains("gemini-weekly"));
     }
 }

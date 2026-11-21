@@ -15,9 +15,10 @@
 - **Put idle sessions to sleep and get the RAM back.** The conversation is still there; one click brings it back.
 - **Find any past conversation** by what was said in it, across all your projects.
 
-kip is a real terminal, not a Claude client: it runs the `claude` CLI on a real
-PTY, so every Claude Code feature and flag works the day it ships, and so do
-`vim`, `ssh` and everything else. One native Rust binary, no Electron.
+kip is a real terminal, not a wrapper UI: it runs the `claude` or Antigravity
+(`agy`) CLI on a real PTY, so every agent feature and flag works the day it
+ships, and so do `vim`, `ssh` and everything else. Switch between Claude Code
+and Antigravity CLI in **Settings > Agent**. One native Rust binary, no Electron.
 
 ## At a glance
 
@@ -187,28 +188,30 @@ or by hand:
 
 ```sh
 claude mcp add -s user kip -- /Applications/kip.app/Contents/MacOS/kip mcp
+# or for Antigravity CLI:
+agy mcp add kip -- /Applications/kip.app/Contents/MacOS/kip mcp
 ```
 
-Small on context: 24 tools, about 7.6 KB of schema (~2.1k tokens) - and Claude
-Code usually defers MCP tools, keeping only their names in context until one
-is used. If kip is not running, the first call starts it.
+Small on context: 24 tools, about 7.4 KB of schema (~2.0k tokens) - and agents
+usually defer MCP tools, keeping only their names in context until one is used.
+If kip is not running, the first call starts it.
 
 | Tool | Does |
 |---|---|
-| `list_sessions`, `list_windows` | sessions with folder, group, project, window, state, busy, finished-unseen, pinned, context %, idle time |
-| `open_session` | new terminal in a folder: plain, with Claude, `--resume <id>`, or a command; window, group, name |
+| `list_sessions`, `list_windows` | sessions with folder, group, project, window, state, busy, finished-unseen, pinned, agent, session id, context %, idle time |
+| `open_session` | new terminal in a folder: plain, with the active agent (`claude`/`agent`), `resume` by id, or a command; window, group, name |
 | `close_session`, `suspend_session`, `wake_session` | pinned sessions refuse to close without `force` |
 | `focus_session`, `rename_session`, `set_group`, `pin_session` | |
 | `style_group` | color a group or project section, move it up or down |
 | `open_folder` | open a session's folder in Finder / Explorer |
 | `open_window`, `move_to_window` | |
 | `save_state` | write sessions and windows to disk now |
-| `read_screen`, `read_transcript` | terminal text and the Claude conversation (also a past one by `sid`), for summaries |
-| `list_history`, `show_history` | past Claude conversations on disk, searched by title and text; open kip's history browser |
+| `read_screen`, `read_transcript` | terminal text and the conversation (also a past one by `sid`), for summaries |
+| `list_history`, `show_history` | past conversations on disk for the active agent, searched by title and text; open kip's history browser |
 | `search` | case-insensitive text search across sessions' screen and scrollback |
 | `send_input` | type into a session - off until enabled in Settings |
 | `cleanup` | suspend or remove long-idle sessions; dry run by default |
-| `get_settings`, `set_settings` | read and change any kip setting |
+| `get_settings`, `set_settings` | read and change any kip setting (including `agent`: `"claude"` \| `"agy"`) |
 
 Under the hood kip listens on 127.0.0.1 with a per-run token in
 `~/.kip/ctl.json` (readable by you only); `kip mcp` relays tool calls there.

@@ -2,9 +2,43 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Which CLI agent kip integrates with (selected in Settings > Agent).
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Agent {
+    #[default]
+    Claude,
+    Agy,
+}
+
+impl Agent {
+    pub fn label(self) -> &'static str {
+        match self {
+            Agent::Claude => "Claude Code",
+            Agent::Agy => "Antigravity (agy)",
+        }
+    }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            Agent::Claude => "Claude",
+            Agent::Agy => "agy",
+        }
+    }
+
+    pub fn cmd(self, s: &Settings) -> &str {
+        match self {
+            Agent::Claude => &s.claude_cmd,
+            Agent::Agy => &s.agy_cmd,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Active CLI agent integration: "claude" or "agy".
+    pub agent: Agent,
     pub font_size: f32,
     /// Terminal font key (see FONT_CHOICES in main.rs).
     pub font: String,
@@ -18,12 +52,17 @@ pub struct Settings {
     pub notify_sound: bool,
     pub skip_permissions_default: bool,
     pub claude_cmd: String,
+    pub agy_cmd: String,
     /// Selected terminal text is copied to the clipboard immediately.
     pub copy_on_select: bool,
-    /// The statusline hook is installed (exact context % for any user).
+    /// The statusline hook is installed for Claude Code (exact context %).
     pub ctx_hook: bool,
-    /// Serialized original statusLine value for rollback ("" = key was absent).
+    /// Serialized original Claude statusLine value for rollback ("" = key was absent).
     pub prev_statusline: Option<String>,
+    /// The statusline hook is installed for Antigravity CLI (exact context %, state, quota).
+    pub agy_ctx_hook: bool,
+    /// Serialized original agy statusLine value for rollback ("" = key was absent).
+    pub agy_prev_statusline: Option<String>,
     /// Terminal color preset key (see palette::PRESETS).
     pub theme: String,
     /// Optional selection-highlight override; None uses the preset's color.
@@ -65,6 +104,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            agent: Agent::Claude,
             // Bundled Hack at a size that lands on ~14.4 physical pixels with the
             // default UI scale - the same on-screen size other terminals use, and
             // identical on every machine since the font ships in the binary.
@@ -78,9 +118,12 @@ impl Default for Settings {
             notify_sound: true,
             skip_permissions_default: true,
             claude_cmd: "claude".into(),
+            agy_cmd: "agy".into(),
             copy_on_select: true,
             ctx_hook: false,
             prev_statusline: None,
+            agy_ctx_hook: false,
+            agy_prev_statusline: None,
             theme: "tomorrow".into(),
             accent: None,
             lang: "auto".into(),
@@ -123,6 +166,8 @@ fn migrate(s: &mut Settings) {
 pub struct SavedSession {
     pub cwd: PathBuf,
     pub claude_session_id: Option<String>,
+    /// Which agent owns `claude_session_id` (None on legacy files = Claude).
+    pub session_agent: Option<Agent>,
     pub claude_title: Option<String>,
     /// User-set name (double-click on the session title). Wins over claude_title.
     pub custom_name: Option<String>,
@@ -142,6 +187,7 @@ impl Default for SavedSession {
         Self {
             cwd: dirs::home_dir().unwrap_or_else(|| "/".into()),
             claude_session_id: None,
+            session_agent: None,
             claude_title: None,
             custom_name: None,
             group: None,

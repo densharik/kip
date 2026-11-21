@@ -11,6 +11,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 
+use crate::config::Agent;
 use crate::i18n::tr;
 
 const USAGE_API: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -32,9 +33,13 @@ pub enum UsageMsg {
     Err(String),
 }
 
-pub fn fetch(tx: Sender<UsageMsg>, egui: egui::Context) {
+pub fn fetch(agent: Agent, agy_hook_on: bool, tx: Sender<UsageMsg>, egui: egui::Context) {
     std::thread::spawn(move || {
-        let msg = match do_fetch() {
+        let res = match agent {
+            Agent::Claude => do_fetch(),
+            Agent::Agy => do_fetch_agy(agy_hook_on),
+        };
+        let msg = match res {
             Ok(v) => UsageMsg::Ok(v),
             Err(e) => UsageMsg::Err(e),
         };
@@ -42,6 +47,65 @@ pub fn fetch(tx: Sender<UsageMsg>, egui: egui::Context) {
             egui.request_repaint();
         }
     });
+}
+
+fn do_fetch_agy(hook_on: bool) -> Result<Vec<Limit>, String> {
+    let Some(path) = crate::ctx_index::agy_status_path() else {
+        return Err(tr("нет домашней директории", "no home directory").into());
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Err(if hook_on {
+            tr("запусти agy, чтобы загрузить лимиты", "run agy to load quotas").into()
+        } else {
+            tr("включи statusline-хук в Настройках > Агент", "enable the statusline hook in Settings > Agent").into()
+        });
+    };
+    parse_agy_quota(&bytes).ok_or_else(|| {
+        tr("нет данных о квотах agy", "no agy quota data yet").to_string()
+    })
+}
+
+fn parse_agy_quota(bytes: &[u8]) -> Option<Vec<Limit>> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let quota = v["quota"].as_object()?;
+    let mut keys: Vec<&String> = quota.keys().collect();
+    keys.sort();
+    let mut out = Vec::new();
+    for k in keys {
+        let q = &quota[k];
+        if q["disabled"].as_bool() == Some(true) {
+            continue;
+        }
+        let Some(rem) = q["remaining_fraction"].as_f64() else { continue };
+        let used_pct = ((1.0 - rem) * 100.0).clamp(0.0, 100.0) as f32;
+        let (label, short) = agy_quota_label(k);
+        out.push(Limit {
+            key: format!("agy:{k}"),
+            label,
+            short,
+            percent: used_pct,
+            resets_at: q["reset_time"].as_str().and_then(parse_iso),
+        });
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn agy_quota_label(key: &str) -> (String, String) {
+    let mut parts = key.split('-');
+    let head = parts.next().unwrap_or(key);
+    let cap = |s: &str| {
+        let mut c = s.chars();
+        match c.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+            None => String::new(),
+        }
+    };
+    let tail: Vec<&str> = parts.collect();
+    match tail.as_slice() {
+        ["weekly"] => (format!("{} ({})", cap(head), tr("неделя", "week")), tr("7д", "7d").into()),
+        ["5h"] | ["session"] => (format!("{} (5{})", cap(head), tr("ч", "h")), tr("5ч", "5h").into()),
+        _ => (cap(&key.replace('-', " ")), cap(head)),
+    }
 }
 
 fn do_fetch() -> Result<Vec<Limit>, String> {
@@ -170,5 +234,15 @@ mod tests {
         assert_eq!(token_from_json(js).as_deref(), Some("tok-1"));
         assert_eq!(token_from_json(br#"{"claudeAiOauth":{}}"#), None);
         assert_eq!(token_from_json(b"garbage"), None);
+    }
+
+    #[test]
+    fn agy_quota_parses_remaining_fraction() {
+        let js = br#"{"quota":{"gemini-weekly":{"remaining_fraction":0.75,"reset_time":"2026-07-25T04:40:00Z"},"off":{"disabled":true,"remaining_fraction":0.5}}}"#;
+        let list = parse_agy_quota(js).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].key, "agy:gemini-weekly");
+        assert!((list[0].percent - 25.0).abs() < 0.01);
+        assert_eq!(list[0].resets_at, Some(1784954400));
     }
 }
